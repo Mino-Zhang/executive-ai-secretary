@@ -226,7 +226,11 @@ function toggleOrganizationSelection(current: string[], organizationId: string) 
   return next.length ? next : [ALL_ORGANIZATIONS_ID];
 }
 
-export default function ProductPrototype() {
+export default function ProductEntry() {
+  return <DemoProductPrototype />;
+}
+
+function DemoProductPrototype() {
   const [role, setRole] = useState<AuthRole>(null);
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     if (typeof window === "undefined") return "system";

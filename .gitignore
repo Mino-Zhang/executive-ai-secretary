@@ -30,12 +30,33 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+!deploy/.env.example
+!deploy/environments/*.env.example
+
+# local production data and secrets
+/data/
+/backups/
+/runtime/
+/deploy/data/
+/deploy/backups/
+*.key
+*.secret
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
 
 # vercel
 .vercel
 
 # typescript
 next-env.d.ts
+*.tsbuildinfo
 /dist/
 /.wrangler/
 /outputs/
