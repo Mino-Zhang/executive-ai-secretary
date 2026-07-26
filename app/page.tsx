@@ -97,20 +97,20 @@ type RouteRecord = {
   status: "待补充范围" | "已路由" | "待网络确认";
 };
 
-type SidebarMenuState = {
-  conversationId: number;
-  top: number;
-};
+type SidebarMenuState =
+  | { kind: "conversation"; conversationId: number; top: number }
+  | { kind: "project"; projectId: string; top: number };
 
 type SidebarProject = {
   id: string;
   title: string;
-  conversations: Array<{
-    id: string;
-    title: string;
-    question: string;
-  }>;
+  description: string;
+  conversationIds: number[];
 };
+
+type ProjectDialogState =
+  | { mode: "create" }
+  | { mode: "edit"; projectId: string };
 
 const ALL_ORGANIZATIONS_ID = "all";
 const COMPOSER_MAX_LENGTH = 8000;
@@ -132,22 +132,18 @@ const workspaceNavigation: Array<{ id: WorkspaceNavigationId; label: string; sho
   { id: "memory", label: "长期记忆", short: "记" },
 ];
 
-const sidebarProjects: SidebarProject[] = [
+const initialSidebarProjects: SidebarProject[] = [
   {
     id: "collection",
     title: "回款与现金流",
-    conversations: [
-      { id: "collection-gap", title: "本月回款差距", question: "本月回款差距主要来自哪些客户？" },
-      { id: "collection-action", title: "逾期应收处置建议", question: "整理三笔逾期应收的处置建议和责任节点。" },
-    ],
+    description: "持续跟进回款差距、逾期应收与现金流风险。",
+    conversationIds: [7, 8],
   },
   {
     id: "delivery",
     title: "重点项目交付",
-    conversations: [
-      { id: "delivery-milestone", title: "两个延期项目卡在哪里", question: "两个延期项目分别卡在哪个里程碑？" },
-      { id: "delivery-review", title: "重点项目复盘", question: "整理重点项目延期原因和下一步动作。" },
-    ],
+    description: "集中查看重点项目、交付里程碑与复盘事项。",
+    conversationIds: [9, 10],
   },
 ];
 
@@ -515,7 +511,15 @@ function ExecutiveWorkspace({
   const linkedConversation = initialConversationId ? initialConversations.find((item) => item.id === initialConversationId) : undefined;
   const linkedPanel: WorkspacePanelView | null = linkedConversation?.type === "每日摘要" ? "daily" : linkedConversation?.type === "每周简报" ? "weekly" : null;
   const linkedRoute: RouteKind = linkedConversation?.type === "文件" ? "file" : linkedConversation?.type === "泛化" ? "research" : "data";
-  const linkedAnswerId = linkedConversation?.type === "文件" ? "file" : linkedConversation?.type === "泛化" ? "research" : linkedConversation?.title.includes("项目") ? "delivery" : "overview";
+  const linkedAnswerId = linkedConversation?.type === "文件"
+    ? "file"
+    : linkedConversation?.type === "泛化"
+      ? "research"
+      : /回款|应收|现金/.test(linkedConversation?.title ?? "")
+        ? "collection"
+        : linkedConversation?.title.includes("项目")
+          ? "delivery"
+          : "overview";
   const linkedChat = Boolean(linkedConversation && !linkedPanel);
   const [view, setView] = useState<ExecutiveView>(linkedChat || initialView === "chat" ? "chat" : "home");
   const [activePanel, setActivePanel] = useState<WorkspacePanelView | null>(linkedPanel ?? (initialView !== "home" && initialView !== "chat" ? initialView : null));
@@ -530,11 +534,13 @@ function ExecutiveWorkspace({
   const [activeAnswerId, setActiveAnswerId] = useState(linkedAnswerId);
   const [answerVersion, setAnswerVersion] = useState(1);
   const [chatTitle, setChatTitle] = useState(linkedChat ? linkedConversation?.title ?? "新会话" : "新会话");
+  const [activeConversationId, setActiveConversationId] = useState<number | null>(linkedChat ? linkedConversation?.id ?? null : null);
   const [scope, setScope] = useState<ScopeState>({ time: "本月累计", organizationIds: [ALL_ORGANIZATIONS_ID], owner: "", object: "" });
   const [scopePanelOpen, setScopePanelOpen] = useState(false);
   const [files, setFiles] = useState<DemoFile[]>(linkedConversation?.type === "文件" ? [demoReadyFile()] : []);
   const [selectedFile, setSelectedFile] = useState<number | null>(null);
   const [conversations, setConversations] = useState(initialConversations);
+  const [sidebarProjects, setSidebarProjects] = useState<SidebarProject[]>(initialSidebarProjects);
   const [memories, setMemories] = useState(initialMemories);
   const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -554,8 +560,11 @@ function ExecutiveWorkspace({
   const [pinnedConversationIds, setPinnedConversationIds] = useState<number[]>([1, 2]);
   const [unreadConversationIds, setUnreadConversationIds] = useState<number[]>([]);
   const [archivedConversationIds, setArchivedConversationIds] = useState<number[]>([]);
+  const [pinnedProjectIds, setPinnedProjectIds] = useState<string[]>([]);
   const [expandedProjectIds, setExpandedProjectIds] = useState<string[]>(["collection"]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [sidebarMenu, setSidebarMenu] = useState<SidebarMenuState | null>(null);
+  const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
   const [sidebarRenameId, setSidebarRenameId] = useState<number | null>(null);
   const [sidebarRenameDraft, setSidebarRenameDraft] = useState("");
   const [renamingConversation, setRenamingConversation] = useState(false);
@@ -577,6 +586,7 @@ function ExecutiveWorkspace({
   const homeFileRef = useRef<HTMLInputElement>(null);
   const chatFileRef = useRef<HTMLInputElement>(null);
   const sidebarRef = useRef<HTMLElement>(null);
+  const sidebarMenuRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
 
   const copy = workbenchCopy[languagePreference];
@@ -605,12 +615,22 @@ function ExecutiveWorkspace({
 
   useEffect(() => {
     if (!sidebarMenu) return;
+    window.requestAnimationFrame(() => sidebarMenuRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus());
     const closeMenu = (event: PointerEvent) => {
       if ((event.target as HTMLElement).closest("[data-sidebar-menu]")) return;
       setSidebarMenu(null);
     };
+    const handleEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setSidebarMenu(null);
+    };
     window.addEventListener("pointerdown", closeMenu);
-    return () => window.removeEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", handleEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", handleEscape);
+    };
   }, [sidebarMenu]);
 
   useEffect(() => {
@@ -647,11 +667,13 @@ function ExecutiveWorkspace({
       setActiveAnswerId("overview");
       setAnswerVersion(1);
       setChatTitle("新会话");
+      setActiveConversationId(null);
       setFiles([]);
       setScope({ time: "本月累计", organizationIds: [ALL_ORGANIZATIONS_ID], owner: "", object: "" });
       setInheritedNotice("");
       setMemoryCandidate(false);
       setNewTopicNotice(false);
+      setActiveProjectId(null);
       setSidebarMenu(null);
       setSidebarRenameId(null);
       setActivePanel(null);
@@ -682,6 +704,14 @@ function ExecutiveWorkspace({
     () => visibleConversations.filter((item) => !pinnedConversationIds.includes(item.id)).slice(0, 5),
     [pinnedConversationIds, visibleConversations],
   );
+  const orderedSidebarProjects = useMemo(
+    () => [...sidebarProjects].sort((first, second) => {
+      const firstPinned = pinnedProjectIds.includes(first.id) ? 1 : 0;
+      const secondPinned = pinnedProjectIds.includes(second.id) ? 1 : 0;
+      return secondPinned - firstPinned;
+    }),
+    [pinnedProjectIds, sidebarProjects],
+  );
 
   function clearTimers() {
     timers.current.forEach((timer) => window.clearTimeout(timer));
@@ -692,15 +722,23 @@ function ExecutiveWorkspace({
     setToast(message);
   }
 
-  function openSidebarMenu(event: ReactMouseEvent<HTMLButtonElement>, conversationId: number) {
+  function openSidebarMenu(
+    event: ReactMouseEvent<HTMLButtonElement>,
+    target: { kind: "conversation"; conversationId: number } | { kind: "project"; projectId: string },
+  ) {
     event.stopPropagation();
     const sidebarBounds = sidebarRef.current?.getBoundingClientRect();
     const triggerBounds = event.currentTarget.getBoundingClientRect();
     const desiredTop = sidebarBounds ? triggerBounds.top - sidebarBounds.top - 8 : triggerBounds.top;
-    const maxTop = Math.max(78, window.innerHeight - 338);
-    setSidebarMenu((current) => current?.conversationId === conversationId
-      ? null
-      : { conversationId, top: Math.min(Math.max(desiredTop, 78), maxTop) });
+    const menuHeight = target.kind === "project" ? 198 : 338;
+    const maxTop = Math.max(78, window.innerHeight - menuHeight);
+    setSidebarMenu((current) => {
+      const sameTarget = current?.kind === target.kind
+        && (target.kind === "conversation"
+          ? current.kind === "conversation" && current.conversationId === target.conversationId
+          : current.kind === "project" && current.projectId === target.projectId);
+      return sameTarget ? null : { ...target, top: Math.min(Math.max(desiredTop, 78), maxTop) };
+    });
   }
 
   function toggleUnread(conversationId: number) {
@@ -733,11 +771,19 @@ function ExecutiveWorkspace({
     setSidebarRenameDraft("");
   }
 
-  function archiveConversation(item: ConversationItem) {
-    setArchivedConversationIds((current) => current.includes(item.id) ? current : [...current, item.id]);
-    setPinnedConversationIds((current) => current.filter((id) => id !== item.id));
+  function requestArchiveConversation(item: ConversationItem) {
     setSidebarMenu(null);
-    notify(`“${item.title}”已归档，可在历史会话中搜索`);
+    setConfirmState({
+      title: `归档会话“${item.title}”？`,
+      description: "归档后，这条会话将从置顶、项目和最近列表中隐藏，仍可在历史会话中搜索。",
+      confirmLabel: "归档会话",
+      action: () => {
+        setArchivedConversationIds((current) => current.includes(item.id) ? current : [...current, item.id]);
+        setPinnedConversationIds((current) => current.filter((id) => id !== item.id));
+        setUnreadConversationIds((current) => current.filter((id) => id !== item.id));
+        notify(`“${item.title}”已归档，可在历史会话中搜索`);
+      },
+    });
   }
 
   function copyConversationId(item: ConversationItem) {
@@ -755,6 +801,8 @@ function ExecutiveWorkspace({
 
   function continueInNewConversation(item: ConversationItem) {
     clearTimers();
+    setActiveProjectId(null);
+    setActiveConversationId(null);
     setActivePanel(null);
     setSidebarMenu(null);
     setSidebarOpen(false);
@@ -774,7 +822,94 @@ function ExecutiveWorkspace({
       : [...current, projectId]);
   }
 
+  function startProjectConversation(project: SidebarProject) {
+    resetConversation();
+    setActiveProjectId(project.id);
+    setExpandedProjectIds((current) => current.includes(project.id) ? current : [...current, project.id]);
+    notify(`新会话将保存到“${project.title}”`);
+    window.requestAnimationFrame(() => homeComposerRef.current?.focus());
+  }
+
+  function togglePinnedProject(project: SidebarProject) {
+    const currentlyPinned = pinnedProjectIds.includes(project.id);
+    setPinnedProjectIds((current) => currentlyPinned
+      ? current.filter((id) => id !== project.id)
+      : [project.id, ...current]);
+    setSidebarMenu(null);
+    notify(currentlyPinned ? `已取消置顶“${project.title}”` : `已置顶“${project.title}”`);
+  }
+
+  function saveProject(
+    dialogState: ProjectDialogState,
+    title: string,
+    description: string,
+  ): string | null {
+    const normalizedTitle = title.trim();
+    const duplicate = sidebarProjects.some((project) => (
+      project.title.toLocaleLowerCase() === normalizedTitle.toLocaleLowerCase()
+      && (dialogState.mode === "create" || project.id !== dialogState.projectId)
+    ));
+    if (duplicate) return "已有同名项目，请使用其他名称。";
+
+    if (dialogState.mode === "create") {
+      const id = `project-${Date.now()}`;
+      setSidebarProjects((current) => [...current, { id, title: normalizedTitle, description: description.trim(), conversationIds: [] }]);
+      setExpandedProjectIds((current) => [...current, id]);
+      setProjectDialog(null);
+      notify(`项目“${normalizedTitle}”已创建`);
+      return null;
+    }
+
+    setSidebarProjects((current) => current.map((project) => project.id === dialogState.projectId
+      ? { ...project, title: normalizedTitle, description: description.trim() }
+      : project));
+    setProjectDialog(null);
+    notify("项目设置已更新");
+    return null;
+  }
+
+  function requestArchiveProjectTasks(project: SidebarProject) {
+    const activeConversationIds = project.conversationIds.filter((id) => !archivedConversationIds.includes(id));
+    setSidebarMenu(null);
+    if (!activeConversationIds.length) {
+      notify("这个项目没有可归档的任务");
+      return;
+    }
+    setConfirmState({
+      title: `归档“${project.title}”中的任务？`,
+      description: `${activeConversationIds.length} 条任务将从侧栏和最近会话中隐藏，项目本身会保留，任务仍可在历史会话中搜索。`,
+      confirmLabel: "归档任务",
+      action: () => {
+        setArchivedConversationIds((current) => Array.from(new Set([...current, ...activeConversationIds])));
+        setPinnedConversationIds((current) => current.filter((id) => !activeConversationIds.includes(id)));
+        setUnreadConversationIds((current) => current.filter((id) => !activeConversationIds.includes(id)));
+        notify(`“${project.title}”中的 ${activeConversationIds.length} 条任务已归档`);
+      },
+    });
+  }
+
+  function requestRemoveProject(project: SidebarProject) {
+    setSidebarMenu(null);
+    const retainedConversationCount = project.conversationIds.length;
+    setConfirmState({
+      title: `移除项目“${project.title}”？`,
+      description: retainedConversationCount
+        ? `只会移除项目分组，其中 ${retainedConversationCount} 条会话仍保留在最近或历史会话中。若要恢复分组，需要重新创建项目。`
+        : "这个空项目将从侧栏移除。若要恢复，需要重新创建项目。",
+      confirmLabel: "移除项目",
+      tone: "danger",
+      action: () => {
+        setSidebarProjects((current) => current.filter((item) => item.id !== project.id));
+        setPinnedProjectIds((current) => current.filter((id) => id !== project.id));
+        setExpandedProjectIds((current) => current.filter((id) => id !== project.id));
+        setActiveProjectId((current) => current === project.id ? null : current);
+        notify(`项目“${project.title}”已移除，会话仍然保留`);
+      },
+    });
+  }
+
   function switchView(nextView: ExecutiveView) {
+    setActiveProjectId(null);
     setAccountMenuOpen(false);
     setLanguageMenuOpen(false);
     setConversationMenuOpen(false);
@@ -798,11 +933,13 @@ function ExecutiveWorkspace({
     setActiveAnswerId("overview");
     setAnswerVersion(1);
     setChatTitle("新会话");
+    setActiveConversationId(null);
     setFiles([]);
     setScope({ time: "本月累计", organizationIds: [ALL_ORGANIZATIONS_ID], owner: "", object: "" });
     setInheritedNotice("");
     setMemoryCandidate(false);
     setNewTopicNotice(false);
+    setActiveProjectId(null);
     setSidebarMenu(null);
     setSidebarRenameId(null);
     setActivePanel(null);
@@ -855,7 +992,36 @@ function ExecutiveWorkspace({
     setActivePanel(null);
     setSidebarOpen(false);
     setView("chat");
-    setChatTitle(makeConversationTitle(finalQuestion, classified.answerId));
+    const nextConversationTitle = makeConversationTitle(finalQuestion, classified.answerId);
+    setChatTitle(nextConversationTitle);
+
+    if (activeProjectId && sidebarProjects.some((project) => project.id === activeProjectId)) {
+      const conversationId = Date.now();
+      const taskTitle = makeTaskTitle(finalQuestion);
+      const conversationType: ConversationItem["type"] = classified.route === "file"
+        ? "文件"
+        : classified.route === "research"
+          ? "泛化"
+          : "数据";
+      setConversations((current) => [{
+        id: conversationId,
+        title: taskTitle,
+        preview: finalQuestion.length > 46 ? `${finalQuestion.slice(0, 46)}…` : finalQuestion,
+        question: finalQuestion,
+        route: classified.route,
+        answerId: classified.answerId,
+        time: "刚刚",
+        group: "今天",
+        type: conversationType,
+        searchable: `${taskTitle} ${finalQuestion}`,
+      }, ...current]);
+      setSidebarProjects((current) => current.map((project) => project.id === activeProjectId
+        ? { ...project, conversationIds: [conversationId, ...project.conversationIds] }
+        : project));
+      setExpandedProjectIds((current) => current.includes(activeProjectId) ? current : [...current, activeProjectId]);
+      setActiveConversationId(conversationId);
+      setActiveProjectId(null);
+    }
 
     const requiresClarification = options?.clarify || /谁(?:的商机)?推进最慢|谁最好|谁风险最大/.test(finalQuestion);
     if (requiresClarification) {
@@ -1007,6 +1173,8 @@ function ExecutiveWorkspace({
   }
 
   function openConversation(item: ConversationItem) {
+    setActiveProjectId(null);
+    setActiveConversationId(item.id);
     setUnreadConversationIds((current) => current.filter((id) => id !== item.id));
     setSidebarMenu(null);
     if (item.type === "每日摘要") {
@@ -1019,10 +1187,18 @@ function ExecutiveWorkspace({
       setSidebarOpen(false);
       return;
     }
-    const route: RouteKind = item.type === "文件" ? "file" : item.type === "泛化" ? "research" : "data";
-    const answerId = item.type === "文件" ? "file" : item.type === "泛化" ? "research" : item.title.includes("项目") ? "delivery" : "overview";
+    const route: RouteKind = item.route ?? (item.type === "文件" ? "file" : item.type === "泛化" ? "research" : "data");
+    const answerId = item.answerId ?? (item.type === "文件"
+      ? "file"
+      : item.type === "泛化"
+        ? "research"
+        : /回款|应收|现金/.test(item.title)
+          ? "collection"
+          : item.title.includes("项目")
+            ? "delivery"
+            : "overview");
     setChatTitle(item.title);
-    setLastQuestion(item.title);
+    setLastQuestion(item.question ?? item.title);
     setPreviousQuestion("");
     setRouteKind(route);
     setActiveAnswerId(answerId);
@@ -1039,6 +1215,7 @@ function ExecutiveWorkspace({
     const nextTitle = title.trim();
     if (!nextTitle) return;
     setConversations((current) => current.map((item) => item.id === id ? { ...item, title: nextTitle } : item));
+    if (activeConversationId === id) setChatTitle(nextTitle);
     notify("会话标题已修改");
   }
 
@@ -1050,6 +1227,14 @@ function ExecutiveWorkspace({
       tone: "danger",
       action: () => {
         setConversations((current) => current.filter((conversation) => conversation.id !== item.id));
+        setSidebarProjects((current) => current.map((project) => ({
+          ...project,
+          conversationIds: project.conversationIds.filter((id) => id !== item.id),
+        })));
+        setPinnedConversationIds((current) => current.filter((id) => id !== item.id));
+        setUnreadConversationIds((current) => current.filter((id) => id !== item.id));
+        setArchivedConversationIds((current) => current.filter((id) => id !== item.id));
+        if (activeConversationId === item.id) resetConversation();
         notify("会话已删除");
       },
     });
@@ -1099,6 +1284,8 @@ function ExecutiveWorkspace({
   }
 
   function runDemoScenario(id: number) {
+    setActiveProjectId(null);
+    setActiveConversationId(null);
     setDemoOpen(false);
     if (id === 1) {
       setActivePanel(null);
@@ -1146,6 +1333,7 @@ function ExecutiveWorkspace({
   }
 
   function openPersonalCenter(nextView: PersonalCenterView) {
+    setActiveProjectId(null);
     setAccountMenuOpen(false);
     setLanguageMenuOpen(false);
     setActivePanel(null);
@@ -1180,8 +1368,11 @@ function ExecutiveWorkspace({
     capabilities: "可查询范围",
     account: "账号与推送",
   };
-  const sidebarMenuConversation = sidebarMenu
+  const sidebarMenuConversation = sidebarMenu?.kind === "conversation"
     ? conversations.find((item) => item.id === sidebarMenu.conversationId) ?? null
+    : null;
+  const sidebarMenuProject = sidebarMenu?.kind === "project"
+    ? sidebarProjects.find((project) => project.id === sidebarMenu.projectId) ?? null
     : null;
   const reportPanelOpen = activePanel === "daily" || activePanel === "weekly";
 
@@ -1229,11 +1420,11 @@ function ExecutiveWorkspace({
                       </form>
                     ) : (
                       <>
-                        <button type="button" className={`sidebar-conversation-button ${view === "chat" && chatTitle === item.title ? "active" : ""}`} onClick={() => openConversation(item)}>
+                        <button type="button" className={`sidebar-conversation-button ${view === "chat" && activeConversationId === item.id ? "active" : ""}`} onClick={() => openConversation(item)}>
                           <span className={`sidebar-unread-dot ${unreadConversationIds.includes(item.id) ? "visible" : ""}`} aria-hidden="true" />
                           <strong>{item.title}</strong>
                         </button>
-                        <button type="button" className="sidebar-row-menu-button" data-sidebar-menu aria-label={`打开“${item.title}”操作菜单`} aria-expanded={sidebarMenu?.conversationId === item.id} onClick={(event) => openSidebarMenu(event, item.id)}>•••</button>
+                        <button type="button" className="sidebar-row-menu-button" data-sidebar-menu aria-label={`打开“${item.title}”操作菜单`} aria-haspopup="menu" aria-expanded={sidebarMenu?.kind === "conversation" && sidebarMenu.conversationId === item.id} onClick={(event) => openSidebarMenu(event, { kind: "conversation", conversationId: item.id })}>•••</button>
                       </>
                     )}
                   </div>
@@ -1242,25 +1433,37 @@ function ExecutiveWorkspace({
             </section>
 
             <section className="sidebar-section" aria-labelledby="sidebar-projects-title">
-              <header className="sidebar-section-header"><span id="sidebar-projects-title">{copy.projects}</span></header>
+              <header className="sidebar-section-header"><span id="sidebar-projects-title">{copy.projects}</span><button type="button" className="sidebar-add-project" aria-label="新建项目" onClick={() => setProjectDialog({ mode: "create" })}>＋</button></header>
               <div className="sidebar-list sidebar-project-list">
-                {sidebarProjects.map((project) => {
+                {orderedSidebarProjects.map((project) => {
                   const expanded = expandedProjectIds.includes(project.id);
+                  const pinned = pinnedProjectIds.includes(project.id);
+                  const projectConversations = project.conversationIds
+                    .map((conversationId) => conversations.find((conversation) => conversation.id === conversationId))
+                    .filter((conversation): conversation is ConversationItem => Boolean(conversation))
+                    .filter((conversation) => !archivedConversationIds.includes(conversation.id));
                   return (
-                    <div className="sidebar-project" key={project.id}>
-                      <button type="button" className="sidebar-project-button" aria-expanded={expanded} onClick={() => toggleProject(project.id)}>
-                        <span className="sidebar-disclosure" aria-hidden="true">{expanded ? "⌄" : "›"}</span>
-                        <span className="sidebar-project-mark" aria-hidden="true" />
-                        <strong>{project.title}</strong>
-                      </button>
+                    <div className={`sidebar-project ${pinned ? "pinned" : ""}`} key={project.id}>
+                      <div className="sidebar-project-row-shell">
+                        <button type="button" className="sidebar-project-button" aria-expanded={expanded} title={project.description || project.title} onClick={() => toggleProject(project.id)}>
+                          <span className="sidebar-disclosure" aria-hidden="true">{expanded ? "⌄" : "›"}</span>
+                          <span className="sidebar-project-mark" aria-hidden="true" />
+                          <strong>{project.title}</strong>
+                        </button>
+                        <button type="button" className="sidebar-row-menu-button sidebar-project-menu-button" data-sidebar-menu aria-label={`打开“${project.title}”项目菜单`} aria-haspopup="menu" aria-expanded={sidebarMenu?.kind === "project" && sidebarMenu.projectId === project.id} onClick={(event) => openSidebarMenu(event, { kind: "project", projectId: project.id })}>•••</button>
+                      </div>
                       {expanded && (
                         <div className="sidebar-project-conversations">
-                          {project.conversations.map((conversation) => (
-                            <button type="button" key={conversation.id} onClick={() => startProcessing(conversation.question)}>
+                          {projectConversations.map((conversation) => (
+                            <button type="button" key={conversation.id} className={view === "chat" && activeConversationId === conversation.id ? "active" : ""} onClick={() => openConversation(conversation)}>
                               <span aria-hidden="true" />
                               <strong>{conversation.title}</strong>
                             </button>
                           ))}
+                          <button type="button" className={`sidebar-project-start-button ${activeProjectId === project.id ? "active" : ""}`} onClick={() => startProjectConversation(project)}>
+                            <span aria-hidden="true">＋</span>
+                            <strong>{activeProjectId === project.id ? "等待输入第一个问题" : "在此项目新建会话"}</strong>
+                          </button>
                         </div>
                       )}
                     </div>
@@ -1282,11 +1485,11 @@ function ExecutiveWorkspace({
                       </form>
                     ) : (
                       <>
-                        <button type="button" className={`sidebar-conversation-button ${view === "chat" && chatTitle === item.title ? "active" : ""}`} onClick={() => openConversation(item)}>
+                        <button type="button" className={`sidebar-conversation-button ${view === "chat" && activeConversationId === item.id ? "active" : ""}`} onClick={() => openConversation(item)}>
                           <span className={`sidebar-unread-dot ${unreadConversationIds.includes(item.id) ? "visible" : ""}`} aria-hidden="true" />
                           <strong>{item.title}</strong>
                         </button>
-                        <button type="button" className="sidebar-row-menu-button" data-sidebar-menu aria-label={`打开“${item.title}”操作菜单`} aria-expanded={sidebarMenu?.conversationId === item.id} onClick={(event) => openSidebarMenu(event, item.id)}>•••</button>
+                        <button type="button" className="sidebar-row-menu-button" data-sidebar-menu aria-label={`打开“${item.title}”操作菜单`} aria-haspopup="menu" aria-expanded={sidebarMenu?.kind === "conversation" && sidebarMenu.conversationId === item.id} onClick={(event) => openSidebarMenu(event, { kind: "conversation", conversationId: item.id })}>•••</button>
                       </>
                     )}
                   </div>
@@ -1335,16 +1538,25 @@ function ExecutiveWorkspace({
         </footer>
 
         {sidebarMenu && sidebarMenuConversation && (
-          <div className="sidebar-context-menu" data-sidebar-menu role="menu" aria-label={`“${sidebarMenuConversation.title}”会话操作`} style={{ top: sidebarMenu.top }}>
+          <div ref={sidebarMenuRef} className="sidebar-context-menu" data-sidebar-menu role="menu" aria-label={`“${sidebarMenuConversation.title}”会话操作`} style={{ top: sidebarMenu.top }}>
             <button type="button" role="menuitem" onClick={() => togglePinnedConversation(sidebarMenuConversation.id)}>{pinnedConversationIds.includes(sidebarMenuConversation.id) ? "取消置顶" : "置顶"}</button>
             <button type="button" role="menuitem" onClick={() => toggleUnread(sidebarMenuConversation.id)}>{unreadConversationIds.includes(sidebarMenuConversation.id) ? "标记为已读" : "标记未读"}</button>
             <button type="button" role="menuitem" onClick={() => beginSidebarRename(sidebarMenuConversation)}>重命名</button>
-            <button type="button" role="menuitem" onClick={() => archiveConversation(sidebarMenuConversation)}>归档</button>
+            <button type="button" role="menuitem" onClick={() => requestArchiveConversation(sidebarMenuConversation)}>归档</button>
             <span className="sidebar-menu-divider" role="separator" />
             <button type="button" role="menuitem" onClick={() => copyConversationId(sidebarMenuConversation)}>复制会话 ID</button>
             <button type="button" role="menuitem" onClick={() => copyConversationDeepLink(sidebarMenuConversation)}>复制深度链接</button>
             <span className="sidebar-menu-divider" role="separator" />
             <button type="button" role="menuitem" onClick={() => continueInNewConversation(sidebarMenuConversation)}>在新会话中继续</button>
+          </div>
+        )}
+        {sidebarMenu && sidebarMenuProject && (
+          <div ref={sidebarMenuRef} className="sidebar-context-menu sidebar-project-context-menu" data-sidebar-menu role="menu" aria-label={`“${sidebarMenuProject.title}”项目操作`} style={{ top: sidebarMenu.top }}>
+            <button type="button" role="menuitem" onClick={() => togglePinnedProject(sidebarMenuProject)}><UiIcon name="pin" /><span>{pinnedProjectIds.includes(sidebarMenuProject.id) ? "取消置顶项目" : "置顶项目"}</span></button>
+            <button type="button" role="menuitem" onClick={() => { setSidebarMenu(null); setProjectDialog({ mode: "edit", projectId: sidebarMenuProject.id }); }}><UiIcon name="edit" /><span>编辑项目</span></button>
+            <button type="button" role="menuitem" disabled={!sidebarMenuProject.conversationIds.some((id) => !archivedConversationIds.includes(id))} onClick={() => requestArchiveProjectTasks(sidebarMenuProject)}><UiIcon name="archive" /><span>归档任务</span></button>
+            <span className="sidebar-menu-divider" role="separator" />
+            <button type="button" className="danger" role="menuitem" onClick={() => requestRemoveProject(sidebarMenuProject)}><UiIcon name="remove" /><span>移除</span></button>
           </div>
         )}
       </aside>
@@ -1487,6 +1699,15 @@ function ExecutiveWorkspace({
         />
       )}
       {demoOpen && <DemoDrawer onClose={() => setDemoOpen(false)} onRun={runDemoScenario} />}
+      {projectDialog && (
+        <ProjectDialog
+          key={projectDialog.mode === "create" ? "create-project" : `edit-${projectDialog.projectId}`}
+          state={projectDialog}
+          project={projectDialog.mode === "edit" ? sidebarProjects.find((project) => project.id === projectDialog.projectId) ?? null : null}
+          onClose={() => setProjectDialog(null)}
+          onSave={(title, description) => saveProject(projectDialog, title, description)}
+        />
+      )}
       {confirmState && (
         <ConfirmDialog
           state={confirmState}
@@ -1749,7 +1970,7 @@ function ChatView({
   );
 }
 
-type UiIconName = "settings" | "language" | "logout" | "chevron" | "search" | "check" | "profile" | "appearance" | "memory" | "system" | "light" | "dark" | "edit" | "shield";
+type UiIconName = "settings" | "language" | "logout" | "chevron" | "search" | "check" | "profile" | "appearance" | "memory" | "system" | "light" | "dark" | "edit" | "shield" | "pin" | "archive" | "remove" | "folder";
 
 function UiIcon({ name }: { name: UiIconName }) {
   const paths: Record<UiIconName, ReactNode> = {
@@ -1767,6 +1988,10 @@ function UiIcon({ name }: { name: UiIconName }) {
     dark: <path d="M19.5 15.5A8 8 0 0 1 8.5 4.5a8.2 8.2 0 1 0 11 11Z" />,
     edit: <><path d="m5 16-.7 3.7L8 19l9.8-9.8-3-3L5 16Z" /><path d="m13.8 7.2 3 3" /></>,
     shield: <><path d="M12 3.5 19 6v5.4c0 4.2-2.3 7.1-7 9.1-4.7-2-7-4.9-7-9.1V6l7-2.5Z" /><path d="m9 12 2 2 4-4" /></>,
+    pin: <><path d="m14 4 6 6-3 1-3.5 3.5 1 3-1.5 1.5-4-4-4.5 4.5" /><path d="m7 8 3 1L13.5 5l.5-1Z" /></>,
+    archive: <><rect x="4" y="5" width="16" height="4" rx="1" /><path d="M6 9v9.5h12V9M10 13h4" /></>,
+    remove: <><path d="M5 5l14 14M19 5 5 19" /></>,
+    folder: <><path d="M3.5 7.5h6l2-2h8a1.5 1.5 0 0 1 1.5 1.5v10.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a1.5 1.5 0 0 1 .5-1.5Z" /><path d="M3.5 9h17.5" /></>,
   };
   return <svg className="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
@@ -2461,12 +2686,118 @@ function AdminRuntime({ onNotify }: { onNotify: (message: string) => void }) {
   return <div className="page subpage admin-page"><section className="page-heading split"><div><p className="eyebrow">部署版本 demo-2026.07.26</p><h1>运行状态</h1><p>诊断信息不包含完整密钥、Prompt 或高层消息正文。</p></div><div className="heading-actions"><button type="button" className="secondary-button" onClick={() => onNotify("健康检查完成，6 项正常，1 项关注")}>立即健康检查</button><button type="button" className="primary-button" onClick={downloadReport}>下载脱敏诊断</button></div></section><section className="runtime-grid">{runtime.map(([label, value, tone]) => <article key={label}><small>{label}</small><strong>{value}</strong><StatusBadge tone={tone} label={tone === "positive" ? "正常" : "关注"} /></article>)}</section><section className="settings-section"><header className="section-header"><div><p className="eyebrow">最近错误摘要</p><h2>可恢复问题</h2></div></header><div className="error-summary"><span className="status-dot attention" /><div><strong>飞书推送请求超时</strong><p>内容已在 H5 保存，可只重试推送。同一内容成功后不会重复发送。</p><dl><div><dt>发生时间</dt><dd>今天 07:30</dd></div><div><dt>错误标识</dt><dd>push_timeout_redacted</dd></div><div><dt>关联内容</dt><dd>每日经营变化｜7月26日</dd></div></dl></div><button type="button" className="secondary-button" onClick={() => onNotify("推送重试成功")}>重试推送</button></div></section><section className="settings-section"><header className="section-header"><div><p className="eyebrow">审计摘要</p><h2>最近路由记录</h2></div><span>不含用户消息正文</span></header><div className="simple-list"><div><time>09:12:06</time><span><strong>经营数据</strong><small>范围完整，调用只读数据能力</small></span><StatusBadge tone="positive" label="完成" /></div><div><time>09:08:42</time><span><strong>当前会话文件</strong><small>限定当前会话 1 个文件</small></span><StatusBadge tone="positive" label="完成" /></div><div><time>08:56:18</time><span><strong>公开研究</strong><small>脱敏检查通过</small></span><StatusBadge tone="positive" label="完成" /></div></div></section></div>;
 }
 
+function ProjectDialog({
+  state,
+  project,
+  onClose,
+  onSave,
+}: {
+  state: ProjectDialogState;
+  project: SidebarProject | null;
+  onClose: () => void;
+  onSave: (title: string, description: string) => string | null;
+}) {
+  const [title, setTitle] = useState(project?.title ?? "");
+  const [description, setDescription] = useState(project?.description ?? "");
+  const [error, setError] = useState("");
+  const dialogRef = useRef<HTMLElement>(null);
+  const editing = state.mode === "edit";
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.requestAnimationFrame(() => dialogRef.current?.querySelector<HTMLInputElement>("input")?.focus());
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled])"));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onClose]);
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    const nextTitle = title.trim();
+    if (!nextTitle) {
+      setError("请输入项目名称。");
+      return;
+    }
+    const validationError = onSave(nextTitle, description.trim());
+    if (validationError) setError(validationError);
+  }
+
+  return (
+    <div className="project-dialog-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section ref={dialogRef} className="project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title">
+        <header>
+          <div><small>{editing ? "项目设置" : "工作项目"}</small><h2 id="project-dialog-title">{editing ? "编辑项目" : "创建项目"}</h2></div>
+          <button type="button" aria-label="关闭项目窗口" onClick={onClose}>×</button>
+        </header>
+        <form onSubmit={submit}>
+          <label className="project-name-field">
+            <span>项目名称</span>
+            <span className="project-name-input"><UiIcon name="folder" /><input value={title} maxLength={32} onChange={(event) => { setTitle(event.target.value); setError(""); }} placeholder="例如：年度经营计划" autoComplete="off" /></span>
+          </label>
+          <label className="project-description-field">
+            <span>项目说明 <small>可选</small></span>
+            <textarea value={description} maxLength={120} rows={3} onChange={(event) => setDescription(event.target.value)} placeholder="说明该项目持续关注的经营主题或范围" />
+            <small>创建后，可直接从项目中开始一条新会话。</small>
+          </label>
+          {error && <p className="project-dialog-error" role="alert">{error}</p>}
+          <footer><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={!title.trim()}>{editing ? "保存修改" : "创建项目"}</button></footer>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function StatusBadge({ tone, label }: { tone: Tone; label: string }) {
   return <span className={`status-badge ${tone}`}>{label}</span>;
 }
 
 function ConfirmDialog({ state, onCancel, onConfirm }: { state: ConfirmState; onCancel: () => void; onConfirm: () => void }) {
-  return <div className="overlay dialog-overlay" role="presentation"><section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><span className={`confirm-mark ${state.tone === "danger" ? "danger" : ""}`} aria-hidden="true">!</span><h2 id="confirm-title">{state.title}</h2><p>{state.description}</p><div><button type="button" className="secondary-button" onClick={onCancel}>取消</button><button type="button" className={state.tone === "danger" ? "danger-button" : "primary-button"} onClick={onConfirm}>{state.confirmLabel}</button></div></section></div>;
+  const dialogRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    window.requestAnimationFrame(() => dialogRef.current?.querySelector<HTMLButtonElement>("button")?.focus());
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCancel();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLButtonElement>("button:not([disabled])"));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onCancel]);
+
+  return <div className="overlay dialog-overlay" role="presentation"><section ref={dialogRef} className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><span className={`confirm-mark ${state.tone === "danger" ? "danger" : ""}`} aria-hidden="true">!</span><h2 id="confirm-title">{state.title}</h2><p>{state.description}</p><div><button type="button" className="secondary-button" onClick={onCancel}>取消</button><button type="button" className={state.tone === "danger" ? "danger-button" : "primary-button"} onClick={onConfirm}>{state.confirmLabel}</button></div></section></div>;
 }
 
 function EmptyState({ title, description, action, onAction }: { title: string; description: string; action?: string; onAction?: () => void }) {
@@ -2480,6 +2811,11 @@ function Toast({ message }: { message: string }) {
 function makeConversationTitle(question: string, answerId: string) {
   const known: Record<string, string> = { overview: "本月整体经营情况", target: "收入目标完成与差距", change: "商机变化原因", forecast: "本季度签约预测", customers: "重点客户经营情况", delivery: "项目交付与回款", collection: "本月回款情况", organization: "组织与负责人表现", people: "负责人商机推进对比", file: "当前文件要点", research: "行业公开研究", general: "经营材料整理", failure: "回款数据查询" };
   return known[answerId] ?? question.slice(0, 20);
+}
+
+function makeTaskTitle(question: string) {
+  const normalized = question.trim().replace(/[？?。！!]+$/, "");
+  return normalized.length > 24 ? `${normalized.slice(0, 24)}…` : normalized;
 }
 
 function safeRouteSummary(route: RouteKind) {

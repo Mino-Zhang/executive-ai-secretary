@@ -75,6 +75,9 @@ export type ConversationItem = {
   id: number;
   title: string;
   preview: string;
+  question?: string;
+  route?: RouteKind;
+  answerId?: string;
   time: string;
   group: "今天" | "昨天" | "更早";
   type: "数据" | "文件" | "泛化" | "每日摘要" | "每周简报";
@@ -196,6 +199,42 @@ export const initialConversations: ConversationItem[] = [
     group: "更早",
     type: "泛化",
     searchable: "行业 公开研究 竞争对手",
+  },
+  {
+    id: 7,
+    title: "本月回款差距",
+    preview: "梳理主要客户回款差距与最新承诺节点。",
+    time: "7月17日 09:24",
+    group: "更早",
+    type: "数据",
+    searchable: "回款 差距 客户 逾期 现金流",
+  },
+  {
+    id: 8,
+    title: "逾期应收处置建议",
+    preview: "整理逾期应收的处置顺序、责任人与确认时间。",
+    time: "7月16日 16:08",
+    group: "更早",
+    type: "数据",
+    searchable: "逾期 应收 处置 回款 责任节点",
+  },
+  {
+    id: 9,
+    title: "两个延期项目卡在哪里",
+    preview: "定位客户确认与交付资源排期的具体偏差。",
+    time: "7月15日 10:36",
+    group: "更早",
+    type: "数据",
+    searchable: "项目 延期 里程碑 客户确认 资源排期",
+  },
+  {
+    id: 10,
+    title: "重点项目复盘",
+    preview: "汇总重点项目延期原因和下一步动作。",
+    time: "7月14日 18:12",
+    group: "更早",
+    type: "数据",
+    searchable: "重点项目 复盘 延期 动作",
   },
 ];
 

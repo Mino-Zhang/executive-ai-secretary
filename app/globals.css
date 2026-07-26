@@ -7002,6 +7002,7 @@ tbody tr:last-child td {
   }
 
   .workspace-sidebar {
+    z-index: 70;
     width: min(86vw, 276px);
   }
 
@@ -8956,4 +8957,383 @@ select:focus {
   .appearance-options > button { grid-template-columns: 104px minmax(0, 1fr); }
   .appearance-preview { height: 78px; }
   .preferences-memory-pane { padding: 14px 13px 40px; }
+}
+
+/* V8 — real project controls, safe destructive actions and readable microcopy. */
+.sidebar-section-header,
+.sidebar-section-header button {
+  font-size: 12.5px;
+  font-weight: 520;
+  letter-spacing: 0;
+}
+
+.sidebar-add-project {
+  display: grid;
+  width: 23px;
+  height: 23px;
+  place-items: center;
+  padding: 0;
+  border-radius: 6px;
+  color: var(--theme-muted);
+  font-size: 16px !important;
+  font-weight: 350 !important;
+}
+
+.sidebar-add-project:hover,
+.sidebar-add-project:focus-visible {
+  color: var(--theme-ink);
+  background: var(--theme-soft);
+}
+
+.sidebar-project {
+  position: relative;
+}
+
+.sidebar-project-row-shell {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 25px;
+  align-items: center;
+  border-radius: 6px;
+}
+
+.sidebar-project-row-shell:hover,
+.sidebar-project-row-shell:focus-within {
+  background: var(--theme-soft);
+}
+
+.sidebar-project-row-shell .sidebar-project-button,
+.sidebar-project-row-shell .sidebar-project-button:hover {
+  background: transparent;
+}
+
+.sidebar-project-row-shell:hover .sidebar-project-menu-button,
+.sidebar-project-row-shell:focus-within .sidebar-project-menu-button,
+.sidebar-project-menu-button:focus-visible,
+.sidebar-project-menu-button[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.sidebar-project.pinned .sidebar-project-mark {
+  border-color: var(--theme-accent-strong);
+  background: var(--theme-accent-strong);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--theme-accent) 10%, transparent);
+}
+
+.sidebar-project-conversations button.active {
+  color: var(--theme-accent-strong);
+  background: var(--theme-accent-soft);
+}
+
+.sidebar-project-conversations .sidebar-project-start-button {
+  color: var(--theme-muted);
+}
+
+.sidebar-project-conversations .sidebar-project-start-button > span {
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  color: var(--theme-muted);
+  background: transparent;
+  font-size: 14px;
+  font-weight: 350;
+  line-height: 1;
+}
+
+.sidebar-project-conversations .sidebar-project-start-button.active {
+  color: var(--theme-accent-strong);
+}
+
+.sidebar-project-context-menu button {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+}
+
+.sidebar-project-context-menu .ui-icon {
+  width: 16px;
+  height: 16px;
+  color: var(--theme-muted);
+}
+
+.sidebar-context-menu button:disabled {
+  color: var(--theme-faint);
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.sidebar-context-menu button:disabled:hover {
+  color: var(--theme-faint);
+  background: transparent;
+}
+
+.sidebar-context-menu button.danger:hover {
+  color: var(--theme-risk);
+  background: var(--theme-risk-soft);
+}
+
+.sidebar-context-menu button.danger:hover .ui-icon {
+  color: currentColor;
+}
+
+@keyframes menu-in {
+  from { opacity: 0; transform: translateY(-3px) scale(.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.workspace-greeting > p {
+  font-size: 12px;
+}
+
+.workspace-greeting > span {
+  font-size: 14px;
+}
+
+.composer-tool-button {
+  font-size: 12px;
+}
+
+.prompt-suggestions h2 {
+  font-size: 11px;
+}
+
+.prompt-suggestions button span {
+  font-size: 12px;
+}
+
+.project-dialog-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 230;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--theme-overlay);
+  backdrop-filter: blur(7px);
+  animation: overlay-in 150ms ease both;
+}
+
+.project-dialog {
+  width: min(560px, calc(100vw - 48px));
+  overflow: hidden;
+  border: 1px solid var(--theme-line);
+  border-radius: 16px;
+  color: var(--theme-ink);
+  background: var(--theme-elevated);
+  box-shadow: var(--theme-shadow-elevated);
+  animation: preferences-in 180ms cubic-bezier(.2,.75,.25,1) both;
+}
+
+.project-dialog > header {
+  display: flex;
+  min-height: 72px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 15px 18px 14px 22px;
+  border-bottom: 1px solid var(--theme-line);
+}
+
+.project-dialog > header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.project-dialog > header small {
+  color: var(--theme-muted);
+  font-size: 9px;
+}
+
+.project-dialog h2 {
+  margin: 0;
+  font-size: 23px;
+  font-weight: 560;
+  letter-spacing: -.025em;
+}
+
+.project-dialog > header > button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--theme-muted);
+  background: var(--theme-soft);
+  font-size: 20px;
+  font-weight: 300;
+}
+
+.project-dialog > header > button:hover {
+  color: var(--theme-ink);
+}
+
+.project-dialog form {
+  display: grid;
+  gap: 20px;
+  padding: 22px;
+}
+
+.project-dialog label {
+  display: grid;
+  gap: 8px;
+}
+
+.project-dialog label > span:first-child {
+  color: var(--theme-ink-soft);
+  font-size: 11px;
+  font-weight: 570;
+}
+
+.project-dialog label > span:first-child small {
+  margin-left: 4px;
+  color: var(--theme-muted);
+  font-size: 9px;
+  font-weight: 450;
+}
+
+.project-name-input {
+  display: grid;
+  height: 46px;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--theme-line-strong);
+  border-radius: 11px;
+  background: var(--theme-surface);
+}
+
+.project-name-input:focus-within {
+  border-color: color-mix(in srgb, var(--theme-accent) 68%, var(--theme-line-strong));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--theme-accent) 12%, transparent);
+}
+
+.project-name-input .ui-icon {
+  width: 18px;
+  height: 18px;
+  justify-self: center;
+  color: var(--theme-muted);
+}
+
+.project-name-input input {
+  min-width: 0;
+  height: 100%;
+  padding: 0 12px;
+  border: 0;
+  border-left: 1px solid var(--theme-line);
+  border-radius: 0;
+  outline: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 13px;
+}
+
+.project-description-field textarea {
+  min-height: 92px;
+  padding: 11px 12px;
+  border: 1px solid var(--theme-line-strong);
+  border-radius: 11px;
+  color: var(--theme-ink);
+  background: var(--theme-surface);
+  font-size: 12px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.project-description-field > small {
+  color: var(--theme-muted);
+  font-size: 9px;
+}
+
+.project-dialog-error {
+  margin: -8px 0 0;
+  color: var(--theme-risk);
+  font-size: 10.5px;
+}
+
+.project-dialog form > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.project-dialog form > footer button {
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 9px;
+  font-size: 11px;
+}
+
+.dialog-overlay {
+  z-index: 240;
+  background: var(--theme-overlay);
+  backdrop-filter: blur(6px);
+}
+
+.confirm-dialog {
+  width: min(430px, calc(100vw - 32px));
+  max-height: min(80dvh, 640px);
+  overflow: auto;
+  border-color: var(--theme-line);
+  border-radius: 14px;
+  color: var(--theme-ink);
+  background: var(--theme-elevated);
+  box-shadow: var(--theme-shadow-elevated);
+}
+
+.confirm-dialog p {
+  color: var(--theme-muted);
+}
+
+.danger-button:hover {
+  background: color-mix(in srgb, var(--theme-risk) 82%, var(--theme-ink));
+}
+
+@media (max-width: 900px) {
+  .sidebar-project-menu-button {
+    opacity: 1;
+  }
+
+  .sidebar-context-menu {
+    max-height: calc(100dvh - 24px);
+    padding-bottom: calc(5px + env(safe-area-inset-bottom));
+    border-radius: 14px;
+  }
+}
+
+@media (max-width: 680px) {
+  .project-dialog-layer {
+    align-items: end;
+    padding: 12px;
+  }
+
+  .project-dialog {
+    width: 100%;
+    max-height: calc(100dvh - 24px);
+    border-radius: 16px;
+  }
+
+  .project-dialog > header {
+    min-height: 64px;
+    padding-left: 18px;
+  }
+
+  .project-dialog h2 {
+    font-size: 20px;
+  }
+
+  .project-dialog form {
+    gap: 17px;
+    padding: 18px;
+  }
+
+  .confirm-dialog {
+    padding: 22px 18px;
+  }
+
+  .confirm-dialog > div {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }

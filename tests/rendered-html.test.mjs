@@ -67,10 +67,21 @@ test("prototype source contains the required functional contracts", async () => 
   assert.match(page, /function OrganizationPicker/);
   assert.match(page, /configuredByAdmin/);
   assert.match(page, /function PersonalCenterWindow/);
+  assert.match(page, /function ProjectDialog/);
+  assert.match(page, /aria-label="新建项目"/);
+  assert.match(page, /const \[sidebarProjects, setSidebarProjects\] = useState<SidebarProject\[]>/);
+  assert.match(page, /function requestArchiveConversation/);
+  assert.match(page, /function requestArchiveProjectTasks/);
+  assert.match(page, /function requestRemoveProject/);
+  assert.match(page, /归档后，这条会话将从置顶、项目和最近列表中隐藏/);
+  assert.match(page, /只会移除项目分组/);
+  assert.match(page, /aria-haspopup="menu"/);
   assert.match(page, /"zh-CN".*"zh-TW".*"en"/s);
   assert.doesNotMatch(page, /ResponsePreferenceControl|回答：标准|maxLength=\{1200\}/);
   assert.match(styles, /\.preferences-window/);
   assert.match(styles, /\.organization-popover/);
+  assert.match(styles, /\.project-dialog-layer/);
+  assert.match(styles, /\.sidebar-project-context-menu/);
   for (const id of ["overview", "target", "change", "forecast", "customers", "delivery", "collection", "organization"]) {
     assert.match(data, new RegExp(`\\b${id}: \\{`));
   }
