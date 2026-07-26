@@ -4,6 +4,7 @@ import {
   ChangeEvent,
   FormEvent,
   KeyboardEvent,
+  MouseEvent as ReactMouseEvent,
   RefObject,
   useEffect,
   useMemo,
@@ -75,6 +76,21 @@ type RouteRecord = {
   status: "待补充范围" | "已路由" | "待网络确认";
 };
 
+type SidebarMenuState = {
+  conversationId: number;
+  top: number;
+};
+
+type SidebarProject = {
+  id: string;
+  title: string;
+  conversations: Array<{
+    id: string;
+    title: string;
+    question: string;
+  }>;
+};
+
 const organizations = ["全部事业部", "华东事业部", "华南事业部", "北区事业部"];
 const owners = ["陈岚", "林序", "唐昱", "顾宁"];
 const workspaceNavigation: Array<{ id: WorkspacePanelView; label: string; short: string }> = [
@@ -82,6 +98,25 @@ const workspaceNavigation: Array<{ id: WorkspacePanelView; label: string; short:
   { id: "weekly", label: "每周高层简报", short: "周" },
   { id: "history", label: "历史会话", short: "历" },
   { id: "memory", label: "长期记忆", short: "记" },
+];
+
+const sidebarProjects: SidebarProject[] = [
+  {
+    id: "collection",
+    title: "回款与现金流",
+    conversations: [
+      { id: "collection-gap", title: "本月回款差距", question: "本月回款差距主要来自哪些客户？" },
+      { id: "collection-action", title: "逾期应收处置建议", question: "整理三笔逾期应收的处置建议和责任节点。" },
+    ],
+  },
+  {
+    id: "delivery",
+    title: "重点项目交付",
+    conversations: [
+      { id: "delivery-milestone", title: "两个延期项目卡在哪里", question: "两个延期项目分别卡在哪个里程碑？" },
+      { id: "delivery-review", title: "重点项目复盘", question: "整理重点项目延期原因和下一步动作。" },
+    ],
+  },
 ];
 
 export default function ProductPrototype() {
@@ -96,6 +131,7 @@ export default function ProductPrototype() {
   const [attempts, setAttempts] = useState(0);
   const [lockedUntil, setLockedUntil] = useState<number | null>(null);
   const [pendingDestination, setPendingDestination] = useState<ExecutiveView>("home");
+  const [pendingConversationId, setPendingConversationId] = useState<number | null>(null);
 
   function switchMode(nextMode: LoginMode) {
     setMode(nextMode);
@@ -153,7 +189,9 @@ export default function ProductPrototype() {
     }
     setLoginError("");
     const destination = new URLSearchParams(window.location.search).get("view");
+    const conversationId = Number(new URLSearchParams(window.location.search).get("conversation"));
     setPendingDestination(destination === "daily" || destination === "weekly" ? destination : "home");
+    setPendingConversationId(Number.isFinite(conversationId) && conversationId > 0 ? conversationId : null);
     setRole("executive");
   }
 
@@ -198,7 +236,7 @@ export default function ProductPrototype() {
     return <AdminWorkspace onLogout={logout} />;
   }
 
-  return <ExecutiveWorkspace initialView={pendingDestination} onLogout={logout} />;
+  return <ExecutiveWorkspace initialView={pendingDestination} initialConversationId={pendingConversationId} onLogout={logout} />;
 }
 
 function LoginScreen({
@@ -315,29 +353,41 @@ function LoginScreen({
   );
 }
 
-function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveView; onLogout: () => void }) {
-  const [view, setView] = useState<ExecutiveView>(initialView === "chat" ? "chat" : "home");
-  const [activePanel, setActivePanel] = useState<WorkspacePanelView | null>(initialView !== "home" && initialView !== "chat" ? initialView : null);
+function ExecutiveWorkspace({ initialView, initialConversationId, onLogout }: { initialView: ExecutiveView; initialConversationId: number | null; onLogout: () => void }) {
+  const linkedConversation = initialConversationId ? initialConversations.find((item) => item.id === initialConversationId) : undefined;
+  const linkedPanel: WorkspacePanelView | null = linkedConversation?.type === "每日摘要" ? "daily" : linkedConversation?.type === "每周简报" ? "weekly" : null;
+  const linkedRoute: RouteKind = linkedConversation?.type === "文件" ? "file" : linkedConversation?.type === "泛化" ? "research" : "data";
+  const linkedAnswerId = linkedConversation?.type === "文件" ? "file" : linkedConversation?.type === "泛化" ? "research" : linkedConversation?.title.includes("项目") ? "delivery" : "overview";
+  const linkedChat = Boolean(linkedConversation && !linkedPanel);
+  const [view, setView] = useState<ExecutiveView>(linkedChat || initialView === "chat" ? "chat" : "home");
+  const [activePanel, setActivePanel] = useState<WorkspacePanelView | null>(linkedPanel ?? (initialView !== "home" && initialView !== "chat" ? initialView : null));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [homeQuestion, setHomeQuestion] = useState("");
   const [chatDraft, setChatDraft] = useState("");
-  const [lastQuestion, setLastQuestion] = useState("");
+  const [lastQuestion, setLastQuestion] = useState(linkedChat ? linkedConversation?.title ?? "" : "");
   const [previousQuestion, setPreviousQuestion] = useState("");
-  const [chatStage, setChatStage] = useState<ChatStage>("empty");
-  const [routeKind, setRouteKind] = useState<RouteKind>("data");
-  const [activeAnswerId, setActiveAnswerId] = useState("overview");
+  const [chatStage, setChatStage] = useState<ChatStage>(linkedChat ? "ready" : "empty");
+  const [routeKind, setRouteKind] = useState<RouteKind>(linkedRoute);
+  const [activeAnswerId, setActiveAnswerId] = useState(linkedAnswerId);
   const [answerVersion, setAnswerVersion] = useState(1);
-  const [chatTitle, setChatTitle] = useState("新会话");
+  const [chatTitle, setChatTitle] = useState(linkedChat ? linkedConversation?.title ?? "新会话" : "新会话");
   const [scope, setScope] = useState<ScopeState>({ time: "本月累计", organizations: ["全部事业部"], owner: "", object: "" });
   const [scopePanelOpen, setScopePanelOpen] = useState(false);
-  const [files, setFiles] = useState<DemoFile[]>([]);
+  const [files, setFiles] = useState<DemoFile[]>(linkedConversation?.type === "文件" ? [demoReadyFile()] : []);
   const [selectedFile, setSelectedFile] = useState<number | null>(null);
   const [conversations, setConversations] = useState(initialConversations);
   const [memories, setMemories] = useState(initialMemories);
   const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [profileOpen, setProfileOpen] = useState(false);
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const [pinnedConversationIds, setPinnedConversationIds] = useState<number[]>([1, 2]);
+  const [unreadConversationIds, setUnreadConversationIds] = useState<number[]>([]);
+  const [archivedConversationIds, setArchivedConversationIds] = useState<number[]>([]);
+  const [expandedProjectIds, setExpandedProjectIds] = useState<string[]>(["collection"]);
+  const [sidebarMenu, setSidebarMenu] = useState<SidebarMenuState | null>(null);
+  const [sidebarRenameId, setSidebarRenameId] = useState<number | null>(null);
+  const [sidebarRenameDraft, setSidebarRenameDraft] = useState("");
   const [renamingConversation, setRenamingConversation] = useState(false);
   const [titleDraft, setTitleDraft] = useState("新会话");
   const [demoOpen, setDemoOpen] = useState(false);
@@ -356,6 +406,7 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
   const homeComposerRef = useRef<HTMLTextAreaElement>(null);
   const homeFileRef = useRef<HTMLInputElement>(null);
   const chatFileRef = useRef<HTMLInputElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     const handleOnline = () => setOnline(true);
@@ -376,6 +427,45 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
   }, [toast]);
 
   useEffect(() => {
+    if (!sidebarMenu) return;
+    const closeMenu = (event: PointerEvent) => {
+      if ((event.target as HTMLElement).closest("[data-sidebar-menu]")) return;
+      setSidebarMenu(null);
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    return () => window.removeEventListener("pointerdown", closeMenu);
+  }, [sidebarMenu]);
+
+  useEffect(() => {
+    const handleShortcut = (event: globalThis.KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
+      event.preventDefault();
+      timers.current.forEach((timer) => window.clearTimeout(timer));
+      timers.current = [];
+      setLastQuestion("");
+      setPreviousQuestion("");
+      setChatDraft("");
+      setChatStage("empty");
+      setRouteKind("data");
+      setActiveAnswerId("overview");
+      setAnswerVersion(1);
+      setChatTitle("新会话");
+      setFiles([]);
+      setScope({ time: "本月累计", organizations: ["全部事业部"], owner: "", object: "" });
+      setInheritedNotice("");
+      setMemoryCandidate(false);
+      setNewTopicNotice(false);
+      setSidebarMenu(null);
+      setSidebarRenameId(null);
+      setActivePanel(null);
+      setSidebarOpen(false);
+      setView("home");
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
+  useEffect(() => {
     const url = new URL(window.location.href);
     if (activePanel === "daily" || activePanel === "weekly") url.searchParams.set("view", activePanel);
     else url.searchParams.delete("view");
@@ -383,6 +473,18 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
   }, [activePanel]);
 
   const networkUnavailable = !online;
+  const visibleConversations = useMemo(
+    () => conversations.filter((item) => !archivedConversationIds.includes(item.id)),
+    [archivedConversationIds, conversations],
+  );
+  const pinnedConversations = useMemo(
+    () => visibleConversations.filter((item) => pinnedConversationIds.includes(item.id)),
+    [pinnedConversationIds, visibleConversations],
+  );
+  const recentConversations = useMemo(
+    () => visibleConversations.filter((item) => !pinnedConversationIds.includes(item.id)).slice(0, 5),
+    [pinnedConversationIds, visibleConversations],
+  );
 
   function clearTimers() {
     timers.current.forEach((timer) => window.clearTimeout(timer));
@@ -391,6 +493,88 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
 
   function notify(message: string) {
     setToast(message);
+  }
+
+  function openSidebarMenu(event: ReactMouseEvent<HTMLButtonElement>, conversationId: number) {
+    event.stopPropagation();
+    const sidebarBounds = sidebarRef.current?.getBoundingClientRect();
+    const triggerBounds = event.currentTarget.getBoundingClientRect();
+    const desiredTop = sidebarBounds ? triggerBounds.top - sidebarBounds.top - 8 : triggerBounds.top;
+    const maxTop = Math.max(78, window.innerHeight - 338);
+    setSidebarMenu((current) => current?.conversationId === conversationId
+      ? null
+      : { conversationId, top: Math.min(Math.max(desiredTop, 78), maxTop) });
+  }
+
+  function toggleUnread(conversationId: number) {
+    setUnreadConversationIds((current) => current.includes(conversationId)
+      ? current.filter((id) => id !== conversationId)
+      : [...current, conversationId]);
+    setSidebarMenu(null);
+    notify(unreadConversationIds.includes(conversationId) ? "已标记为已读" : "已标记为未读");
+  }
+
+  function togglePinnedConversation(conversationId: number) {
+    const currentlyPinned = pinnedConversationIds.includes(conversationId);
+    setPinnedConversationIds((current) => currentlyPinned
+      ? current.filter((id) => id !== conversationId)
+      : [...current, conversationId]);
+    setSidebarMenu(null);
+    notify(currentlyPinned ? "已取消置顶" : "已置顶");
+  }
+
+  function beginSidebarRename(item: ConversationItem) {
+    setSidebarRenameId(item.id);
+    setSidebarRenameDraft(item.title);
+    setSidebarMenu(null);
+  }
+
+  function saveSidebarRename(event: FormEvent, conversationId: number) {
+    event.preventDefault();
+    renameConversation(conversationId, sidebarRenameDraft);
+    setSidebarRenameId(null);
+    setSidebarRenameDraft("");
+  }
+
+  function archiveConversation(item: ConversationItem) {
+    setArchivedConversationIds((current) => current.includes(item.id) ? current : [...current, item.id]);
+    setPinnedConversationIds((current) => current.filter((id) => id !== item.id));
+    setSidebarMenu(null);
+    notify(`“${item.title}”已归档，可在历史会话中搜索`);
+  }
+
+  function copyConversationId(item: ConversationItem) {
+    setSidebarMenu(null);
+    void copyToClipboard(`conversation_${item.id}`, notify, "会话 ID 已复制");
+  }
+
+  function copyConversationDeepLink(item: ConversationItem) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("view");
+    url.searchParams.set("conversation", String(item.id));
+    setSidebarMenu(null);
+    void copyToClipboard(url.toString(), notify, "会话深度链接已复制");
+  }
+
+  function continueInNewConversation(item: ConversationItem) {
+    clearTimers();
+    setActivePanel(null);
+    setSidebarMenu(null);
+    setSidebarOpen(false);
+    setView("chat");
+    setChatStage("empty");
+    setChatTitle("新会话");
+    setLastQuestion("");
+    setPreviousQuestion(item.title);
+    setChatDraft(`继续分析：${item.title}`);
+    setInheritedNotice(`已从“${item.title}”继承经营上下文，原会话保持不变。`);
+    notify("已在新会话中继承上下文");
+  }
+
+  function toggleProject(projectId: string) {
+    setExpandedProjectIds((current) => current.includes(projectId)
+      ? current.filter((id) => id !== projectId)
+      : [...current, projectId]);
   }
 
   function switchView(nextView: ExecutiveView) {
@@ -421,6 +605,8 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
     setInheritedNotice("");
     setMemoryCandidate(false);
     setNewTopicNotice(false);
+    setSidebarMenu(null);
+    setSidebarRenameId(null);
     setActivePanel(null);
     setSidebarOpen(false);
     setView("home");
@@ -623,6 +809,8 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
   }
 
   function openConversation(item: ConversationItem) {
+    setUnreadConversationIds((current) => current.filter((id) => id !== item.id));
+    setSidebarMenu(null);
     if (item.type === "每日摘要") {
       setActivePanel("daily");
       setSidebarOpen(false);
@@ -774,6 +962,10 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
     capabilities: "可查询范围",
     account: "账号与推送",
   };
+  const sidebarMenuConversation = sidebarMenu
+    ? conversations.find((item) => item.id === sidebarMenu.conversationId) ?? null
+    : null;
+  const reportPanelOpen = activePanel === "daily" || activePanel === "weekly";
 
   return (
     <div className={`product-shell workbench-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${sidebarOpen ? "sidebar-open" : ""}`} data-route-record-count={routeRecords.length}>
@@ -783,7 +975,7 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
           <span>网络连接已中断。未确认送达的消息会保留，不会重复创建任务。</span>
         </div>
       )}
-      <aside className="workspace-sidebar" aria-label="工作台侧栏">
+      <aside ref={sidebarRef} className="workspace-sidebar" aria-label="工作台侧栏">
         <header className="sidebar-brand-row">
           <button className="sidebar-brand" type="button" onClick={resetConversation} aria-label="打开新会话">
             <span className="brand-glyph" aria-hidden="true">董</span>
@@ -792,28 +984,99 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
           <button className="sidebar-collapse" type="button" aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"} onClick={() => setSidebarCollapsed((current) => !current)}>{sidebarCollapsed ? "›" : "‹"}</button>
         </header>
 
-        <button className="new-conversation-button" type="button" onClick={resetConversation}>
-          <span aria-hidden="true">＋</span><strong className="sidebar-label">新会话</strong><kbd className="sidebar-label">⌘ K</kbd>
-        </button>
+        <div className="sidebar-scroll-region">
+          <button className="new-conversation-button" type="button" onClick={resetConversation}>
+            <span aria-hidden="true">＋</span><strong className="sidebar-label">新建会话</strong><kbd className="sidebar-label">⌘ K</kbd>
+          </button>
 
-        <nav className="workspace-navigation" aria-label="经营工作台功能">
-          {workspaceNavigation.map((item) => (
-            <button type="button" key={item.id} className={activePanel === item.id ? "active" : ""} aria-current={activePanel === item.id ? "page" : undefined} onClick={() => switchView(item.id)}>
-              <span aria-hidden="true">{item.short}</span><strong className="sidebar-label">{item.label}</strong>
-            </button>
-          ))}
-        </nav>
-
-        <section className="sidebar-conversations" aria-labelledby="sidebar-conversations-title">
-          <header><span id="sidebar-conversations-title">最近会话</span><button type="button" onClick={() => switchView("history")}>全部</button></header>
-          <div>
-            {conversations.slice(0, 6).map((item) => (
-              <button type="button" key={item.id} className={view === "chat" && chatTitle === item.title ? "active" : ""} onClick={() => openConversation(item)}>
-                <strong>{item.title}</strong><small>{item.time}</small>
+          <nav className="workspace-navigation" aria-label="经营工作台功能">
+            {workspaceNavigation.map((item) => (
+              <button type="button" key={item.id} className={activePanel === item.id ? "active" : ""} aria-current={activePanel === item.id ? "page" : undefined} onClick={() => switchView(item.id)}>
+                <span aria-hidden="true">{item.short}</span><strong className="sidebar-label">{item.label}</strong>
               </button>
             ))}
+          </nav>
+
+          <div className="sidebar-sections">
+            <section className="sidebar-section" aria-labelledby="sidebar-pinned-title">
+              <header className="sidebar-section-header"><span id="sidebar-pinned-title">置顶</span></header>
+              <div className="sidebar-list">
+                {pinnedConversations.map((item) => (
+                  <div className="sidebar-row-shell" key={item.id}>
+                    {sidebarRenameId === item.id ? (
+                      <form className="sidebar-rename-form" onSubmit={(event) => saveSidebarRename(event, item.id)}>
+                        <input value={sidebarRenameDraft} maxLength={28} onChange={(event) => setSidebarRenameDraft(event.target.value)} aria-label="新的会话名称" autoFocus />
+                        <button type="submit" aria-label="保存名称">✓</button>
+                        <button type="button" aria-label="取消重命名" onClick={() => setSidebarRenameId(null)}>×</button>
+                      </form>
+                    ) : (
+                      <>
+                        <button type="button" className={`sidebar-conversation-button ${view === "chat" && chatTitle === item.title ? "active" : ""}`} onClick={() => openConversation(item)}>
+                          <span className={`sidebar-unread-dot ${unreadConversationIds.includes(item.id) ? "visible" : ""}`} aria-hidden="true" />
+                          <strong>{item.title}</strong>
+                        </button>
+                        <button type="button" className="sidebar-row-menu-button" data-sidebar-menu aria-label={`打开“${item.title}”操作菜单`} aria-expanded={sidebarMenu?.conversationId === item.id} onClick={(event) => openSidebarMenu(event, item.id)}>•••</button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="sidebar-section" aria-labelledby="sidebar-projects-title">
+              <header className="sidebar-section-header"><span id="sidebar-projects-title">项目</span></header>
+              <div className="sidebar-list sidebar-project-list">
+                {sidebarProjects.map((project) => {
+                  const expanded = expandedProjectIds.includes(project.id);
+                  return (
+                    <div className="sidebar-project" key={project.id}>
+                      <button type="button" className="sidebar-project-button" aria-expanded={expanded} onClick={() => toggleProject(project.id)}>
+                        <span className="sidebar-disclosure" aria-hidden="true">{expanded ? "⌄" : "›"}</span>
+                        <span className="sidebar-project-mark" aria-hidden="true" />
+                        <strong>{project.title}</strong>
+                      </button>
+                      {expanded && (
+                        <div className="sidebar-project-conversations">
+                          {project.conversations.map((conversation) => (
+                            <button type="button" key={conversation.id} onClick={() => startProcessing(conversation.question)}>
+                              <span aria-hidden="true" />
+                              <strong>{conversation.title}</strong>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section className="sidebar-section" aria-labelledby="sidebar-recent-title">
+              <header className="sidebar-section-header"><span id="sidebar-recent-title">最近</span><button type="button" onClick={() => switchView("history")}>全部</button></header>
+              <div className="sidebar-list">
+                {recentConversations.map((item) => (
+                  <div className="sidebar-row-shell" key={item.id}>
+                    {sidebarRenameId === item.id ? (
+                      <form className="sidebar-rename-form" onSubmit={(event) => saveSidebarRename(event, item.id)}>
+                        <input value={sidebarRenameDraft} maxLength={28} onChange={(event) => setSidebarRenameDraft(event.target.value)} aria-label="新的会话名称" autoFocus />
+                        <button type="submit" aria-label="保存名称">✓</button>
+                        <button type="button" aria-label="取消重命名" onClick={() => setSidebarRenameId(null)}>×</button>
+                      </form>
+                    ) : (
+                      <>
+                        <button type="button" className={`sidebar-conversation-button ${view === "chat" && chatTitle === item.title ? "active" : ""}`} onClick={() => openConversation(item)}>
+                          <span className={`sidebar-unread-dot ${unreadConversationIds.includes(item.id) ? "visible" : ""}`} aria-hidden="true" />
+                          <strong>{item.title}</strong>
+                        </button>
+                        <button type="button" className="sidebar-row-menu-button" data-sidebar-menu aria-label={`打开“${item.title}”操作菜单`} aria-expanded={sidebarMenu?.conversationId === item.id} onClick={(event) => openSidebarMenu(event, item.id)}>•••</button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
           </div>
-        </section>
+        </div>
 
         <footer className="sidebar-footer">
           <button type="button" className="sidebar-data-status" onClick={() => switchView("capabilities")}>
@@ -832,6 +1095,20 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
             )}
           </div>
         </footer>
+
+        {sidebarMenu && sidebarMenuConversation && (
+          <div className="sidebar-context-menu" data-sidebar-menu role="menu" aria-label={`“${sidebarMenuConversation.title}”会话操作`} style={{ top: sidebarMenu.top }}>
+            <button type="button" role="menuitem" onClick={() => togglePinnedConversation(sidebarMenuConversation.id)}>{pinnedConversationIds.includes(sidebarMenuConversation.id) ? "取消置顶" : "置顶"}</button>
+            <button type="button" role="menuitem" onClick={() => toggleUnread(sidebarMenuConversation.id)}>{unreadConversationIds.includes(sidebarMenuConversation.id) ? "标记为已读" : "标记未读"}</button>
+            <button type="button" role="menuitem" onClick={() => beginSidebarRename(sidebarMenuConversation)}>重命名</button>
+            <button type="button" role="menuitem" onClick={() => archiveConversation(sidebarMenuConversation)}>归档</button>
+            <span className="sidebar-menu-divider" role="separator" />
+            <button type="button" role="menuitem" onClick={() => copyConversationId(sidebarMenuConversation)}>复制会话 ID</button>
+            <button type="button" role="menuitem" onClick={() => copyConversationDeepLink(sidebarMenuConversation)}>复制深度链接</button>
+            <span className="sidebar-menu-divider" role="separator" />
+            <button type="button" role="menuitem" onClick={() => continueInNewConversation(sidebarMenuConversation)}>在新会话中继续</button>
+          </div>
+        )}
       </aside>
       <button className="workspace-sidebar-scrim" type="button" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} />
 
@@ -917,13 +1194,19 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
 
       {activePanel && (
         <div className="workspace-panel-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setActivePanel(null); }}>
-          <aside className="workspace-detail-panel" role="dialog" aria-modal="true" aria-labelledby="workspace-panel-title">
-            <header><div><small>工作台下钻</small><h2 id="workspace-panel-title">{panelTitle[activePanel]}</h2></div><button type="button" onClick={() => setActivePanel(null)} aria-label="关闭面板">关闭</button></header>
+          <aside className={`workspace-detail-panel ${reportPanelOpen ? "report-detail-panel" : ""}`} role="dialog" aria-modal="true" aria-labelledby="workspace-panel-title">
+            <header>
+              <div><h2 id="workspace-panel-title">{panelTitle[activePanel]}</h2><small>工作台下钻</small></div>
+              <div className="panel-header-actions">
+                {reportPanelOpen && <button type="button" className="panel-feishu-button" onClick={() => setFeishuPreview((current) => !current)}>{feishuPreview ? "收起飞书消息样例" : "查看飞书消息样例"}</button>}
+                <button type="button" className="panel-close-button" onClick={() => setActivePanel(null)} aria-label="关闭面板">×</button>
+              </div>
+            </header>
             <div className="workspace-detail-scroll">
               {activePanel === "history" && <HistoryView conversations={conversations} onOpen={openConversation} onNew={resetConversation} onRename={renameConversation} onDelete={requestDeleteConversation} />}
               {activePanel === "memory" && <MemoryView enabled={memoryEnabled} setEnabled={(enabled) => { setMemoryEnabled(enabled); notify(enabled ? "长期记忆已开启" : "长期记忆已关闭，现有内容仍保留"); }} memories={memories} onSave={saveMemory} onDelete={requestDeleteMemory} onClear={requestClearMemories} onOpenSource={() => switchView("history")} />}
-              {activePanel === "daily" && <DailySummaryView feishuPreview={feishuPreview} setFeishuPreview={setFeishuPreview} onBack={() => setActivePanel(null)} onQuestion={(question) => startProcessing(question)} />}
-              {activePanel === "weekly" && <WeeklyBriefView feishuPreview={feishuPreview} setFeishuPreview={setFeishuPreview} onBack={() => setActivePanel(null)} onQuestion={(question) => startProcessing(question)} />}
+              {activePanel === "daily" && <DailySummaryView feishuPreview={feishuPreview} onQuestion={(question) => startProcessing(question)} />}
+              {activePanel === "weekly" && <WeeklyBriefView feishuPreview={feishuPreview} onQuestion={(question) => startProcessing(question)} />}
               {activePanel === "capabilities" && <CapabilitiesView onBack={() => setActivePanel(null)} />}
               {activePanel === "account" && <AccountView memoryEnabled={memoryEnabled} onMemory={() => switchView("memory")} onLogout={onLogout} />}
             </div>
@@ -1375,11 +1658,65 @@ function MemoryView({ enabled, setEnabled, memories, onSave, onDelete, onClear, 
   return <div className="page subpage"><section className="page-heading split"><div><p className="eyebrow">由您控制</p><h1>个人长期记忆</h1><p>只保存经确认的稳定偏好。关闭后停止读取和新增，现有内容仍可查看与删除。</p></div><button type="button" className="secondary-button" onClick={() => setAdding(true)} disabled={!enabled}>手动新增</button></section><section className="memory-master-setting"><div><strong>长期记忆</strong><p>{enabled ? "后续新消息会使用已确认的偏好。" : "已停止读取和新增，现有记忆仍保留。"}</p></div><label className="switch"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span aria-hidden="true" /><small>{enabled ? "已开启" : "已关闭"}</small></label></section>{adding && <form className="inline-form memory-add-form" onSubmit={(event) => { event.preventDefault(); if (!draft.trim()) return; onSave({ id: Date.now(), content: draft.trim(), category, createdAt: "刚刚", usedAt: "尚未使用", source: "记忆页手动新增" }); setDraft(""); setAdding(false); }}><label className="field"><span>分类</span><select value={category} onChange={(event) => setCategory(event.target.value)}><option>表达偏好</option><option>数字偏好</option><option>默认范围</option><option>长期关注</option><option>比较口径</option></select></label><label className="field grow"><span>记忆内容</span><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="例如：对比默认使用上月同期" autoFocus /></label><button type="submit" className="primary-button compact" disabled={!draft.trim()}>保存</button><button type="button" className="text-button" onClick={() => { setAdding(false); setDraft(""); }}>取消</button></form>}<section className="memory-list-section"><header className="section-header"><div><p className="eyebrow">{memories.length} 条</p><h2>已保存记忆</h2></div>{memories.length > 0 && <button type="button" className="danger-text-button" onClick={onClear}>清空全部</button>}</header>{memories.length ? <div className="memory-list">{memories.map((memory) => <article key={memory.id}><span className="type-badge">{memory.category}</span>{editingId === memory.id ? <form onSubmit={(event) => { event.preventDefault(); onSave({ ...memory, content: draft.trim() }); setEditingId(null); }}><textarea rows={2} value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><div><button type="submit" className="primary-button compact" disabled={!draft.trim()}>保存</button><button type="button" className="text-button" onClick={() => setEditingId(null)}>取消</button></div></form> : <div className="memory-copy"><strong>{memory.content}</strong><dl><div><dt>创建</dt><dd>{memory.createdAt}</dd></div><div><dt>最近使用</dt><dd>{memory.usedAt}</dd></div><div><dt>来源</dt><dd><button type="button" onClick={onOpenSource}>{memory.source}</button></dd></div></dl></div>}<div className="memory-actions"><button type="button" onClick={() => { setEditingId(memory.id); setDraft(memory.content); }}>修改</button><button type="button" className="danger" onClick={() => onDelete(memory)}>删除</button></div></article>)}</div> : <EmptyState title="暂无长期记忆" description="明确表达并确认的稳定偏好会显示在这里。" />}</section></div>;
 }
 
-function DailySummaryView({ feishuPreview, setFeishuPreview, onBack, onQuestion }: { feishuPreview: boolean; setFeishuPreview: (value: boolean) => void; onBack: () => void; onQuestion: (question: string) => void }) {
-  return <div className="page subpage report-page"><section className="report-heading"><button type="button" className="back-link" onClick={onBack}>返回首页</button><div><p className="eyebrow">覆盖最近两次成功快照</p><h1>每日经营变化｜2026-07-26</h1><p>数据截至 2026-07-25 02:06 · 05:03 生成</p></div><button type="button" className="secondary-button" onClick={() => setFeishuPreview(!feishuPreview)}>{feishuPreview ? "收起飞书样例" : "查看飞书消息样例"}</button></section>{feishuPreview && <FeishuPreview type="daily" />}<section className="report-conclusion"><p className="eyebrow">今日一句话结论</p><h2>经营节奏总体稳定，回款和两项交付偏差需要今天确认。</h2><p>本摘要只在数据同步成功后生成。今天有三项值得关注的变化，不为凑数增加普通更新。</p></section><section className="update-overview"><header className="section-header"><div><p className="eyebrow">数据更新</p><h2>部门数据更新概况</h2></div><span className="status-badge positive">同步成功</span></header><div><dl><dt>商机</dt><dd><strong>新增 6</strong><span>推进 14 · 赢单 2 · 输单 1</span></dd></dl><dl><dt>项目</dt><dd><strong>更新 17</strong><span>里程碑变化 4 · 延期关注 2</span></dd></dl><dl><dt>财务回款</dt><dd><strong>更新 28</strong><span>新增回款 7 · 逾期新增 1</span></dd></dl></div></section><section className="report-domain-grid">{dailyChanges.map((change, index) => <article key={change.title}><span className={`change-number ${change.tone}`}>{String(index + 1).padStart(2, "0")}</span><small className={change.tone}>{change.state}</small><h3>{change.title}</h3><p>{change.detail}</p><button type="button" onClick={() => onQuestion(index === 0 ? "本月回款差距主要来自哪些客户？" : index === 1 ? "两个延期项目分别卡在哪个里程碑？" : "华东新增商机由谁负责？")}>继续下钻</button></article>)}</section><section className="report-attention"><p className="eyebrow">需要关注</p><h2>今天建议确认两件事</h2><ol><li><span>01</span><div><strong>三笔逾期回款的最新承诺日期</strong><p>其中云海智造单笔 420 万元，已逾期 12 天。</p></div></li><li><span>02</span><div><strong>两个项目的客户确认和资源排期</strong><p>当前只引用项目记录中已经填写的问题。</p></div></li></ol></section><FollowUps questions={homeSuggestions} onSelect={onQuestion} /></div>;
+function DailySummaryView({ feishuPreview, onQuestion }: { feishuPreview: boolean; onQuestion: (question: string) => void }) {
+  const metrics: Array<{ label: string; value: string; note: string; tone: Tone }> = [
+    { label: "回款进度", value: "落后 8.6 个百分点", note: "需关注", tone: "risk" },
+    { label: "交付关注", value: "2 个项目", note: "里程碑偏差", tone: "attention" },
+    { label: "加权商机", value: "+5.1%", note: "较上月同期改善", tone: "positive" },
+  ];
+  const questions = [
+    "本月回款差距主要来自哪些客户？",
+    "两个延期项目分别卡在哪个里程碑？",
+    "华东新增商机由谁负责？",
+  ];
+
+  return (
+    <article className="executive-report executive-report-daily">
+      <header className="executive-report-lead">
+        <div className="executive-report-meta">
+          <div><span>每日经营变化</span><time dateTime="2026-07-26">2026.07.26</time></div>
+          <p>数据截至 7月25日 02:06 · 今日 05:03 生成</p>
+        </div>
+        <h1>经营节奏总体稳定，<br />回款和两项交付偏差需要今天确认。</h1>
+        <p>基于最近两次成功快照，仅展示值得关注的变化。</p>
+      </header>
+
+      {feishuPreview && <FeishuPreview type="daily" />}
+
+      <section className="executive-metric-rail" aria-label="今日关键指标">
+        {metrics.map((metric) => <ExecutiveReportMetric key={metric.label} {...metric} />)}
+      </section>
+
+      <section className="executive-report-section" aria-labelledby="daily-changes-title">
+        <header><span>01—03</span><h2 id="daily-changes-title">今日关键变化</h2></header>
+        <div className="executive-change-list">
+          {dailyChanges.map((change, index) => (
+            <button type="button" className="executive-change-row" key={change.title} onClick={() => onQuestion(questions[index])}>
+              <span className="executive-change-index">{String(index + 1).padStart(2, "0")}</span>
+              <span className={`executive-change-status ${change.tone}`}>{change.state}</span>
+              <span className="executive-change-copy"><strong>{change.title}</strong><small>{change.detail}</small></span>
+              <span className="executive-change-arrow" aria-hidden="true">→</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="executive-action-strip" aria-labelledby="daily-actions-title">
+        <header><span>需要关注</span><h2 id="daily-actions-title">今天需要确认</h2></header>
+        <ol>
+          <li><span>1</span><strong>确认三笔逾期回款的最新承诺日期</strong></li>
+          <li><span>2</span><strong>锁定两个延期项目的客户确认与资源排期</strong></li>
+        </ol>
+        <button type="button" onClick={() => onQuestion(questions[0])}>继续追问 <span aria-hidden="true">→</span></button>
+      </section>
+
+      <ReportProvenance scope="2026-07-25，全部事业部" sources="商机主表、项目交付标准表、经营财务与回款表" definition="回款进度按本月计划口径；变化基于最近两次成功快照。" />
+      <ReportFollowUps questions={questions} onQuestion={onQuestion} />
+    </article>
+  );
 }
 
-function WeeklyBriefView({ feishuPreview, setFeishuPreview, onBack, onQuestion }: { feishuPreview: boolean; setFeishuPreview: (value: boolean) => void; onBack: () => void; onQuestion: (question: string) => void }) {
+function WeeklyBriefView({ feishuPreview, onQuestion }: { feishuPreview: boolean; onQuestion: (question: string) => void }) {
   const sections = [
     ["目标完成与差距", "收入完成 77.6%，较上一完整自然周提高 4.2 个百分点。"],
     ["商机与签约", "新增两笔高概率商机，一笔预计签约日延后至 8月。"],
@@ -1387,7 +1724,79 @@ function WeeklyBriefView({ feishuPreview, setFeishuPreview, onBack, onQuestion }
     ["项目交付", "15 个项目按计划，2 个里程碑存在偏差。"],
     ["收入、毛利与回款", "毛利率保持稳定，回款差距较上一周扩大 3.1 个百分点。"],
   ];
-  return <div className="page subpage report-page"><section className="report-heading"><button type="button" className="back-link" onClick={onBack}>返回首页</button><div><p className="eyebrow">2026-07-13 至 2026-07-19</p><h1>每周高层经营简报｜第30周</h1><p>上一个完整自然周 · 7月20日 06:02 生成</p></div><button type="button" className="secondary-button" onClick={() => setFeishuPreview(!feishuPreview)}>{feishuPreview ? "收起飞书样例" : "查看飞书消息样例"}</button></section>{feishuPreview && <FeishuPreview type="weekly" />}<section className="report-conclusion"><p className="eyebrow">一周经营结论</p><h2>签约质量改善，但回款与交付节奏仍需校准。</h2><p>对比上一完整自然周，并同时参考本月目标进度。未将不完整周与完整周直接比较。</p></section><section className="weekly-metrics"><Metric label="收入完成" value="77.6%" note="周环比 +4.2 个百分点" tone="positive" /><Metric label="新增加权商机" value="1,180万" note="2 笔高概率" tone="positive" /><Metric label="回款完成" value="65.9%" note="低于周计划 10.4 个百分点" tone="risk" /><Metric label="交付关注" value="2个" note="其余 15 个正常" tone="attention" /></section><section className="weekly-sections">{sections.map(([title, body], index) => <article key={title}><span>{String(index + 1).padStart(2, "0")}</span><div><h3>{title}</h3><p>{body}</p></div></article>)}</section><section className="report-attention"><p className="eyebrow">需要关注</p><h2>下一周优先事项</h2><ol><li><span>01</span><div><strong>回款责任闭环</strong><p>将三笔逾期记录落实到责任人与明确日期。</p></div></li><li><span>02</span><div><strong>交付里程碑确认</strong><p>在周中前锁定客户验收与联调资源。</p></div></li><li><span>03</span><div><strong>高概率商机推进</strong><p>保持两笔新增商机的关键人沟通节奏。</p></div></li></ol></section><FollowUps questions={["第30周回款差距来自哪些客户？", "对比前两周的商机变化。", "整理成周一经营会提纲。"]} onSelect={onQuestion} /></div>;
+  const metrics: Array<{ label: string; value: string; note: string; tone: Tone }> = [
+    { label: "收入完成", value: "77.6%", note: "周环比 +4.2 个百分点", tone: "positive" },
+    { label: "新增加权商机", value: "1,180万", note: "2 笔高概率", tone: "positive" },
+    { label: "回款完成", value: "65.9%", note: "低于周计划 10.4 个百分点", tone: "risk" },
+    { label: "交付关注", value: "2 个", note: "其余 15 个正常", tone: "attention" },
+  ];
+  const questions = ["第30周回款差距来自哪些客户？", "对比前两周的商机变化。", "整理成周一经营会提纲。"];
+
+  return (
+    <article className="executive-report executive-report-weekly">
+      <header className="executive-report-lead">
+        <div className="executive-report-meta">
+          <div><span>每周高层经营简报</span><time dateTime="2026-W30">第30周</time></div>
+          <p>2026.07.13—07.19 · 7月20日 06:02 生成</p>
+        </div>
+        <h1>签约质量改善，<br />但回款与交付节奏仍需校准。</h1>
+        <p>对比上一完整自然周，并同时参考本月目标进度；不将不完整周与完整周直接比较。</p>
+      </header>
+
+      {feishuPreview && <FeishuPreview type="weekly" />}
+
+      <section className="executive-metric-rail weekly" aria-label="本周关键指标">
+        {metrics.map((metric) => <ExecutiveReportMetric key={metric.label} {...metric} />)}
+      </section>
+
+      <section className="executive-report-section" aria-labelledby="weekly-judgements-title">
+        <header><span>01—05</span><h2 id="weekly-judgements-title">本周经营判断</h2></header>
+        <div className="executive-change-list weekly">
+          {sections.map(([title, body], index) => (
+            <button type="button" className="executive-change-row" key={title} onClick={() => onQuestion(index === 1 ? questions[1] : index === 4 ? questions[0] : questions[2])}>
+              <span className="executive-change-index">{String(index + 1).padStart(2, "0")}</span>
+              <span className="executive-change-copy"><strong>{title}</strong><small>{body}</small></span>
+              <span className="executive-change-arrow" aria-hidden="true">→</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="executive-action-strip weekly" aria-labelledby="weekly-actions-title">
+        <header><span>需要关注</span><h2 id="weekly-actions-title">下周优先事项</h2></header>
+        <ol>
+          <li><span>1</span><strong>将三笔逾期记录落实到责任人与明确日期</strong></li>
+          <li><span>2</span><strong>在周中前锁定客户验收与联调资源</strong></li>
+          <li><span>3</span><strong>保持两笔新增商机的关键人沟通节奏</strong></li>
+        </ol>
+        <button type="button" onClick={() => onQuestion(questions[2])}>整理经营会提纲 <span aria-hidden="true">→</span></button>
+      </section>
+
+      <ReportProvenance scope="2026-07-13 至 2026-07-19，全部事业部" sources="商机主表、项目交付标准表、经营财务与回款表" definition="周环比只比较两个完整自然周，同时参考本月目标进度。" />
+      <ReportFollowUps questions={questions} onQuestion={onQuestion} />
+    </article>
+  );
+}
+
+function ExecutiveReportMetric({ label, value, note, tone }: { label: string; value: string; note: string; tone: Tone }) {
+  return <div className={`executive-report-metric ${tone}`}><span>{label}</span><strong>{value}</strong><small><i aria-hidden="true" />{note}</small></div>;
+}
+
+function ReportProvenance({ scope, sources, definition }: { scope: string; sources: string; definition: string }) {
+  return (
+    <details className="executive-report-provenance">
+      <summary>数据范围、来源与指标口径</summary>
+      <dl>
+        <div><dt>范围</dt><dd>{scope}</dd></div>
+        <div><dt>来源</dt><dd>{sources}</dd></div>
+        <div><dt>口径</dt><dd>{definition}</dd></div>
+      </dl>
+    </details>
+  );
+}
+
+function ReportFollowUps({ questions, onQuestion }: { questions: string[]; onQuestion: (question: string) => void }) {
+  return <section className="executive-report-followups" aria-label="下一步可以询问"><span>下一步可以询问</span><div>{questions.map((question) => <button type="button" key={question} onClick={() => onQuestion(question)}>{question}<i aria-hidden="true">→</i></button>)}</div></section>;
 }
 
 function FeishuPreview({ type }: { type: "daily" | "weekly" }) {
