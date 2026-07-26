@@ -22,7 +22,6 @@ import {
   answerConfigs,
   dailyChanges,
   demoScenarios,
-  executiveNavigation,
   homeSuggestions,
   initialConversations,
   initialMemories,
@@ -31,6 +30,7 @@ import {
 type AuthRole = "executive" | "admin" | null;
 type LoginMode = Exclude<AuthRole, null>;
 type AuthStep = "login" | "change-password";
+type WorkspacePanelView = Exclude<ExecutiveView, "home" | "chat">;
 type ChatStage =
   | "empty"
   | "clarifying"
@@ -77,6 +77,12 @@ type RouteRecord = {
 
 const organizations = ["全部事业部", "华东事业部", "华南事业部", "北区事业部"];
 const owners = ["陈岚", "林序", "唐昱", "顾宁"];
+const workspaceNavigation: Array<{ id: WorkspacePanelView; label: string; short: string }> = [
+  { id: "daily", label: "今日经营简报", short: "今" },
+  { id: "weekly", label: "每周高层简报", short: "周" },
+  { id: "history", label: "历史会话", short: "历" },
+  { id: "memory", label: "长期记忆", short: "记" },
+];
 
 export default function ProductPrototype() {
   const [role, setRole] = useState<AuthRole>(null);
@@ -310,7 +316,10 @@ function LoginScreen({
 }
 
 function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveView; onLogout: () => void }) {
-  const [view, setView] = useState<ExecutiveView>(initialView);
+  const [view, setView] = useState<ExecutiveView>(initialView === "chat" ? "chat" : "home");
+  const [activePanel, setActivePanel] = useState<WorkspacePanelView | null>(initialView !== "home" && initialView !== "chat" ? initialView : null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [homeQuestion, setHomeQuestion] = useState("");
   const [chatDraft, setChatDraft] = useState("");
   const [lastQuestion, setLastQuestion] = useState("");
@@ -328,6 +337,9 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
   const [memories, setMemories] = useState(initialMemories);
   const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const [renamingConversation, setRenamingConversation] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("新会话");
   const [demoOpen, setDemoOpen] = useState(false);
   const [feishuPreview, setFeishuPreview] = useState(false);
   const [clarificationRound, setClarificationRound] = useState<1 | 2>(1);
@@ -364,12 +376,11 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
   }, [toast]);
 
   useEffect(() => {
-    window.scrollTo({ top: 0, behavior: "smooth" });
     const url = new URL(window.location.href);
-    if (view === "daily" || view === "weekly") url.searchParams.set("view", view);
+    if (activePanel === "daily" || activePanel === "weekly") url.searchParams.set("view", activePanel);
     else url.searchParams.delete("view");
     window.history.replaceState({}, "", `${url.pathname}${url.search}`);
-  }, [view]);
+  }, [activePanel]);
 
   const networkUnavailable = !online;
 
@@ -384,8 +395,15 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
 
   function switchView(nextView: ExecutiveView) {
     setProfileOpen(false);
-    setView(nextView);
-    if (nextView === "chat" && !lastQuestion) setChatStage("empty");
+    setConversationMenuOpen(false);
+    setSidebarOpen(false);
+    if (nextView === "home" || nextView === "chat") {
+      setActivePanel(null);
+      setView(nextView);
+      if (nextView === "chat" && !lastQuestion) setChatStage("empty");
+      return;
+    }
+    setActivePanel(nextView);
   }
 
   function resetConversation() {
@@ -403,7 +421,9 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
     setInheritedNotice("");
     setMemoryCandidate(false);
     setNewTopicNotice(false);
-    setView("chat");
+    setActivePanel(null);
+    setSidebarOpen(false);
+    setView("home");
   }
 
   function classifyQuestion(question: string): { route: RouteKind; answerId: string } {
@@ -448,6 +468,8 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
     setAnswerVersion((current) => options?.retry ? current + 1 : 1);
     setMemoryCandidate(/以后|默认|先给我结论/.test(finalQuestion));
     setNewTopicNotice(Boolean(lastQuestion && classified.route !== routeKind));
+    setActivePanel(null);
+    setSidebarOpen(false);
     setView("chat");
     setChatTitle(makeConversationTitle(finalQuestion, classified.answerId));
 
@@ -560,6 +582,7 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
     setRouteKind("file");
     setChatTitle("当前会话文件");
     if (fromHome) {
+      setActivePanel(null);
       setView("chat");
       setChatStage("empty");
     }
@@ -601,11 +624,13 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
 
   function openConversation(item: ConversationItem) {
     if (item.type === "每日摘要") {
-      setView("daily");
+      setActivePanel("daily");
+      setSidebarOpen(false);
       return;
     }
     if (item.type === "每周简报") {
-      setView("weekly");
+      setActivePanel("weekly");
+      setSidebarOpen(false);
       return;
     }
     const route: RouteKind = item.type === "文件" ? "file" : item.type === "泛化" ? "research" : "data";
@@ -619,6 +644,8 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
     if (item.type === "文件" && !files.length) {
       setFiles([demoReadyFile()]);
     }
+    setActivePanel(null);
+    setSidebarOpen(false);
     setView("chat");
   }
 
@@ -688,6 +715,7 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
   function runDemoScenario(id: number) {
     setDemoOpen(false);
     if (id === 1) {
+      setActivePanel(null);
       setView("home");
       return;
     }
@@ -728,46 +756,72 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
       return;
     }
     setFeishuPreview(true);
-    setView("daily");
+    setActivePanel("daily");
   }
 
   const activeDataAnswer = answerConfigs[activeAnswerId] ?? answerConfigs.overview;
-  const headerLabel = executiveNavigation.find((item) => item.id === view)?.label ?? (
-    view === "daily" ? "每日经营变化" : view === "weekly" ? "每周高层简报" : view === "capabilities" ? "可查询范围" : view === "account" ? "账号与推送" : "经营工作台"
-  );
+  const workspaceTitle = view === "home" ? "新会话" : chatTitle;
+  const workspaceSubtitle = view === "home"
+    ? "数据已更新至 7月25日 02:06"
+    : routeKind === "file"
+      ? `${files.length} 个当前会话文件`
+      : `${scope.time} · ${scope.organizations.join("、")}`;
+  const panelTitle: Record<WorkspacePanelView, string> = {
+    history: "历史会话",
+    memory: "长期记忆",
+    daily: "今日经营简报",
+    weekly: "每周高层简报",
+    capabilities: "可查询范围",
+    account: "账号与推送",
+  };
 
   return (
-    <div className="product-shell" data-route-record-count={routeRecords.length}>
+    <div className={`product-shell workbench-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${sidebarOpen ? "sidebar-open" : ""}`} data-route-record-count={routeRecords.length}>
       <a className="skip-link" href="#main-content">跳到主要内容</a>
       {networkUnavailable && (
         <div className="network-banner" role="status">
           <span>网络连接已中断。未确认送达的消息会保留，不会重复创建任务。</span>
         </div>
       )}
-      <header className="app-header">
-        <button className="brand-button" type="button" onClick={() => switchView("home")} aria-label="返回经营首页">
-          <span className="brand-glyph" aria-hidden="true">董</span>
-          <span><strong>董事长 AI 秘书</strong><small>经营决策工作台</small></span>
+      <aside className="workspace-sidebar" aria-label="工作台侧栏">
+        <header className="sidebar-brand-row">
+          <button className="sidebar-brand" type="button" onClick={resetConversation} aria-label="打开新会话">
+            <span className="brand-glyph" aria-hidden="true">董</span>
+            <span className="sidebar-label"><strong>董事长 AI 秘书</strong><small>经营决策工作台</small></span>
+          </button>
+          <button className="sidebar-collapse" type="button" aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"} onClick={() => setSidebarCollapsed((current) => !current)}>{sidebarCollapsed ? "›" : "‹"}</button>
+        </header>
+
+        <button className="new-conversation-button" type="button" onClick={resetConversation}>
+          <span aria-hidden="true">＋</span><strong className="sidebar-label">新会话</strong><kbd className="sidebar-label">⌘ K</kbd>
         </button>
-        <nav className="primary-nav" aria-label="主导航">
-          {executiveNavigation.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={view === item.id ? "active" : ""}
-              aria-current={view === item.id ? "page" : undefined}
-              onClick={() => item.id === "chat" && !lastQuestion ? resetConversation() : switchView(item.id)}
-            >
-              {item.label}
+
+        <nav className="workspace-navigation" aria-label="经营工作台功能">
+          {workspaceNavigation.map((item) => (
+            <button type="button" key={item.id} className={activePanel === item.id ? "active" : ""} aria-current={activePanel === item.id ? "page" : undefined} onClick={() => switchView(item.id)}>
+              <span aria-hidden="true">{item.short}</span><strong className="sidebar-label">{item.label}</strong>
             </button>
           ))}
         </nav>
-        <div className="header-actions">
-          <button className="demo-button" type="button" onClick={() => setDemoOpen(true)}>演示场景 <span>10</span></button>
-          <div className="profile-control">
+
+        <section className="sidebar-conversations" aria-labelledby="sidebar-conversations-title">
+          <header><span id="sidebar-conversations-title">最近会话</span><button type="button" onClick={() => switchView("history")}>全部</button></header>
+          <div>
+            {conversations.slice(0, 6).map((item) => (
+              <button type="button" key={item.id} className={view === "chat" && chatTitle === item.title ? "active" : ""} onClick={() => openConversation(item)}>
+                <strong>{item.title}</strong><small>{item.time}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <footer className="sidebar-footer">
+          <button type="button" className="sidebar-data-status" onClick={() => switchView("capabilities")}>
+            <span className="status-dot positive" aria-hidden="true" /><span className="sidebar-label"><strong>企业数据可用</strong><small>更新至 02:06</small></span>
+          </button>
+          <div className="profile-control workspace-profile">
             <button className="profile-button" type="button" aria-label="打开个人菜单" aria-expanded={profileOpen} onClick={() => setProfileOpen((current) => !current)}>
-              <span aria-hidden="true">董</span>
-              <span><strong>董事长</strong><small>{headerLabel}</small></span>
+              <span aria-hidden="true">董</span><span className="sidebar-label"><strong>董事长</strong><small>全部事业部</small></span>
             </button>
             {profileOpen && (
               <div className="profile-menu">
@@ -777,10 +831,35 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
               </div>
             )}
           </div>
-        </div>
-      </header>
+        </footer>
+      </aside>
+      <button className="workspace-sidebar-scrim" type="button" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} />
 
-      <main id="main-content" className="app-main">
+      <section className="workspace-stage" aria-label="AI 对话工作台">
+        <header className="workspace-topbar">
+          <button className="mobile-sidebar-trigger" type="button" aria-label="打开侧栏" onClick={() => setSidebarOpen(true)}>☰</button>
+          {renamingConversation && view === "chat" ? (
+            <form className="workspace-title-form" onSubmit={(event) => { event.preventDefault(); const nextTitle = titleDraft.trim(); if (nextTitle) { setChatTitle(nextTitle); notify("会话标题已修改"); } setRenamingConversation(false); }}>
+              <input value={titleDraft} maxLength={20} onChange={(event) => setTitleDraft(event.target.value)} aria-label="会话标题" autoFocus />
+              <button type="submit">保存</button><button type="button" onClick={() => setRenamingConversation(false)}>取消</button>
+            </form>
+          ) : (
+            <div className="workspace-title-block"><strong>{workspaceTitle}</strong><small>{workspaceSubtitle}</small></div>
+          )}
+          <div className="workspace-topbar-actions">
+            {view === "chat" && (routeKind === "data" || routeKind === "failure") && <button type="button" className="topbar-scope-button" onClick={() => setScopePanelOpen(true)}>调整范围</button>}
+            <button className="demo-button" type="button" onClick={() => setDemoOpen(true)}>演示 <span>10</span></button>
+            <button className="topbar-new-button" type="button" onClick={resetConversation}>新会话</button>
+            {view === "chat" && lastQuestion && (
+              <div className="more-control">
+                <button type="button" className="topbar-more-button" aria-label="会话操作" aria-expanded={conversationMenuOpen} onClick={() => setConversationMenuOpen((current) => !current)}>•••</button>
+                {conversationMenuOpen && <div className="more-menu"><button type="button" onClick={() => { setTitleDraft(chatTitle); setRenamingConversation(true); setConversationMenuOpen(false); }}>修改标题</button><button type="button" className="danger" onClick={() => { setConversationMenuOpen(false); setConfirmState({ title: "删除当前会话？", description: "会话消息与当前附件将被删除，长期记忆不会自动删除。", confirmLabel: "删除会话", tone: "danger", action: () => { resetConversation(); notify("会话已删除"); } }); }}>删除会话</button></div>}
+              </div>
+            )}
+          </div>
+        </header>
+
+        <main id="main-content" className="workspace-main">
         {view === "home" && (
           <HomeView
             question={homeQuestion}
@@ -793,14 +872,11 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
             onSuggestion={(suggestion) => chooseSuggestion(suggestion, "home")}
             onDaily={() => switchView("daily")}
             onWeekly={() => switchView("weekly")}
-            onHistory={() => switchView("history")}
-            onConversation={openConversation}
             onCapabilities={() => switchView("capabilities")}
           />
         )}
         {view === "chat" && (
           <ChatView
-            title={chatTitle}
             question={lastQuestion}
             previousQuestion={previousQuestion}
             stage={chatStage}
@@ -822,11 +898,7 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
             draft={chatDraft}
             setDraft={setChatDraft}
             fileRef={chatFileRef}
-            onBack={() => switchView("home")}
-            onNew={resetConversation}
             onOpenScope={() => setScopePanelOpen(true)}
-            onRename={(title) => { setChatTitle(title); notify("会话标题已修改"); }}
-            onDeleteChat={() => setConfirmState({ title: "删除当前会话？", description: "会话消息与当前附件将被删除，长期记忆不会自动删除。", confirmLabel: "删除会话", tone: "danger", action: () => { resetConversation(); notify("会话已删除"); } })}
             onStop={stopCurrent}
             onRetry={retryCurrent}
             onConfirmClarification={confirmClarification}
@@ -840,65 +912,24 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
             onDismissMemory={() => setMemoryCandidate(false)}
           />
         )}
-        {view === "history" && (
-          <HistoryView
-            conversations={conversations}
-            onOpen={openConversation}
-            onNew={resetConversation}
-            onRename={renameConversation}
-            onDelete={requestDeleteConversation}
-          />
-        )}
-        {view === "memory" && (
-          <MemoryView
-            enabled={memoryEnabled}
-            setEnabled={(enabled) => { setMemoryEnabled(enabled); notify(enabled ? "长期记忆已开启" : "长期记忆已关闭，现有内容仍保留"); }}
-            memories={memories}
-            onSave={saveMemory}
-            onDelete={requestDeleteMemory}
-            onClear={requestClearMemories}
-            onOpenSource={() => switchView("history")}
-          />
-        )}
-        {view === "daily" && (
-          <DailySummaryView
-            feishuPreview={feishuPreview}
-            setFeishuPreview={setFeishuPreview}
-            onBack={() => switchView("home")}
-            onQuestion={(question) => startProcessing(question)}
-          />
-        )}
-        {view === "weekly" && (
-          <WeeklyBriefView
-            feishuPreview={feishuPreview}
-            setFeishuPreview={setFeishuPreview}
-            onBack={() => switchView("home")}
-            onQuestion={(question) => startProcessing(question)}
-          />
-        )}
-        {view === "capabilities" && <CapabilitiesView onBack={() => switchView("home")} />}
-        {view === "account" && (
-          <AccountView
-            memoryEnabled={memoryEnabled}
-            onMemory={() => switchView("memory")}
-            onLogout={onLogout}
-          />
-        )}
-      </main>
+        </main>
+      </section>
 
-      <nav className="mobile-nav" aria-label="移动端主导航">
-        {executiveNavigation.map((item) => (
-          <button
-            type="button"
-            key={item.id}
-            className={view === item.id ? "active" : ""}
-            aria-current={view === item.id ? "page" : undefined}
-            onClick={() => item.id === "chat" && !lastQuestion ? resetConversation() : switchView(item.id)}
-          >
-            <span aria-hidden="true">{item.short.slice(0, 1)}</span>{item.short}
-          </button>
-        ))}
-      </nav>
+      {activePanel && (
+        <div className="workspace-panel-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setActivePanel(null); }}>
+          <aside className="workspace-detail-panel" role="dialog" aria-modal="true" aria-labelledby="workspace-panel-title">
+            <header><div><small>工作台下钻</small><h2 id="workspace-panel-title">{panelTitle[activePanel]}</h2></div><button type="button" onClick={() => setActivePanel(null)} aria-label="关闭面板">关闭</button></header>
+            <div className="workspace-detail-scroll">
+              {activePanel === "history" && <HistoryView conversations={conversations} onOpen={openConversation} onNew={resetConversation} onRename={renameConversation} onDelete={requestDeleteConversation} />}
+              {activePanel === "memory" && <MemoryView enabled={memoryEnabled} setEnabled={(enabled) => { setMemoryEnabled(enabled); notify(enabled ? "长期记忆已开启" : "长期记忆已关闭，现有内容仍保留"); }} memories={memories} onSave={saveMemory} onDelete={requestDeleteMemory} onClear={requestClearMemories} onOpenSource={() => switchView("history")} />}
+              {activePanel === "daily" && <DailySummaryView feishuPreview={feishuPreview} setFeishuPreview={setFeishuPreview} onBack={() => setActivePanel(null)} onQuestion={(question) => startProcessing(question)} />}
+              {activePanel === "weekly" && <WeeklyBriefView feishuPreview={feishuPreview} setFeishuPreview={setFeishuPreview} onBack={() => setActivePanel(null)} onQuestion={(question) => startProcessing(question)} />}
+              {activePanel === "capabilities" && <CapabilitiesView onBack={() => setActivePanel(null)} />}
+              {activePanel === "account" && <AccountView memoryEnabled={memoryEnabled} onMemory={() => switchView("memory")} onLogout={onLogout} />}
+            </div>
+          </aside>
+        </div>
+      )}
 
       {scopePanelOpen && (
         <ScopePanel
@@ -916,7 +947,6 @@ function ExecutiveWorkspace({ initialView, onLogout }: { initialView: ExecutiveV
         />
       )}
       {toast && <Toast message={toast} />}
-
     </div>
   );
 }
@@ -932,8 +962,6 @@ function HomeView({
   onSuggestion,
   onDaily,
   onWeekly,
-  onHistory,
-  onConversation,
   onCapabilities,
 }: {
   question: string;
@@ -946,112 +974,73 @@ function HomeView({
   onSuggestion: (question: string) => void;
   onDaily: () => void;
   onWeekly: () => void;
-  onHistory: () => void;
-  onConversation: (item: ConversationItem) => void;
   onCapabilities: () => void;
 }) {
   return (
-    <div className="page home-page">
-      <section className="home-intro">
-        <div>
-          <p className="eyebrow">2026年7月26日，星期日</p>
-          <h1>早上好，董事长</h1>
-          <p>这里是今天最值得关注的经营变化。</p>
-        </div>
-        <button type="button" className="data-time-button" onClick={onCapabilities}>
-          <span className="status-dot positive" aria-hidden="true" />
-          <span><strong>数据截至 7月25日 02:06</strong><small>查看可查询范围</small></span>
-        </button>
-      </section>
+    <div className="workspace-home">
+      <div className="home-scroll-region">
+        <div className="home-conversation-canvas">
+          <section className="workspace-greeting" aria-labelledby="workspace-greeting-title">
+            <span className="assistant-monogram" aria-hidden="true">秘</span>
+            <div><p>2026年7月26日，星期日</p><h1 id="workspace-greeting-title">早上好，董事长</h1><span>我已经核对了最新经营数据，可以直接开始问。</span></div>
+          </section>
 
-      <section className="home-lead-grid">
-        <article className="daily-summary-panel" aria-labelledby="daily-title">
-          <header className="section-header">
-            <div><p className="eyebrow">今日 05:03 生成</p><h2 id="daily-title">今日经营变化</h2></div>
-            <button type="button" className="text-button" onClick={onDaily}>查看详情</button>
-          </header>
-          <button type="button" className="daily-conclusion" onClick={onDaily}>
-            <span>一句话结论</span>
-            <strong>经营节奏总体稳定，回款和两项交付偏差需要今天确认。</strong>
-          </button>
-          <ol className="change-list">
-            {dailyChanges.map((change, index) => (
-              <li key={change.title}>
-                <button type="button" onClick={onDaily}>
-                  <span className={`change-number ${change.tone}`}>{String(index + 1).padStart(2, "0")}</span>
-                  <span className="change-copy"><small className={change.tone}>{change.state}</small><strong>{change.title}</strong><span>{change.detail}</span></span>
-                  <span className="row-arrow" aria-hidden="true">→</span>
-                </button>
-              </li>
-            ))}
-          </ol>
-          <footer><span>数据同步成功</span><span>仅展示前三项，不为凑数放大普通变化</span></footer>
-        </article>
-
-        <aside className="home-side-column">
-          <article className="weekly-entry">
-            <div><p className="eyebrow">上一个完整自然周</p><h2>每周高层经营简报</h2><p>签约质量改善，回款与交付节奏仍需校准。</p></div>
-            <button type="button" onClick={onWeekly}>阅读第30周简报</button>
-          </article>
-          <article className="suggestion-panel" aria-labelledby="suggestions-title">
-            <header className="section-header"><div><p className="eyebrow">基于变化与关注偏好</p><h2 id="suggestions-title">下一步建议</h2></div></header>
-            <div className="suggestion-list">
-              {homeSuggestions.map((suggestion, index) => (
-                <button key={suggestion} type="button" onClick={() => onSuggestion(suggestion)}>
-                  <span>{index + 1}</span><strong>{suggestion}</strong><small>放入输入框</small>
-                </button>
-              ))}
+          <article className="assistant-brief-message" aria-labelledby="daily-title">
+            <div className="message-rail"><span className="assistant-monogram" aria-hidden="true">秘</span></div>
+            <div className="assistant-brief-body">
+              <header><div><strong>晨间经营简报</strong><span>今日 05:03 · 数据截至 7月25日 02:06</span></div><button type="button" onClick={onCapabilities}>查看数据范围</button></header>
+              <section className="brief-conclusion"><small>一句话结论</small><h2 id="daily-title">经营节奏总体稳定，回款和两项交付偏差需要今天确认。</h2></section>
+              <ol className="brief-change-list">
+                {dailyChanges.map((change, index) => (
+                  <li key={change.title}>
+                    <button type="button" onClick={onDaily}>
+                      <span className={`change-number ${change.tone}`}>{String(index + 1).padStart(2, "0")}</span>
+                      <span><small className={change.tone}>{change.state}</small><strong>{change.title}</strong><em>{change.detail}</em></span>
+                      <span aria-hidden="true">›</span>
+                    </button>
+                  </li>
+                ))}
+              </ol>
+              <footer><button type="button" onClick={onDaily}>展开今日简报</button><button type="button" onClick={onWeekly}>查看每周高层简报</button></footer>
             </div>
           </article>
-        </aside>
-      </section>
 
-      <section className="home-composer-section" aria-labelledby="composer-title">
-        <div className="composer-heading"><p className="eyebrow">新会话</p><h2 id="composer-title">您想了解什么？</h2><p>直接提问经营数据，也可以上传本会话需要分析的文件。</p></div>
-        <form className="composer" onSubmit={onSubmit}>
+          <section className="prompt-suggestions" aria-labelledby="prompt-suggestions-title">
+            <h2 id="prompt-suggestions-title">可以接着问</h2>
+            <div>{homeSuggestions.map((suggestion) => <button key={suggestion} type="button" onClick={() => onSuggestion(suggestion)}><span>{suggestion}</span><small>填入输入框</small></button>)}</div>
+          </section>
+        </div>
+      </div>
+
+      <div className="workspace-composer-dock">
+        <form className="composer workbench-composer" onSubmit={onSubmit}>
           <label className="sr-only" htmlFor="executive-question">输入经营问题</label>
           <textarea
             ref={composerRef}
             id="executive-question"
-            rows={3}
+            rows={2}
             maxLength={1200}
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="例如：这个月整体经营怎么样？"
+            placeholder="向 AI 秘书提问经营数据，或上传当前会话文件"
           />
           <div className="composer-footer">
             <div className="composer-tools">
               <input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} id="home-file-input" />
-              <button type="button" className="secondary-button compact" onClick={() => fileRef.current?.click()}>添加文件</button>
-              <span>PDF、Word、Excel、PPT · 单文件 50 MB</span>
+              <button type="button" className="composer-attach-button" onClick={() => fileRef.current?.click()}>＋ 添加文件</button>
+              <span>系统会自动判断数据、文件或公开研究路径</span>
             </div>
-            <div className="composer-send"><span>{question.length}/1200</span><kbd>Enter</kbd><button className="primary-button" type="submit" disabled={!question.trim()}>发送问题</button></div>
+            <div className="composer-send"><span>{question.length}/1200</span><kbd>Enter</kbd><button className="composer-submit-button" type="submit" disabled={!question.trim()} aria-label="发送问题">↑</button></div>
           </div>
         </form>
-      </section>
-
-      <section className="recent-section" aria-labelledby="recent-title">
-        <header className="section-header">
-          <div><p className="eyebrow">保留上下文</p><h2 id="recent-title">最近会话</h2></div>
-          <button type="button" className="text-button" onClick={onHistory}>查看全部</button>
-        </header>
-        <div className="recent-list">
-          {initialConversations.slice(0, 4).map((item) => (
-            <button type="button" key={item.id} onClick={() => onConversation(item)}>
-              <span className="type-badge">{item.type}</span>
-              <span className="recent-copy"><strong>{item.title}</strong><small>{item.preview}</small></span>
-              <time>{item.time}</time><span className="row-arrow" aria-hidden="true">→</span>
-            </button>
-          ))}
-        </div>
-      </section>
+        <p>AI 可能出错。关键经营数字请结合来源与数据时间核对。</p>
+      </div>
     </div>
   );
 }
 
 function ChatView({
-  title,
   question,
   previousQuestion,
   stage,
@@ -1073,11 +1062,7 @@ function ChatView({
   draft,
   setDraft,
   fileRef,
-  onBack,
-  onNew,
   onOpenScope,
-  onRename,
-  onDeleteChat,
   onStop,
   onRetry,
   onConfirmClarification,
@@ -1090,7 +1075,6 @@ function ChatView({
   onSaveMemory,
   onDismissMemory,
 }: {
-  title: string;
   question: string;
   previousQuestion: string;
   stage: ChatStage;
@@ -1112,11 +1096,7 @@ function ChatView({
   draft: string;
   setDraft: (value: string) => void;
   fileRef: RefObject<HTMLInputElement | null>;
-  onBack: () => void;
-  onNew: () => void;
   onOpenScope: () => void;
-  onRename: (title: string) => void;
-  onDeleteChat: () => void;
   onStop: () => void;
   onRetry: () => void;
   onConfirmClarification: () => void;
@@ -1129,49 +1109,26 @@ function ChatView({
   onSaveMemory: () => void;
   onDismissMemory: () => void;
 }) {
-  const [moreOpen, setMoreOpen] = useState(false);
-  const [renaming, setRenaming] = useState(false);
-  const [titleDraft, setTitleDraft] = useState(title);
-
   const isProcessing = ["understanding", "working", "composing"].includes(stage);
   const usableFiles = files.filter((file) => file.status === "可使用" || file.status === "部分解析");
 
   return (
     <div className="chat-page">
-      <header className="chat-page-header">
-        <button type="button" className="back-link" onClick={onBack}>返回首页</button>
-        <div className="chat-title-block">
-          {renaming ? (
-            <form onSubmit={(event) => { event.preventDefault(); onRename(titleDraft); setRenaming(false); }}>
-              <input value={titleDraft} maxLength={20} onChange={(event) => setTitleDraft(event.target.value)} aria-label="会话标题" autoFocus />
-              <button type="submit">保存</button><button type="button" onClick={() => setRenaming(false)}>取消</button>
-            </form>
-          ) : (
-            <><h1>{title}</h1><p>{question ? "会话范围会用于后续追问" : "从一个经营问题或文件开始"}</p></>
+      <div className="chat-scroll-region">
+        <div className="chat-scroll-inner">
+          {(route === "data" || route === "failure") && (
+            <button type="button" className="scope-bar" onClick={onOpenScope}>
+              <span><small>当前范围</small><strong>{scope.time} · {scope.organizations.join("、")}{scope.owner ? ` · ${scope.owner}` : ""}{scope.object ? ` · ${scope.object}` : ""}</strong></span>
+              <span>查看或调整</span>
+            </button>
           )}
-        </div>
-        <div className="chat-header-actions">
-          <button type="button" className="secondary-button compact" onClick={onNew}>新建会话</button>
-          <div className="more-control">
-            <button type="button" className="icon-text-button" aria-expanded={moreOpen} onClick={() => setMoreOpen((current) => !current)}>更多</button>
-            {moreOpen && <div className="more-menu"><button type="button" onClick={() => { setTitleDraft(title); setRenaming(true); setMoreOpen(false); }}>修改标题</button><button type="button" className="danger" onClick={onDeleteChat}>删除会话</button></div>}
-          </div>
-        </div>
-      </header>
+          {route === "file" && (
+            <div className="scope-bar static"><span><small>当前会话文件</small><strong>{files.length} 个文件，{usableFiles.length} 个可使用</strong></span><span>不会跨会话检索</span></div>
+          )}
+          {inheritedNotice && <p className="context-notice">{inheritedNotice}</p>}
+          {newTopicNotice && <p className="context-notice">这是一个新的主题，已在当前会话中继续处理。</p>}
 
-      {(route === "data" || route === "failure") && (
-        <button type="button" className="scope-bar" onClick={onOpenScope}>
-          <span><small>当前范围</small><strong>{scope.time} · {scope.organizations.join("、")}{scope.owner ? ` · ${scope.owner}` : ""}{scope.object ? ` · ${scope.object}` : ""}</strong></span>
-          <span>查看或调整</span>
-        </button>
-      )}
-      {route === "file" && (
-        <div className="scope-bar static"><span><small>当前会话文件</small><strong>{files.length} 个文件，{usableFiles.length} 个可使用</strong></span><span>不会跨会话检索</span></div>
-      )}
-      {inheritedNotice && <p className="context-notice">{inheritedNotice}</p>}
-      {newTopicNotice && <p className="context-notice">这是一个新的主题，已在当前会话中继续处理。</p>}
-
-      <div className="conversation-column">
+          <div className="conversation-column">
         {previousQuestion && (
           <details className="previous-turn"><summary>上一轮对话</summary><p>{previousQuestion}</p></details>
         )}
@@ -1214,16 +1171,21 @@ function ChatView({
         {files.length > 0 && (
           <FileList files={files} selectedFile={selectedFile} setSelectedFile={setSelectedFile} onDelete={onDeleteFile} />
         )}
+          </div>
+        </div>
       </div>
 
-      <form className="composer chat-composer" onSubmit={onSubmit}>
-        <label className="sr-only" htmlFor="chat-question">继续提问</label>
-        <textarea id="chat-question" rows={2} maxLength={1200} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} placeholder="继续追问，当前范围会自动继承" />
-        <div className="composer-footer">
-          <div className="composer-tools"><input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} /><button type="button" className="secondary-button compact" onClick={() => fileRef.current?.click()}>添加文件</button><span>当前会话最多 10 个</span></div>
-          <div className="composer-send"><span>{draft.length}/1200</span><button className="primary-button" type="submit" disabled={!draft.trim() || isProcessing}>发送</button></div>
-        </div>
-      </form>
+      <div className="workspace-composer-dock chat-dock">
+        <form className="composer workbench-composer chat-composer" onSubmit={onSubmit}>
+          <label className="sr-only" htmlFor="chat-question">继续提问</label>
+          <textarea id="chat-question" rows={2} maxLength={1200} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} placeholder="继续追问，当前范围会自动继承" />
+          <div className="composer-footer">
+            <div className="composer-tools"><input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} /><button type="button" className="composer-attach-button" onClick={() => fileRef.current?.click()}>＋ 添加文件</button><span>当前会话最多 10 个文件</span></div>
+            <div className="composer-send"><span>{draft.length}/1200</span><button className="composer-submit-button" type="submit" disabled={!draft.trim() || isProcessing} aria-label="发送">↑</button></div>
+          </div>
+        </form>
+        <p>AI 可能出错。关键经营数字请结合来源与数据时间核对。</p>
+      </div>
     </div>
   );
 }
