@@ -31,6 +31,8 @@ import {
 type AuthRole = "executive" | "admin" | null;
 type LoginMode = Exclude<AuthRole, null>;
 type AuthStep = "login" | "change-password";
+type ThemePreference = "system" | "light" | "dark";
+type ResponseDepth = "简洁" | "标准" | "详细";
 type WorkspacePanelView = Exclude<ExecutiveView, "home" | "chat">;
 type ChatStage =
   | "empty"
@@ -121,6 +123,11 @@ const sidebarProjects: SidebarProject[] = [
 
 export default function ProductPrototype() {
   const [role, setRole] = useState<AuthRole>(null);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
+    if (typeof window === "undefined") return "system";
+    const savedTheme = window.localStorage.getItem("executive-workbench-theme");
+    return savedTheme === "light" || savedTheme === "dark" || savedTheme === "system" ? savedTheme : "system";
+  });
   const [mode, setMode] = useState<LoginMode>("executive");
   const [step, setStep] = useState<AuthStep>("login");
   const [account, setAccount] = useState("chairman");
@@ -132,6 +139,12 @@ export default function ProductPrototype() {
   const [lockedUntil, setLockedUntil] = useState<number | null>(null);
   const [pendingDestination, setPendingDestination] = useState<ExecutiveView>("home");
   const [pendingConversationId, setPendingConversationId] = useState<number | null>(null);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themePreference;
+    document.documentElement.style.colorScheme = themePreference === "system" ? "light dark" : themePreference;
+    window.localStorage.setItem("executive-workbench-theme", themePreference);
+  }, [themePreference]);
 
   function switchMode(nextMode: LoginMode) {
     setMode(nextMode);
@@ -236,7 +249,15 @@ export default function ProductPrototype() {
     return <AdminWorkspace onLogout={logout} />;
   }
 
-  return <ExecutiveWorkspace initialView={pendingDestination} initialConversationId={pendingConversationId} onLogout={logout} />;
+  return (
+    <ExecutiveWorkspace
+      initialView={pendingDestination}
+      initialConversationId={pendingConversationId}
+      themePreference={themePreference}
+      onThemePreferenceChange={setThemePreference}
+      onLogout={logout}
+    />
+  );
 }
 
 function LoginScreen({
@@ -353,7 +374,19 @@ function LoginScreen({
   );
 }
 
-function ExecutiveWorkspace({ initialView, initialConversationId, onLogout }: { initialView: ExecutiveView; initialConversationId: number | null; onLogout: () => void }) {
+function ExecutiveWorkspace({
+  initialView,
+  initialConversationId,
+  themePreference,
+  onThemePreferenceChange,
+  onLogout,
+}: {
+  initialView: ExecutiveView;
+  initialConversationId: number | null;
+  themePreference: ThemePreference;
+  onThemePreferenceChange: (theme: ThemePreference) => void;
+  onLogout: () => void;
+}) {
   const linkedConversation = initialConversationId ? initialConversations.find((item) => item.id === initialConversationId) : undefined;
   const linkedPanel: WorkspacePanelView | null = linkedConversation?.type === "每日摘要" ? "daily" : linkedConversation?.type === "每周简报" ? "weekly" : null;
   const linkedRoute: RouteKind = linkedConversation?.type === "文件" ? "file" : linkedConversation?.type === "泛化" ? "research" : "data";
@@ -365,6 +398,7 @@ function ExecutiveWorkspace({ initialView, initialConversationId, onLogout }: { 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [homeQuestion, setHomeQuestion] = useState("");
   const [chatDraft, setChatDraft] = useState("");
+  const [responseDepth, setResponseDepth] = useState<ResponseDepth>("标准");
   const [lastQuestion, setLastQuestion] = useState(linkedChat ? linkedConversation?.title ?? "" : "");
   const [previousQuestion, setPreviousQuestion] = useState("");
   const [chatStage, setChatStage] = useState<ChatStage>(linkedChat ? "ready" : "empty");
@@ -1090,6 +1124,27 @@ function ExecutiveWorkspace({ initialView, initialConversationId, onLogout }: { 
               <div className="profile-menu">
                 <button type="button" onClick={() => switchView("account")}>账号与推送</button>
                 <button type="button" onClick={() => switchView("capabilities")}>当前可查询范围</button>
+                <div className="profile-menu-divider" />
+                <div className="theme-menu-section" role="radiogroup" aria-label="外观模式">
+                  <span>外观</span>
+                  {([
+                    ["system", "跟随系统"],
+                    ["light", "白天"],
+                    ["dark", "夜间"],
+                  ] as Array<[ThemePreference, string]>).map(([value, label]) => (
+                    <button
+                      type="button"
+                      key={value}
+                      role="radio"
+                      aria-checked={themePreference === value}
+                      className={themePreference === value ? "selected" : ""}
+                      onClick={() => onThemePreferenceChange(value)}
+                    >
+                      <span>{label}</span><span aria-hidden="true">{themePreference === value ? "✓" : ""}</span>
+                    </button>
+                  ))}
+                </div>
+                <div className="profile-menu-divider" />
                 <button type="button" onClick={onLogout}>退出登录</button>
               </div>
             )}
@@ -1126,7 +1181,7 @@ function ExecutiveWorkspace({ initialView, initialConversationId, onLogout }: { 
           <div className="workspace-topbar-actions">
             {view === "chat" && (routeKind === "data" || routeKind === "failure") && <button type="button" className="topbar-scope-button" onClick={() => setScopePanelOpen(true)}>调整范围</button>}
             <button className="demo-button" type="button" onClick={() => setDemoOpen(true)}>演示 <span>10</span></button>
-            <button className="topbar-new-button" type="button" onClick={resetConversation}>新会话</button>
+            <button className="topbar-new-button" type="button" aria-label="新建会话" title="新建会话" onClick={resetConversation}>＋</button>
             {view === "chat" && lastQuestion && (
               <div className="more-control">
                 <button type="button" className="topbar-more-button" aria-label="会话操作" aria-expanded={conversationMenuOpen} onClick={() => setConversationMenuOpen((current) => !current)}>•••</button>
@@ -1148,8 +1203,10 @@ function ExecutiveWorkspace({ initialView, initialConversationId, onLogout }: { 
             onFiles={(event) => handleFiles(event, true)}
             onSuggestion={(suggestion) => chooseSuggestion(suggestion, "home")}
             onDaily={() => switchView("daily")}
-            onWeekly={() => switchView("weekly")}
-            onCapabilities={() => switchView("capabilities")}
+            scope={scope}
+            onOpenScope={() => setScopePanelOpen(true)}
+            responseDepth={responseDepth}
+            onResponseDepthChange={setResponseDepth}
           />
         )}
         {view === "chat" && (
@@ -1187,6 +1244,8 @@ function ExecutiveWorkspace({ initialView, initialConversationId, onLogout }: { 
             onNotify={notify}
             onSaveMemory={saveMemoryCandidate}
             onDismissMemory={() => setMemoryCandidate(false)}
+            responseDepth={responseDepth}
+            onResponseDepthChange={setResponseDepth}
           />
         )}
         </main>
@@ -1244,8 +1303,10 @@ function HomeView({
   onFiles,
   onSuggestion,
   onDaily,
-  onWeekly,
-  onCapabilities,
+  scope,
+  onOpenScope,
+  responseDepth,
+  onResponseDepthChange,
 }: {
   question: string;
   setQuestion: (value: string) => void;
@@ -1256,47 +1317,31 @@ function HomeView({
   onFiles: (event: ChangeEvent<HTMLInputElement>) => void;
   onSuggestion: (question: string) => void;
   onDaily: () => void;
-  onWeekly: () => void;
-  onCapabilities: () => void;
+  scope: ScopeState;
+  onOpenScope: () => void;
+  responseDepth: ResponseDepth;
+  onResponseDepthChange: (depth: ResponseDepth) => void;
 }) {
   return (
     <div className="workspace-home">
-      <div className="home-scroll-region">
-        <div className="home-conversation-canvas">
+      <div className="home-empty-stage">
+        <div className="home-empty-inner">
+          <button type="button" className="morning-brief-trigger" onClick={onDaily}>
+            <span className="morning-brief-dot" aria-hidden="true" />
+            <span><strong>今日有 2 项需要确认</strong><small>晨间简报 · 数据截至 7月25日 02:06</small></span>
+            <span>查看晨间摘要 <i aria-hidden="true">›</i></span>
+          </button>
+
           <section className="workspace-greeting" aria-labelledby="workspace-greeting-title">
-            <span className="assistant-monogram" aria-hidden="true">秘</span>
-            <div><p>2026年7月26日，星期日</p><h1 id="workspace-greeting-title">早上好，董事长</h1><span>我已经核对了最新经营数据，可以直接开始问。</span></div>
-          </section>
-
-          <article className="assistant-brief-message" aria-labelledby="daily-title">
-            <div className="message-rail"><span className="assistant-monogram" aria-hidden="true">秘</span></div>
-            <div className="assistant-brief-body">
-              <header><div><strong>晨间经营简报</strong><span>今日 05:03 · 数据截至 7月25日 02:06</span></div><button type="button" onClick={onCapabilities}>查看数据范围</button></header>
-              <section className="brief-conclusion"><small>一句话结论</small><h2 id="daily-title">经营节奏总体稳定，回款和两项交付偏差需要今天确认。</h2></section>
-              <ol className="brief-change-list">
-                {dailyChanges.map((change, index) => (
-                  <li key={change.title}>
-                    <button type="button" onClick={onDaily}>
-                      <span className={`change-number ${change.tone}`}>{String(index + 1).padStart(2, "0")}</span>
-                      <span><small className={change.tone}>{change.state}</small><strong>{change.title}</strong><em>{change.detail}</em></span>
-                      <span aria-hidden="true">›</span>
-                    </button>
-                  </li>
-                ))}
-              </ol>
-              <footer><button type="button" onClick={onDaily}>展开今日简报</button><button type="button" onClick={onWeekly}>查看每周高层简报</button></footer>
+            <p>2026年7月26日，星期日</p>
+            <div className="greeting-title-line">
+              <span className="service-mark" aria-hidden="true" />
+              <h1 id="workspace-greeting-title">早上好，董事长</h1>
             </div>
-          </article>
-
-          <section className="prompt-suggestions" aria-labelledby="prompt-suggestions-title">
-            <h2 id="prompt-suggestions-title">可以接着问</h2>
-            <div>{homeSuggestions.map((suggestion) => <button key={suggestion} type="button" onClick={() => onSuggestion(suggestion)}><span>{suggestion}</span><small>填入输入框</small></button>)}</div>
+            <span>今天需要我先看什么？</span>
           </section>
-        </div>
-      </div>
 
-      <div className="workspace-composer-dock">
-        <form className="composer workbench-composer" onSubmit={onSubmit}>
+          <form className="composer workbench-composer home-primary-composer" onSubmit={onSubmit}>
           <label className="sr-only" htmlFor="executive-question">输入经营问题</label>
           <textarea
             ref={composerRef}
@@ -1311,13 +1356,24 @@ function HomeView({
           <div className="composer-footer">
             <div className="composer-tools">
               <input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} id="home-file-input" />
-              <button type="button" className="composer-attach-button" onClick={() => fileRef.current?.click()}>＋ 添加文件</button>
-              <span>系统会自动判断数据、文件或公开研究路径</span>
+              <button type="button" className="composer-tool-button" onClick={() => fileRef.current?.click()} aria-label="添加文件"><span aria-hidden="true">＋</span><span>文件</span></button>
+              <button type="button" className="composer-tool-button scope" onClick={onOpenScope}><span className="scope-building-mark" aria-hidden="true" />{scope.organizations.join("、")}</button>
             </div>
-            <div className="composer-send"><span>{question.length}/1200</span><kbd>Enter</kbd><button className="composer-submit-button" type="submit" disabled={!question.trim()} aria-label="发送问题">↑</button></div>
+            <div className="composer-send">
+              <ResponsePreferenceControl value={responseDepth} onChange={onResponseDepthChange} />
+              <span>{question.length}/1200</span>
+              <button className="composer-submit-button" type="submit" disabled={!question.trim()} aria-label="发送问题">↑</button>
+            </div>
           </div>
         </form>
-        <p>AI 可能出错。关键经营数字请结合来源与数据时间核对。</p>
+
+          <section className="prompt-suggestions" aria-labelledby="prompt-suggestions-title">
+            <h2 id="prompt-suggestions-title">从一个问题开始</h2>
+            <div>{homeSuggestions.map((suggestion) => <button key={suggestion} type="button" onClick={() => onSuggestion(suggestion)}><span>{suggestion}</span><small aria-hidden="true">›</small></button>)}</div>
+          </section>
+
+          <p className="home-service-note">AI 可能出错。关键经营数字请结合来源与数据时间核对。</p>
+        </div>
       </div>
     </div>
   );
@@ -1357,6 +1413,8 @@ function ChatView({
   onNotify,
   onSaveMemory,
   onDismissMemory,
+  responseDepth,
+  onResponseDepthChange,
 }: {
   question: string;
   previousQuestion: string;
@@ -1391,6 +1449,8 @@ function ChatView({
   onNotify: (message: string) => void;
   onSaveMemory: () => void;
   onDismissMemory: () => void;
+  responseDepth: ResponseDepth;
+  onResponseDepthChange: (depth: ResponseDepth) => void;
 }) {
   const isProcessing = ["understanding", "working", "composing"].includes(stage);
   const usableFiles = files.filter((file) => file.status === "可使用" || file.status === "部分解析");
@@ -1463,12 +1523,40 @@ function ChatView({
           <label className="sr-only" htmlFor="chat-question">继续提问</label>
           <textarea id="chat-question" rows={2} maxLength={1200} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} placeholder="继续追问，当前范围会自动继承" />
           <div className="composer-footer">
-            <div className="composer-tools"><input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} /><button type="button" className="composer-attach-button" onClick={() => fileRef.current?.click()}>＋ 添加文件</button><span>当前会话最多 10 个文件</span></div>
-            <div className="composer-send"><span>{draft.length}/1200</span><button className="composer-submit-button" type="submit" disabled={!draft.trim() || isProcessing} aria-label="发送">↑</button></div>
+            <div className="composer-tools">
+              <input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} />
+              <button type="button" className="composer-tool-button" onClick={() => fileRef.current?.click()} aria-label="添加文件"><span aria-hidden="true">＋</span><span>文件</span></button>
+              {(route === "data" || route === "failure") && <button type="button" className="composer-tool-button scope" onClick={onOpenScope}><span className="scope-building-mark" aria-hidden="true" />{scope.organizations.join("、")}</button>}
+            </div>
+            <div className="composer-send">
+              <ResponsePreferenceControl value={responseDepth} onChange={onResponseDepthChange} />
+              <span>{draft.length}/1200</span>
+              <button className="composer-submit-button" type="submit" disabled={!draft.trim() || isProcessing} aria-label="发送">↑</button>
+            </div>
           </div>
         </form>
         <p>AI 可能出错。关键经营数字请结合来源与数据时间核对。</p>
       </div>
+    </div>
+  );
+}
+
+function ResponsePreferenceControl({ value, onChange }: { value: ResponseDepth; onChange: (depth: ResponseDepth) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="response-preference-control">
+      <button type="button" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+        回答：{value}<span aria-hidden="true">{open ? "⌃" : "⌄"}</span>
+      </button>
+      {open && (
+        <div className="response-preference-menu" role="menu" aria-label="回答详细程度">
+          {(["简洁", "标准", "详细"] as ResponseDepth[]).map((depth) => (
+            <button type="button" key={depth} role="menuitemradio" aria-checked={value === depth} className={value === depth ? "selected" : ""} onClick={() => { onChange(depth); setOpen(false); }}>
+              <span>{depth}</span><span aria-hidden="true">{value === depth ? "✓" : ""}</span>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
