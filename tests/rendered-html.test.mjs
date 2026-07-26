@@ -55,12 +55,22 @@ test("includes accessible controls for login and first-use security", async () =
 test("prototype source contains the required functional contracts", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const data = await readFile(new URL("../app/prototype-data.ts", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
 
   assert.match(page, /accept="\.pdf,\.docx,\.xlsx,\.pptx"/);
   assert.match(page, /十个标准演示场景/);
   assert.match(data, /最多两轮范围选择/);
   assert.match(page, /不会检索其他会话文件/);
   assert.match(page, /没有生成近似金额/);
+  assert.match(page, /const COMPOSER_MAX_LENGTH = 8000/);
+  assert.match(page, /const COMPOSER_HINT_THRESHOLD = COMPOSER_MAX_LENGTH \* 0\.8/);
+  assert.match(page, /function OrganizationPicker/);
+  assert.match(page, /configuredByAdmin/);
+  assert.match(page, /function PersonalCenterWindow/);
+  assert.match(page, /"zh-CN".*"zh-TW".*"en"/s);
+  assert.doesNotMatch(page, /ResponsePreferenceControl|回答：标准|maxLength=\{1200\}/);
+  assert.match(styles, /\.preferences-window/);
+  assert.match(styles, /\.organization-popover/);
   for (const id of ["overview", "target", "change", "forecast", "customers", "delivery", "collection", "organization"]) {
     assert.match(data, new RegExp(`\\b${id}: \\{`));
   }
