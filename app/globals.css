@@ -1,24 +1,24 @@
 :root {
-  --canvas: #f5f4f0;
+  --canvas: #e9ece7;
   --surface: #ffffff;
-  --surface-soft: #faf9f6;
-  --surface-quiet: #f0efeb;
-  --ink: #1c211f;
-  --ink-soft: #424946;
-  --muted: #747b77;
-  --faint: #9ca29f;
-  --line: #e2e3df;
-  --line-strong: #cfd2cd;
-  --accent: #2457d6;
-  --accent-dark: #1c45ad;
-  --accent-soft: #edf2ff;
-  --positive: #386748;
-  --positive-bg: #edf3ec;
-  --attention: #8a641a;
-  --attention-bg: #fbf3db;
-  --risk: #9a3936;
-  --risk-bg: #fdebec;
-  --neutral-bg: #eff1ef;
+  --surface-soft: #f7f9f5;
+  --surface-quiet: #edf1ec;
+  --ink: #1b2521;
+  --ink-soft: #44514b;
+  --muted: #69766f;
+  --faint: #98a19b;
+  --line: #dbe1db;
+  --line-strong: #c8d1c9;
+  --accent: #236652;
+  --accent-dark: #174c3e;
+  --accent-soft: #e1eee8;
+  --positive: #3d6a4c;
+  --positive-bg: #e9f1e9;
+  --attention: #856429;
+  --attention-bg: #f5edd9;
+  --risk: #985047;
+  --risk-bg: #f7e8e5;
+  --neutral-bg: #edf1ed;
   --radius: 8px;
   --radius-small: 5px;
   --header-height: 68px;
@@ -72,7 +72,7 @@ input:focus-visible,
 textarea:focus-visible,
 select:focus-visible,
 summary:focus-visible {
-  box-shadow: 0 0 0 3px rgba(36, 87, 214, 0.22);
+  box-shadow: 0 0 0 3px rgba(35, 102, 82, 0.22);
 }
 
 button {
@@ -123,14 +123,14 @@ select {
 input:hover,
 textarea:hover,
 select:hover {
-  border-color: #b9beb9;
+  border-color: #aebbb1;
 }
 
 input:focus,
 textarea:focus,
 select:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(36, 87, 214, 0.1);
+  box-shadow: 0 0 0 3px rgba(35, 102, 82, 0.1);
 }
 
 textarea {
@@ -139,7 +139,7 @@ textarea {
 
 ::selection {
   color: var(--ink);
-  background: #dce6ff;
+  background: #cfe2d9;
 }
 
 .sr-only {
@@ -1166,7 +1166,7 @@ fieldset legend {
 
 .composer:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(36, 87, 214, 0.08);
+  box-shadow: 0 0 0 3px rgba(35, 102, 82, 0.08);
 }
 
 .composer textarea {
@@ -4710,11 +4710,15 @@ tbody tr:last-child td {
 
 /* Executive workbench redesign */
 .workbench-shell {
-  --workbench-chrome: #e8e7e3;
-  --workbench-sidebar: #f1f0ed;
-  --workbench-canvas: #fcfcfb;
-  --workbench-message: #f2f5fa;
-  --workbench-line: #d9d8d3;
+  --workbench-chrome: #dfe4de;
+  --workbench-sidebar: #edf0eb;
+  --workbench-canvas: #fbfcf9;
+  --workbench-message: #eef4f0;
+  --workbench-user-message: #e9e7df;
+  --workbench-subtle: #f3f6f2;
+  --workbench-line: #d4dcd5;
+  --workbench-line-strong: #c3cdc5;
+  --workbench-shadow: rgba(31, 47, 40, 0.09);
   position: fixed;
   inset: 0;
   z-index: 0;
@@ -4740,10 +4744,10 @@ tbody tr:last-child td {
   min-height: 0;
   flex-direction: column;
   padding: 10px;
-  border: 1px solid rgba(82, 82, 75, 0.09);
+  border: 1px solid rgba(48, 67, 58, 0.1);
   border-radius: 12px;
   background: var(--workbench-sidebar);
-  box-shadow: inset -1px 0 rgba(255, 255, 255, 0.45);
+  box-shadow: inset -1px 0 rgba(255, 255, 255, 0.5);
 }
 
 .sidebar-brand-row {
@@ -4769,7 +4773,7 @@ tbody tr:last-child td {
   height: 31px;
   flex: 0 0 31px;
   border-radius: 8px;
-  background: #252a27;
+  background: #1d2b26;
   font-size: 13px;
 }
 
@@ -4788,7 +4792,7 @@ tbody tr:last-child td {
 
 .sidebar-brand small {
   margin-top: 2px;
-  color: #777a76;
+  color: #748078;
   font-size: 9px;
 }
 
@@ -4801,7 +4805,7 @@ tbody tr:last-child td {
   flex: 0 0 30px;
   place-items: center;
   border-radius: 7px;
-  color: #676a66;
+  color: #66736c;
   background: transparent;
   font-size: 17px;
   transition: color 160ms ease, background 160ms ease, transform 160ms ease;
@@ -4810,8 +4814,8 @@ tbody tr:last-child td {
 .sidebar-collapse:hover,
 .mobile-sidebar-trigger:hover,
 .topbar-more-button:hover {
-  color: #242825;
-  background: #e2e1dd;
+  color: #1f2c27;
+  background: #dfe5df;
 }
 
 .sidebar-collapse:active,
@@ -4829,18 +4833,18 @@ tbody tr:last-child td {
   gap: 7px;
   margin: 12px 0 9px;
   padding: 0 10px;
-  border: 1px solid #d3d2cd;
+  border: 1px solid #cbd4cc;
   border-radius: 9px;
-  color: #272b28;
-  background: #fff;
+  color: #23302a;
+  background: #fafbf8;
   text-align: left;
-  box-shadow: 0 1px 2px rgba(44, 45, 42, 0.04);
+  box-shadow: 0 1px 2px rgba(31, 47, 40, 0.05);
   transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
 }
 
 .new-conversation-button:hover {
-  border-color: #bcbcb6;
-  background: #fdfdfc;
+  border-color: #acbbae;
+  background: #f4f7f3;
 }
 
 .new-conversation-button:active {
@@ -4858,7 +4862,7 @@ tbody tr:last-child td {
 }
 
 .new-conversation-button kbd {
-  color: #969893;
+  color: #8b978f;
   font-family: var(--font-geist-mono), monospace;
   font-size: 9px;
 }
@@ -4877,20 +4881,20 @@ tbody tr:last-child td {
   gap: 6px;
   padding: 0 9px;
   border-radius: 8px;
-  color: #626560;
+  color: #5e6b64;
   background: transparent;
   text-align: left;
   transition: color 160ms ease, background 160ms ease;
 }
 
 .workspace-navigation button:hover {
-  color: #252925;
-  background: #e6e5e1;
+  color: #203029;
+  background: #e1e7e1;
 }
 
 .workspace-navigation button.active {
-  color: #202421;
-  background: #deddd8;
+  color: #174c3e;
+  background: #d7e3db;
 }
 
 .workspace-navigation button > span {
@@ -4898,9 +4902,9 @@ tbody tr:last-child td {
   width: 24px;
   height: 24px;
   place-items: center;
-  border: 1px solid #d6d5d0;
+  border: 1px solid #cfd8d0;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.62);
   font-family: "Songti SC", serif;
   font-size: 10px;
 }
@@ -4919,7 +4923,7 @@ tbody tr:last-child td {
   flex: 1;
   flex-direction: column;
   margin-top: 16px;
-  border-top: 1px solid #dddbd6;
+  border-top: 1px solid #d5dcd5;
   padding-top: 14px;
 }
 
@@ -4928,14 +4932,14 @@ tbody tr:last-child td {
   align-items: center;
   justify-content: space-between;
   padding: 0 7px 7px;
-  color: #8c8e89;
+  color: #818d85;
   font-size: 10px;
   font-weight: 600;
 }
 
 .sidebar-conversations > header button {
   padding: 3px;
-  color: #777a76;
+  color: #748078;
   background: transparent;
   font-size: 9px;
 }
@@ -4956,15 +4960,15 @@ tbody tr:last-child td {
   gap: 8px;
   padding: 7px 9px;
   border-radius: 8px;
-  color: #4f524e;
+  color: #4b5952;
   background: transparent;
   text-align: left;
 }
 
 .sidebar-conversations > div > button:hover,
 .sidebar-conversations > div > button.active {
-  color: #222622;
-  background: #e5e4e0;
+  color: #1e2c26;
+  background: #dfe6e0;
 }
 
 .sidebar-conversations strong {
@@ -4976,7 +4980,7 @@ tbody tr:last-child td {
 }
 
 .sidebar-conversations small {
-  color: #979994;
+  color: #8f9992;
   font-family: var(--font-geist-mono), monospace;
   font-size: 8px;
   white-space: nowrap;
@@ -4987,7 +4991,7 @@ tbody tr:last-child td {
   gap: 5px;
   margin-top: 10px;
   padding-top: 9px;
-  border-top: 1px solid #dddbd6;
+  border-top: 1px solid #d5dcd5;
 }
 
 .sidebar-data-status,
@@ -5005,7 +5009,7 @@ tbody tr:last-child td {
 
 .sidebar-data-status:hover,
 .workspace-profile .profile-button:hover {
-  background: #e5e4e0;
+  background: #dfe6e0;
 }
 
 .sidebar-data-status > span:last-child,
@@ -5023,7 +5027,7 @@ tbody tr:last-child td {
 .sidebar-data-status small,
 .workspace-profile .profile-button small {
   margin-top: 2px;
-  color: #8b8e89;
+  color: #818d85;
   font-size: 9px;
 }
 
@@ -5033,9 +5037,9 @@ tbody tr:last-child td {
   bottom: 44px;
   left: 0;
   width: 230px;
-  border-color: #d3d2cd;
+  border-color: #cbd4cc;
   border-radius: 10px;
-  box-shadow: 0 18px 50px rgba(44, 45, 42, 0.14);
+  box-shadow: 0 18px 50px rgba(31, 47, 40, 0.15);
 }
 
 .sidebar-collapsed .sidebar-label,
@@ -5077,10 +5081,10 @@ tbody tr:last-child td {
   min-height: 0;
   grid-template-rows: 56px minmax(0, 1fr);
   overflow: hidden;
-  border: 1px solid rgba(82, 82, 75, 0.12);
+  border: 1px solid rgba(48, 67, 58, 0.12);
   border-radius: 12px;
   background: var(--workbench-canvas);
-  box-shadow: 0 2px 10px rgba(46, 47, 43, 0.05);
+  box-shadow: 0 2px 12px rgba(31, 47, 40, 0.06);
 }
 
 .workspace-topbar {
@@ -5089,8 +5093,8 @@ tbody tr:last-child td {
   align-items: center;
   gap: 12px;
   padding: 0 14px 0 18px;
-  border-bottom: 1px solid #e4e3df;
-  background: rgba(252, 252, 251, 0.96);
+  border-bottom: 1px solid #dde3dd;
+  background: rgba(251, 252, 249, 0.96);
 }
 
 .mobile-sidebar-trigger {
@@ -5114,7 +5118,7 @@ tbody tr:last-child td {
 .workspace-title-block small {
   overflow: hidden;
   margin-top: 2px;
-  color: #858883;
+  color: #7b8780;
   font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5139,8 +5143,8 @@ tbody tr:last-child td {
   min-height: 31px;
   padding: 0 9px;
   border-radius: 7px;
-  color: #555954;
-  background: #f0efec;
+  color: #4d5b54;
+  background: #edf1ed;
   font-size: 10px;
   font-weight: 600;
 }
@@ -5156,9 +5160,9 @@ tbody tr:last-child td {
 .workbench-shell .demo-button {
   min-height: 31px;
   padding: 0 8px;
-  border-color: #d9d8d3;
+  border-color: #d0d8d1;
   border-radius: 7px;
-  background: #fff;
+  background: #fbfcf9;
   font-size: 10px;
 }
 
@@ -5169,7 +5173,7 @@ tbody tr:last-child td {
 .workbench-shell .demo-button span {
   width: 16px;
   height: 16px;
-  background: #315fd0;
+  background: var(--accent);
   font-size: 8px;
 }
 
@@ -5237,7 +5241,7 @@ tbody tr:last-child td {
 
 .workspace-greeting > div > p {
   margin: 0 0 4px;
-  color: #898c87;
+  color: #7e8a83;
   font-size: 10px;
 }
 
@@ -5251,7 +5255,7 @@ tbody tr:last-child td {
 }
 
 .workspace-greeting > div > span {
-  color: #6f736e;
+  color: #65726b;
   font-size: 12px;
 }
 
@@ -5264,10 +5268,10 @@ tbody tr:last-child td {
 
 .assistant-brief-body {
   overflow: hidden;
-  border: 1px solid #dce1ea;
+  border: 1px solid #d2ddd6;
   border-radius: 14px;
   background: var(--workbench-message);
-  box-shadow: 0 1px 2px rgba(42, 50, 64, 0.03);
+  box-shadow: 0 1px 3px rgba(31, 47, 40, 0.04);
 }
 
 .assistant-brief-body > header {
@@ -5277,7 +5281,7 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 16px;
   padding: 10px 16px;
-  border-bottom: 1px solid #e0e4ec;
+  border-bottom: 1px solid #dbe4de;
 }
 
 .assistant-brief-body > header > div {
@@ -5291,14 +5295,14 @@ tbody tr:last-child td {
 
 .assistant-brief-body > header span {
   margin-top: 2px;
-  color: #80858d;
+  color: #75827a;
   font-family: var(--font-geist-mono), monospace;
   font-size: 8px;
 }
 
 .assistant-brief-body > header button {
   padding: 4px 0;
-  color: #315aaf;
+  color: var(--accent-dark);
   background: transparent;
   font-size: 10px;
   font-weight: 600;
@@ -5309,7 +5313,7 @@ tbody tr:last-child td {
 }
 
 .brief-conclusion small {
-  color: #7e838c;
+  color: #748179;
   font-size: 9px;
 }
 
@@ -5331,7 +5335,7 @@ tbody tr:last-child td {
 }
 
 .brief-change-list li {
-  border-top: 1px solid #dde2ea;
+  border-top: 1px solid #d8e1db;
 }
 
 .brief-change-list button {
@@ -5362,7 +5366,7 @@ tbody tr:last-child td {
 
 .brief-change-list em {
   overflow: hidden;
-  color: #777c84;
+  color: #6f7c74;
   font-size: 10px;
   font-style: normal;
   text-overflow: ellipsis;
@@ -5370,7 +5374,7 @@ tbody tr:last-child td {
 }
 
 .brief-change-list button > span:last-child {
-  color: #969ba2;
+  color: #8d9991;
   font-size: 16px;
   transition: transform 160ms ease;
 }
@@ -5383,16 +5387,16 @@ tbody tr:last-child td {
   display: flex;
   gap: 8px;
   padding: 12px 18px 15px;
-  border-top: 1px solid #dde2ea;
+  border-top: 1px solid #d8e1db;
 }
 
 .assistant-brief-body > footer button {
   min-height: 32px;
   padding: 0 10px;
-  border: 1px solid #d3d9e3;
+  border: 1px solid #ccd8d0;
   border-radius: 7px;
-  color: #4e5767;
-  background: rgba(255, 255, 255, 0.6);
+  color: #46574f;
+  background: rgba(255, 255, 255, 0.68);
   font-size: 10px;
   font-weight: 600;
 }
@@ -5403,7 +5407,7 @@ tbody tr:last-child td {
 
 .prompt-suggestions h2 {
   margin-bottom: 8px;
-  color: #7c807b;
+  color: #748078;
   font-size: 10px;
   font-weight: 600;
 }
@@ -5420,17 +5424,17 @@ tbody tr:last-child td {
   align-content: space-between;
   gap: 8px;
   padding: 11px 12px;
-  border: 1px solid #e0dfdb;
+  border: 1px solid #d9dfd9;
   border-radius: 9px;
-  color: #474b47;
-  background: #fff;
+  color: #414f48;
+  background: #fbfcf9;
   text-align: left;
   transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
 }
 
 .prompt-suggestions button:hover {
-  border-color: #c6c7c2;
-  background: #f7f7f5;
+  border-color: #b9c5bb;
+  background: #f1f5f1;
   transform: translateY(-1px);
 }
 
@@ -5441,30 +5445,30 @@ tbody tr:last-child td {
 }
 
 .prompt-suggestions button small {
-  color: #9a9c98;
+  color: #909a93;
   font-size: 8px;
 }
 
 .workspace-composer-dock {
   flex: 0 0 auto;
   padding: 12px 24px 10px;
-  border-top: 1px solid #e6e5e1;
-  background: #fafaf8;
+  border-top: 1px solid #dde3dd;
+  background: #f7f8f4;
 }
 
 .workbench-composer {
   width: min(100%, 900px);
   margin: 0 auto;
   overflow: hidden;
-  border-color: #c8c9c5;
+  border-color: #c3cec5;
   border-radius: 14px;
-  background: #f1f1ef;
-  box-shadow: 0 5px 20px rgba(44, 45, 42, 0.07), inset 0 1px rgba(255, 255, 255, 0.72);
+  background: #f0f3ee;
+  box-shadow: 0 5px 20px rgba(31, 47, 40, 0.08), inset 0 1px rgba(255, 255, 255, 0.76);
 }
 
 .workbench-composer:focus-within {
-  border-color: #8fa6d7;
-  box-shadow: 0 0 0 3px rgba(49, 95, 208, 0.1), 0 8px 24px rgba(44, 45, 42, 0.08);
+  border-color: #75a08f;
+  box-shadow: 0 0 0 3px rgba(35, 102, 82, 0.12), 0 8px 24px rgba(31, 47, 40, 0.1);
 }
 
 .workbench-composer textarea,
@@ -5485,14 +5489,14 @@ tbody tr:last-child td {
   min-height: 30px;
   padding: 0 8px;
   border-radius: 7px;
-  color: #555954;
+  color: #4d5b54;
   background: transparent;
   font-size: 10px;
   font-weight: 600;
 }
 
 .composer-attach-button:hover {
-  background: #e5e5e1;
+  background: #e2e8e2;
 }
 
 .composer-submit-button {
@@ -5502,14 +5506,14 @@ tbody tr:last-child td {
   place-items: center;
   border-radius: 9px;
   color: #fff;
-  background: #252a27;
+  background: #1d2b26;
   font-size: 17px;
   font-weight: 650;
   transition: background 160ms ease, transform 160ms ease;
 }
 
 .composer-submit-button:hover:not(:disabled) {
-  background: #315fd0;
+  background: var(--accent);
 }
 
 .composer-submit-button:active:not(:disabled) {
@@ -5517,14 +5521,14 @@ tbody tr:last-child td {
 }
 
 .composer-submit-button:disabled {
-  color: #aaaca8;
-  background: #dededb;
+  color: #9ea8a1;
+  background: #d9dfd9;
 }
 
 .workspace-composer-dock > p {
   width: min(100%, 900px);
   margin: 6px auto 0;
-  color: #999b97;
+  color: #8e9992;
   font-size: 8px;
   text-align: center;
 }
@@ -5537,9 +5541,9 @@ tbody tr:last-child td {
   min-height: 43px;
   margin-bottom: 22px;
   padding: 7px 10px;
-  border-color: #e1e0dc;
+  border-color: #d9e0da;
   border-radius: 9px;
-  background: #f6f6f4;
+  background: #f3f6f2;
 }
 
 .workbench-shell .conversation-column {
@@ -5551,9 +5555,9 @@ tbody tr:last-child td {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 9px;
   padding: 12px 14px;
-  border: 1px solid #e1e2df;
+  border: 1px solid #d9d9d1;
   border-radius: 13px 13px 4px 13px;
-  background: #eceeec;
+  background: var(--workbench-user-message);
 }
 
 .workbench-shell .user-message > span {
@@ -5572,18 +5576,18 @@ tbody tr:last-child td {
 .workbench-shell .file-list-section,
 .workbench-shell .memory-candidate {
   margin-left: 46px;
-  border-color: #dde1e8;
+  border-color: #d2ddd6;
   border-radius: 13px;
-  background: #f5f7fa;
+  background: var(--workbench-message);
 }
 
 .workbench-shell .structured-answer {
-  background: #f7f8fa;
-  box-shadow: 0 1px 3px rgba(38, 43, 51, 0.04);
+  background: var(--workbench-message);
+  box-shadow: 0 1px 3px rgba(31, 47, 40, 0.05);
 }
 
 .workbench-shell .answer-meta {
-  background: #f3f5f8;
+  background: #e7efe9;
 }
 
 .workbench-shell .answer-conclusion {
@@ -5606,14 +5610,14 @@ tbody tr:last-child td {
 }
 
 .workbench-shell .metric-grid {
-  background: #fff;
+  background: #fbfcf9;
 }
 
 .workbench-shell .chat-empty-state {
   margin-left: 46px;
-  border-color: #dfe2e8;
+  border-color: #d2ddd6;
   border-radius: 13px;
-  background: #f5f7fa;
+  background: var(--workbench-message);
 }
 
 .workbench-shell .chat-composer {
@@ -5631,7 +5635,7 @@ tbody tr:last-child td {
   justify-content: flex-end;
   overflow: hidden;
   border-radius: 12px;
-  background: rgba(42, 43, 40, 0.14);
+  background: rgba(27, 43, 36, 0.16);
   animation: overlay-in 160ms ease both;
 }
 
@@ -5645,9 +5649,9 @@ tbody tr:last-child td {
   min-width: 0;
   min-height: 0;
   grid-template-rows: 62px minmax(0, 1fr);
-  border-left: 1px solid #d8d7d2;
-  background: #f9f9f7;
-  box-shadow: -18px 0 48px rgba(43, 44, 41, 0.12);
+  border-left: 1px solid #cfd8d1;
+  background: #f7f9f5;
+  box-shadow: -18px 0 48px rgba(31, 47, 40, 0.14);
   animation: panel-in 240ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
@@ -5657,8 +5661,8 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 16px;
   padding: 0 20px;
-  border-bottom: 1px solid #e1e0dc;
-  background: #fdfdfc;
+  border-bottom: 1px solid #dbe1db;
+  background: #fbfcf9;
 }
 
 .workspace-detail-panel > header > div {
@@ -5667,7 +5671,7 @@ tbody tr:last-child td {
 }
 
 .workspace-detail-panel > header small {
-  color: #959792;
+  color: #89958d;
   font-size: 8px;
 }
 
@@ -5680,8 +5684,8 @@ tbody tr:last-child td {
   min-height: 31px;
   padding: 0 9px;
   border-radius: 7px;
-  color: #5f625e;
-  background: #efefec;
+  color: #536159;
+  background: #e9eeea;
   font-size: 10px;
   font-weight: 600;
 }
@@ -5790,7 +5794,7 @@ tbody tr:last-child td {
     grid-template-columns: minmax(0, 1fr);
     gap: 0;
     padding: 0;
-    background: #fff;
+    background: var(--workbench-canvas);
   }
 
   .workspace-stage {
@@ -5810,7 +5814,7 @@ tbody tr:last-child td {
     border-bottom: 0;
     border-left: 0;
     border-radius: 0 12px 12px 0;
-    box-shadow: 18px 0 46px rgba(40, 41, 38, 0.16);
+    box-shadow: 18px 0 46px rgba(31, 47, 40, 0.18);
     transform: translateX(-105%);
     transition: transform 220ms cubic-bezier(0.2, 0, 0, 1);
   }
