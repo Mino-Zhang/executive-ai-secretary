@@ -205,6 +205,10 @@ fi
 
 grep -q 'verify-release-bundle.sh' "${SCRIPT_DIR}/start-release.sh" \
   || die "release startup does not verify the signed release bundle"
+# This is intentionally matched as literal shell source.
+# shellcheck disable=SC2016
+grep -q 'compose "${environment}" port nginx 8080' "${SCRIPT_DIR}/smoke-test.sh" \
+  || die "smoke test does not verify Docker's effective gateway publication"
 grep -q -- '--no-build' "${SCRIPT_DIR}/start-release.sh" \
   || die "release startup could rebuild unreviewed local source"
 grep -q 'require_digest_image POSTGRES_IMAGE' "${SCRIPT_DIR}/start-release.sh" \
