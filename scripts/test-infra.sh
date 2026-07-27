@@ -70,34 +70,34 @@ seed_config="$(
   compose local-demo --profile demo-seed config
 )"
 
-printf '%s\n' "${local_config}" | grep -q 'host_ip: 127.0.0.1' \
+grep -q 'host_ip: 127.0.0.1' <<< "${local_config}" \
   || die "local-demo gateway is not loopback-only"
-printf '%s\n' "${customer_config}" | grep -q 'host_ip: 127.0.0.1' \
+grep -q 'host_ip: 127.0.0.1' <<< "${customer_config}" \
   || die "customer-template gateway is not loopback-only"
-printf '%s\n' "${customer_config}" | grep -A 30 'APP_ENV: customer-template' | grep -q 'SEED_DEMO_DATA: "false"' \
+grep -q 'SEED_DEMO_DATA: "false"' <<< "${customer_config}" \
   || die "customer-template seed invariant is missing"
-printf '%s\n' "${customer_config}" | grep -q 'source: audit_hmac_key' \
+grep -q 'source: audit_hmac_key' <<< "${customer_config}" \
   || die "backend services are missing the independent audit HMAC secret"
-printf '%s\n' "${customer_config}" | grep -q 'source: audit_hmac_key_ring' \
+grep -q 'source: audit_hmac_key_ring' <<< "${customer_config}" \
   || die "backend services are missing the versioned audit key ring"
-printf '%s\n' "${customer_config}" | grep -q 'source: file_encryption_key_ring' \
+grep -q 'source: file_encryption_key_ring' <<< "${customer_config}" \
   || die "API and Worker are missing the versioned file key ring"
-if printf '%s\n' "${customer_config}" | grep -q 'source: secret_key'; then
+if grep -q 'source: secret_key' <<< "${customer_config}"; then
   die "legacy SECRET_KEY pseudo-separation must not be present"
 fi
-[ "$(printf '%s\n' "${customer_config}" | grep -c 'export AUDIT_HMAC_KEY=')" -eq 2 ] \
+[ "$(grep -c 'export AUDIT_HMAC_KEY=' <<< "${customer_config}")" -eq 2 ] \
   || die "only api and worker should receive the audit HMAC secret during normal startup"
-[ "$(printf '%s\n' "${bootstrap_config}" | grep -c 'export AUDIT_HMAC_KEY=')" -eq 4 ] \
+[ "$(grep -c 'export AUDIT_HMAC_KEY=' <<< "${bootstrap_config}")" -eq 4 ] \
   || die "bootstrap services do not all receive the audit HMAC secret"
-[ "$(printf '%s\n' "${seed_config}" | grep -c 'export AUDIT_HMAC_KEY=')" -eq 3 ] \
+[ "$(grep -c 'export AUDIT_HMAC_KEY=' <<< "${seed_config}")" -eq 3 ] \
   || die "demo seed does not receive the audit HMAC secret"
-printf '%s\n' "${customer_config}" | grep -q 'SERVICE_ROLE: migration' \
+grep -q 'SERVICE_ROLE: migration' <<< "${customer_config}" \
   || die "migration service role is not explicit"
-printf '%s\n' "${customer_config}" | grep -q 'SERVICE_ROLE: worker' \
+grep -q 'SERVICE_ROLE: worker' <<< "${customer_config}" \
   || die "worker service role is not explicit"
-printf '%s\n' "${customer_config}" | grep -q 'source: postgres_migrator_password' \
+grep -q 'source: postgres_migrator_password' <<< "${customer_config}" \
   || die "independent migrator password is missing"
-printf '%s\n' "${customer_config}" | grep -q 'source: postgres_backup_password' \
+grep -q 'source: postgres_backup_password' <<< "${customer_config}" \
   || die "independent read-only backup password is missing"
 grep -q 'REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_events' \
   "${REPO_ROOT}/deploy/postgres/ensure-runtime-role.sh" \
@@ -105,33 +105,33 @@ grep -q 'REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_events' \
 grep -q 'REVOKE DELETE, TRUNCATE ON TABLE public.audit_chain_heads' \
   "${REPO_ROOT}/deploy/postgres/ensure-runtime-role.sh" \
   || die "runtime role can delete or truncate audit-chain heads"
-if ! sed -n '/^  api:/,/^  worker:/p' "${REPO_ROOT}/compose.yml" \
-  | grep -q 'postgres_runtime_password'; then
+if ! grep -q 'postgres_runtime_password' \
+  < <(sed -n '/^  api:/,/^  worker:/p' "${REPO_ROOT}/compose.yml"); then
   die "API does not receive its non-superuser runtime credential"
 fi
-if sed -n '/^  api:/,/^  worker:/p' "${REPO_ROOT}/compose.yml" \
-  | grep -Eq 'postgres_password|postgres_migrator_password|postgres_backup_password'; then
+if grep -Eq 'postgres_password|postgres_migrator_password|postgres_backup_password' \
+  < <(sed -n '/^  api:/,/^  worker:/p' "${REPO_ROOT}/compose.yml"); then
   die "API receives an owner, migrator or backup credential"
 fi
-if sed -n '/^  worker:/,/^  web:/p' "${REPO_ROOT}/compose.yml" \
-  | grep -Eq 'session_secret|csrf_secret|postgres_password|postgres_migrator_password|postgres_backup_password'; then
+if grep -Eq 'session_secret|csrf_secret|postgres_password|postgres_migrator_password|postgres_backup_password' \
+  < <(sed -n '/^  worker:/,/^  web:/p' "${REPO_ROOT}/compose.yml"); then
   die "worker receives an unrelated session, CSRF, owner, migrator or backup secret"
 fi
-if sed -n '/^  migrate:/,/^  db-permissions:/p' "${REPO_ROOT}/compose.yml" \
-  | grep -Eq 'session_secret|csrf_secret|file_encryption_key|audit_hmac_key|postgres_password|postgres_runtime_password|postgres_backup_password'; then
+if grep -Eq 'session_secret|csrf_secret|file_encryption_key|audit_hmac_key|postgres_password|postgres_runtime_password|postgres_backup_password' \
+  < <(sed -n '/^  migrate:/,/^  db-permissions:/p' "${REPO_ROOT}/compose.yml"); then
   die "migrator receives an unrelated application, owner, runtime or backup secret"
 fi
 for bootstrap_flag in --email --display-name --enterprise-name --enterprise-slug --password-stdin --force-password-change; do
-  printf '%s\n' "${bootstrap_config}" | grep -q -- "${bootstrap_flag}" \
+  grep -q -- "${bootstrap_flag}" <<< "${bootstrap_config}" \
     || die "bootstrap command is missing ${bootstrap_flag}"
 done
 for executive_flag in create-user --role --enterprise-wide-scope --organization-unit-code; do
-  printf '%s\n' "${executive_config}" | grep -q -- "${executive_flag}" \
+  grep -q -- "${executive_flag}" <<< "${executive_config}" \
     || die "executive bootstrap command is missing ${executive_flag}"
 done
-printf '%s\n' "${seed_config}" | grep -q -- '--enterprise-slug' \
+grep -q -- '--enterprise-slug' <<< "${seed_config}" \
   || die "demo seed does not pass an explicit enterprise slug"
-printf '%s\n' "${seed_config}" | grep -q 'DEMO_ENTERPRISE_SLUG: demo-enterprise' \
+grep -q 'DEMO_ENTERPRISE_SLUG: demo-enterprise' <<< "${seed_config}" \
   || die "demo seed enterprise slug is not injected"
 
 for application_dockerfile in \
@@ -194,8 +194,8 @@ for application_dockerfile in \
     || die "application build does not use the reviewed uv manifest: ${application_dockerfile}"
 done
 
-sed -n '/^  file-tool:/,/^  db-backup-tool:/p' "${REPO_ROOT}/compose.yml" \
-  | grep -q 'user: "999:999"' \
+grep -q 'user: "999:999"' \
+  < <(sed -n '/^  file-tool:/,/^  db-backup-tool:/p' "${REPO_ROOT}/compose.yml") \
   || die "file-tool does not share the unprivileged API/Worker uid and gid"
 
 if grep -Eiq '(password|secret|token)[[:space:]]*=[[:space:]]*[^#[:space:]]+' \
@@ -225,11 +225,11 @@ grep -q '\[ "${SOURCE_REF}" = "refs/heads/main" \]' "${REPO_ROOT}/.github/workfl
 top_level_permissions="$(
   sed -n '/^permissions:/,/^jobs:/p' "${REPO_ROOT}/.github/workflows/release-images.yml"
 )"
-printf '%s\n' "${top_level_permissions}" | grep -q '^  actions: read$' \
+grep -q '^  actions: read$' <<< "${top_level_permissions}" \
   || die "release authorization cannot inspect GitHub Environment protection"
-printf '%s\n' "${top_level_permissions}" | grep -q '^  contents: read$' \
+grep -q '^  contents: read$' <<< "${top_level_permissions}" \
   || die "release workflow does not default to contents:read"
-if printf '%s\n' "${top_level_permissions}" | grep -Eq 'packages:|id-token:'; then
+if grep -Eq 'packages:|id-token:' <<< "${top_level_permissions}"; then
   die "release workflow grants publish permissions at top level"
 fi
 authorization_job="$(
@@ -247,20 +247,20 @@ for authorization_contract in \
   '.name == "main" and .type == "branch"' \
   '.name == "production-v\*" and .type == "tag"' \
   'authorized=true'; do
-  printf '%s\n' "${authorization_job}" | grep -q -- "${authorization_contract}" \
+  grep -q -- "${authorization_contract}" <<< "${authorization_job}" \
     || die "release authorization is missing fail-closed contract: ${authorization_contract}"
 done
-if printf '%s\n' "${authorization_job}" \
-  | grep -Eq 'packages:[[:space:]]*write|id-token:[[:space:]]*write|^[[:space:]]+environment:'; then
+if grep -Eq 'packages:[[:space:]]*write|id-token:[[:space:]]*write|^[[:space:]]+environment:' \
+  <<< "${authorization_job}"; then
   die "release authorization obtains publishing capability before the protected job"
 fi
 publish_job="$(sed -n '/^  publish:/,$p' "${REPO_ROOT}/.github/workflows/release-images.yml")"
-printf '%s\n' "${publish_job}" | grep -q 'needs: \[preflight, release_authorization\]' \
+grep -q 'needs: \[preflight, release_authorization\]' <<< "${publish_job}" \
   || die "publish job does not depend directly on the fail-closed authorization gate"
-printf '%s\n' "${publish_job}" | grep -q 'needs.release_authorization.outputs.authorized' \
+grep -q 'needs.release_authorization.outputs.authorized' <<< "${publish_job}" \
   || die "publish job does not require the positive authorization output"
 for capability in 'packages: write' 'id-token: write'; do
-  printf '%s\n' "${publish_job}" | grep -q "${capability}" \
+  grep -q "${capability}" <<< "${publish_job}" \
     || die "protected publish job is missing ${capability}"
 done
 
@@ -272,13 +272,13 @@ for workflow in \
 done
 
 while IFS= read -r action_line; do
-  action_ref="$(printf '%s\n' "${action_line}" | sed -E 's/.*uses:[[:space:]]*([^[:space:]#]+).*/\1/')"
+  action_ref="$(sed -E 's/.*uses:[[:space:]]*([^[:space:]#]+).*/\1/' <<< "${action_line}")"
   case "${action_ref}" in
     ./*) continue ;;
   esac
   [[ "${action_ref}" =~ @([0-9a-f]{40})$ ]] \
     || die "GitHub Action is not pinned to a full commit SHA: ${action_ref}"
-  printf '%s\n' "${action_line}" | grep -Eq '#[[:space:]]+v?[0-9]+' \
+  grep -Eq '#[[:space:]]+v?[0-9]+' <<< "${action_line}" \
     || die "pinned GitHub Action is missing its reviewed version comment: ${action_ref}"
 done < <(grep -RhE 'uses:[[:space:]]*[^[:space:]#]+' "${REPO_ROOT}/.github/workflows")
 

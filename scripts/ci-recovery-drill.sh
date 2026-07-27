@@ -11,6 +11,7 @@ fi
 require_command docker
 require_command curl
 require_command python3
+require_command sudo
 
 runtime_dir="$(runtime_dir_for local-demo)"
 backup_root="${REPO_ROOT}/backups/local-demo"
@@ -19,12 +20,23 @@ backup_root="${REPO_ROOT}/backups/local-demo"
 
 temporary_dir="$(mktemp -d)"
 cleanup() {
+  local status="$1"
+  trap - EXIT INT TERM
+  if [ "${status}" -ne 0 ]; then
+    info "Recovery drill failed; collecting bounded service diagnostics."
+    compose local-demo ps >&2 || true
+    compose local-demo logs --no-color --tail=200 \
+      postgres db-role-init migrate db-permissions api worker web nginx >&2 || true
+  fi
   compose local-demo down --volumes --remove-orphans >/dev/null 2>&1 || true
   case "${temporary_dir}" in
     /tmp/*|/private/tmp/*) rm -rf -- "${temporary_dir}" ;;
   esac
+  exit "${status}"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup $?' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
 
 json_field() {
   local field="$1"
@@ -43,9 +55,21 @@ executive_new_password="Final-E2!$(openssl rand -hex 18)"
 # Docker Compose implements local file-backed secrets as bind mounts on Linux,
 # preserving the host UID and mode. This drill is hard-restricted above to a
 # fresh, single-tenant GitHub-hosted runner and uses only one-time random keys.
-# Make those ephemeral files container-readable but never writable; real local
-# and customer environments retain the stricter 0600 host permissions.
-find "${runtime_dir}/secrets" -type f -exec chmod 0444 {} +
+# Give only the unprivileged application identity access to the ephemeral files
+# it consumes. The 0400 mode also satisfies the application's key-ring guard;
+# real local and customer environments retain their original 0600 ownership.
+for app_secret in \
+  postgres_migrator_password \
+  postgres_runtime_password \
+  session_secret \
+  csrf_secret \
+  file_encryption_key \
+  file_encryption_key_ring \
+  audit_hmac_key \
+  audit_hmac_key_ring; do
+  sudo chown 999:999 "${runtime_dir}/secrets/${app_secret}"
+  sudo chmod 0400 "${runtime_dir}/secrets/${app_secret}"
+done
 "${SCRIPT_DIR}/start.sh" local-demo
 printf '%s\n' "${admin_password}" | "${SCRIPT_DIR}/bootstrap-admin.sh" \
   local-demo admin@ci.invalid "CI 企业管理员" "CI 演示企业" ci-enterprise
