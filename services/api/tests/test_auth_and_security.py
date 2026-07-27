@@ -136,6 +136,7 @@ def test_protected_service_roles_require_only_their_runtime_secrets() -> None:
             app_mode="production",
             service_role="worker",
             audit_hmac_key="A" * 40,
+            file_encryption_key="",
         )
 
 

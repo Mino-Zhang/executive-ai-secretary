@@ -23,8 +23,10 @@ require_digest_image() {
     *) die "${name} must be pinned by immutable sha256 digest, not a tag: ${value}" ;;
   esac
   digest="${value##*@sha256:}"
-  [ "${#digest}" -eq 64 ] && printf '%s' "${digest}" | grep -Eq '^[0-9a-f]{64}$' \
-    || die "${name} has an invalid sha256 digest"
+  if [ "${#digest}" -ne 64 ] \
+    || ! printf '%s' "${digest}" | grep -Eq '^[0-9a-f]{64}$'; then
+    die "${name} has an invalid sha256 digest"
+  fi
 }
 
 require_digest_image WEB_IMAGE "${WEB_IMAGE:-}"

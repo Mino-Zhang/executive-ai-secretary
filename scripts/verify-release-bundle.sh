@@ -11,10 +11,13 @@ signature_bundle_file="$2"
 
 require_command jq
 require_command cosign
-[ -f "${bundle_file}" ] && [ ! -L "${bundle_file}" ] && [ -s "${bundle_file}" ] \
-  || die "release bundle must be a non-empty regular file: ${bundle_file}"
-[ -f "${signature_bundle_file}" ] && [ ! -L "${signature_bundle_file}" ] && [ -s "${signature_bundle_file}" ] \
-  || die "Sigstore bundle must be a non-empty regular file: ${signature_bundle_file}"
+if [ ! -f "${bundle_file}" ] || [ -L "${bundle_file}" ] || [ ! -s "${bundle_file}" ]; then
+  die "release bundle must be a non-empty regular file: ${bundle_file}"
+fi
+if [ ! -f "${signature_bundle_file}" ] || [ -L "${signature_bundle_file}" ] \
+  || [ ! -s "${signature_bundle_file}" ]; then
+  die "Sigstore bundle must be a non-empty regular file: ${signature_bundle_file}"
+fi
 
 jq -e '
   (keys == ["database", "images", "release", "schemaVersion"]) and

@@ -11,8 +11,10 @@ email="${3:-}"
 display_name="${4:-}"
 scope="${5:-}"
 validate_environment_name "${environment}"
-[ -n "${enterprise_slug}" ] && [ -n "${email}" ] && [ -n "${display_name}" ] && [ -n "${scope}" ] \
-  || die "usage: $0 <environment> <enterprise-slug> <email> <display-name> <enterprise|unit-code[,unit-code]>"
+if [ -z "${enterprise_slug}" ] || [ -z "${email}" ] \
+  || [ -z "${display_name}" ] || [ -z "${scope}" ]; then
+  die "usage: $0 <environment> <enterprise-slug> <email> <display-name> <enterprise|unit-code[,unit-code]>"
+fi
 printf '%s' "${enterprise_slug}" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$' \
   || die "enterprise slug is invalid"
 case "${email}" in

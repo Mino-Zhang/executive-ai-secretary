@@ -11,8 +11,10 @@ display_name="${3:-}"
 enterprise_name="${4:-}"
 enterprise_slug="${5:-}"
 validate_environment_name "${environment}"
-[ -n "${email}" ] && [ -n "${display_name}" ] && [ -n "${enterprise_name}" ] && [ -n "${enterprise_slug}" ] \
-  || die "usage: $0 <environment> <email> <display-name> <enterprise-name> <enterprise-slug>"
+if [ -z "${email}" ] || [ -z "${display_name}" ] \
+  || [ -z "${enterprise_name}" ] || [ -z "${enterprise_slug}" ]; then
+  die "usage: $0 <environment> <email> <display-name> <enterprise-name> <enterprise-slug>"
+fi
 case "${email}" in
   *@*.*) ;;
   *) die "administrator email is not valid" ;;

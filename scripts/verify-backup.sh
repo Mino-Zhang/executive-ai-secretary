@@ -32,9 +32,10 @@ manifest_environment="$(manifest_value environment)"
 [ "$(manifest_value format_version)" = "1" ] || die "unsupported backup format"
 [ "$(manifest_value consistency)" = "application-quiesced" ] \
   || die "backup was not captured from a quiesced application"
-[ -n "$(manifest_value alembic_revision)" ] \
-  && [ "$(manifest_value alembic_revision)" != "unknown" ] \
-  || die "backup does not identify its Alembic revision"
+alembic_revision="$(manifest_value alembic_revision)"
+if [ -z "${alembic_revision}" ] || [ "${alembic_revision}" = "unknown" ]; then
+  die "backup does not identify its Alembic revision"
+fi
 printf '%s' "$(manifest_value enterprise_count)" | grep -Eq '^[0-9]+$' \
   || die "backup does not identify its enterprise count"
 

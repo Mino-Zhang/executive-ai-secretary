@@ -5,8 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/runtime.sh
 . "${SCRIPT_DIR}/lib/runtime.sh"
 
-[ "${CI:-}" = "true" ] && [ "${GITHUB_ACTIONS:-}" = "true" ] \
-  || die "this destructive recovery drill is restricted to a fresh GitHub Actions runner"
+if [ "${CI:-}" != "true" ] || [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+  die "this destructive recovery drill is restricted to a fresh GitHub Actions runner"
+fi
 require_command docker
 require_command curl
 require_command python3

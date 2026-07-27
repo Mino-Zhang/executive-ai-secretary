@@ -62,7 +62,7 @@ executive_config="$(
   EXECUTIVE_DISPLAY_NAME=Chairman \
   EXECUTIVE_ENTERPRISE_SLUG=customer \
   EXECUTIVE_SCOPE_MODE=enterprise \
-  EXECUTIVE_ORGANIZATION_UNIT_CODES= \
+  EXECUTIVE_ORGANIZATION_UNIT_CODES='' \
   compose customer-template --profile bootstrap config
 )"
 seed_config="$(
@@ -217,6 +217,8 @@ grep -q 'environment: production-images' "${REPO_ROOT}/.github/workflows/release
   || die "release publishing is not protected by the production-images environment"
 grep -q 'git merge-base --is-ancestor' "${REPO_ROOT}/.github/workflows/release-images.yml" \
   || die "release workflow does not bind the release commit to main ancestry"
+# The workflow contract is intentionally matched as literal GitHub shell source.
+# shellcheck disable=SC2016
 grep -q '\[ "${SOURCE_REF}" = "refs/heads/main" \]' "${REPO_ROOT}/.github/workflows/release-images.yml" \
   || die "manual release dispatch is not restricted to main"
 
@@ -411,16 +413,20 @@ fi
 restore_script="${SCRIPT_DIR}/restore.sh"
 compatibility_line="$(grep -n 'executive_ai_api.migration_compatibility' "${restore_script}" | head -n 1 | cut -d: -f1)"
 destructive_restore_line="$(grep -n 'pg_restore --username' "${restore_script}" | head -n 1 | cut -d: -f1)"
-[ -n "${compatibility_line}" ] && [ -n "${destructive_restore_line}" ] \
-  && [ "${compatibility_line}" -lt "${destructive_restore_line}" ] \
-  || die "restore does not reject incompatible migrations before destructive pg_restore"
+if [ -z "${compatibility_line}" ] || [ -z "${destructive_restore_line}" ] \
+  || [ "${compatibility_line}" -ge "${destructive_restore_line}" ]; then
+  die "restore does not reject incompatible migrations before destructive pg_restore"
+fi
 for restore_step in db-role-init migrate db-permissions restored_revision; do
   grep -q "${restore_step}" "${restore_script}" \
     || die "restore is missing required migration/permission step: ${restore_step}"
 done
 
+# These nginx variables are intentionally matched literally.
+# shellcheck disable=SC2016
 [ "$(grep -c 'proxy_set_header X-Forwarded-For \$remote_addr;' "${REPO_ROOT}/deploy/nginx/conf.d/default.conf")" -eq 3 ] \
   || die "gateway must overwrite, not append, untrusted X-Forwarded-For headers"
+# shellcheck disable=SC2016
 if grep -q '\$proxy_add_x_forwarded_for' "${REPO_ROOT}/deploy/nginx/conf.d/default.conf"; then
   die "gateway preserves caller-supplied X-Forwarded-For values"
 fi
