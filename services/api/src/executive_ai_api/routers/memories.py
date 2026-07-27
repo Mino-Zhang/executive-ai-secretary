@@ -9,12 +9,20 @@ from sqlalchemy.orm import Session
 
 from ..audit import record_audit
 from ..authz import Principal, assert_org_scope, get_executive_principal
+from ..config import Settings, get_settings
 from ..database import get_db
 from ..errors import AppError
-from ..models import Conversation, Memory, MemoryEvent
+from ..models import Conversation, Memory, MemoryEvent, new_uuid
+from ..personal_data import ensure_memory_encrypted, set_memory_content
 from ..schemas import MemoryCreate, MemoryOut, MemoryUpdate, Page
 
 router = APIRouter(prefix="/memories", tags=["memories"])
+
+
+def _memory_out(item: Memory, settings: Settings) -> MemoryOut:
+    return MemoryOut.model_validate(item).model_copy(
+        update={"content": ensure_memory_encrypted(item, settings)}
+    )
 
 
 def owned_memory(db: Session, principal: Principal, memory_id: uuid.UUID) -> Memory:
@@ -37,6 +45,7 @@ def owned_memory(db: Session, principal: Principal, memory_id: uuid.UUID) -> Mem
 def list_memories(
     principal: Annotated[Principal, Depends(get_executive_principal)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
     include_disabled: bool = False,
 ) -> Page:
     statement = select(Memory).where(
@@ -53,7 +62,8 @@ def list_memories(
             assert_org_scope(db, principal, item.organization_unit_id)
         except AppError:
             continue
-        visible.append(MemoryOut.model_validate(item))
+        visible.append(_memory_out(item, settings))
+    db.commit()
     return Page(items=visible)
 
 
@@ -63,6 +73,7 @@ def create_memory(
     request: Request,
     principal: Annotated[Principal, Depends(get_executive_principal)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> MemoryOut:
     assert_org_scope(db, principal, payload.organization_unit_id)
     if payload.source_conversation_id:
@@ -76,14 +87,16 @@ def create_memory(
         if source is None:
             raise AppError(404, "conversation_not_found", "来源会话不存在")
     item = Memory(
+        id=new_uuid(),
         enterprise_id=principal.enterprise_id,
         user_id=principal.user.id,
         organization_unit_id=payload.organization_unit_id,
         source_conversation_id=payload.source_conversation_id,
         kind=payload.kind,
         title=payload.title,
-        content=payload.content,
+        content="",
     )
+    set_memory_content(item, payload.content, settings)
     db.add(item)
     db.flush()
     db.add(
@@ -91,7 +104,7 @@ def create_memory(
             memory_id=item.id,
             actor_user_id=principal.user.id,
             event_type="created",
-            new_content=item.content,
+            new_content=None,
         )
     )
     record_audit(
@@ -102,10 +115,10 @@ def create_memory(
         session=principal.session,
         target_type="memory",
         target_id=item.id,
-        metadata={"kind": item.kind, "content_length": len(item.content)},
+        metadata={"kind": item.kind, "content_length": len(payload.content)},
     )
     db.commit()
-    return MemoryOut.model_validate(item)
+    return _memory_out(item, settings)
 
 
 @router.get("/{memory_id}", response_model=MemoryOut)
@@ -113,8 +126,12 @@ def get_memory(
     memory_id: uuid.UUID,
     principal: Annotated[Principal, Depends(get_executive_principal)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> MemoryOut:
-    return MemoryOut.model_validate(owned_memory(db, principal, memory_id))
+    item = owned_memory(db, principal, memory_id)
+    output = _memory_out(item, settings)
+    db.commit()
+    return output
 
 
 @router.patch("/{memory_id}", response_model=MemoryOut)
@@ -124,10 +141,12 @@ def update_memory(
     request: Request,
     principal: Annotated[Principal, Depends(get_executive_principal)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> MemoryOut:
     item = owned_memory(db, principal, memory_id)
     changes = payload.model_dump(exclude_unset=True)
-    previous_content = item.content if "content" in changes else None
+    if "content" in changes:
+        set_memory_content(item, changes.pop("content"), settings)
     for key, value in changes.items():
         setattr(item, key, value)
     item.version += 1
@@ -136,8 +155,8 @@ def update_memory(
             memory_id=item.id,
             actor_user_id=principal.user.id,
             event_type="updated",
-            previous_content=previous_content,
-            new_content=item.content if previous_content is not None else None,
+            previous_content=None,
+            new_content=None,
         )
     )
     record_audit(
@@ -152,7 +171,7 @@ def update_memory(
     )
     db.commit()
     db.refresh(item)
-    return MemoryOut.model_validate(item)
+    return _memory_out(item, settings)
 
 
 @router.delete("/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)

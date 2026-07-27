@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import uuid
-from calendar import monthrange
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from time import monotonic
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import httpx
 from executive_ai_api.anspire import AnspireConfigurationError, runtime_provider_config
+from executive_ai_api.authz import accessible_organization_unit_ids_for_user
 from executive_ai_api.capabilities import issue_capability_token
 from executive_ai_api.config import Settings
 from executive_ai_api.database import SessionLocal
+from executive_ai_api.harness_config import apply_glossary, match_fast_rule
 from executive_ai_api.hermes_client import HermesRuntimeError, parse_json_response, run_hermes
 from executive_ai_api.mcp_registry import MCP_TOOL_SPECS, planner_catalog
 from executive_ai_api.models import (
     Clarification,
     Conversation,
+    HarnessConfigVersion,
+    HarnessStageRun,
     Job,
     Memory,
     Message,
@@ -26,86 +30,10 @@ from executive_ai_api.models import (
     OrganizationUnit,
     User,
 )
+from executive_ai_api.personal_data import ensure_memory_encrypted
+from executive_ai_api.query_spec import normalize_query_spec
 from executive_ai_api.security import utc_now
 from sqlalchemy import or_, select
-
-TOOL_HINTS = {
-    "get_target_completion": ("目标", "完成率", "达成"),
-    "get_opportunity_funnel": ("漏斗", "阶段分布"),
-    "get_sales_forecast": ("预测", "加权", "签约", "商机"),
-    "get_customer_status": ("客户", "哪些客户"),
-    "get_delivery_status": ("项目", "交付", "里程碑", "延期"),
-    "get_finance_margin": ("毛利", "财务", "合同额"),
-    "get_collection_aging": ("回款", "逾期", "账龄", "应收"),
-    "get_organization_performance": ("事业部", "部门", "组织", "对比"),
-    "get_daily_changes": ("今日", "今天", "变化", "昨日"),
-}
-BUSINESS_HINTS = tuple(
-    dict.fromkeys(
-        hint
-        for hints in TOOL_HINTS.values()
-        for hint in hints
-    )
-) + ("经营", "收入", "现金流", "业绩", "销售")
-WIDE_SCOPE_HINTS = ("整体", "全部", "所有", "各事业部", "事业部对比", "横向对比")
-
-
-def _deterministic_tools(question: str, allowed_tools: set[str]) -> list[str]:
-    """Resolve only explicit, high-confidence intents; ambiguous wording stays model-routed."""
-
-    candidates: list[str] = []
-    if (
-        any(hint in question for hint in ("事业部", "部门", "组织"))
-        and any(hint in question for hint in ("比较", "对比", "排名", "差距", "表现"))
-    ):
-        candidates.append("get_organization_performance")
-    elif any(hint in question for hint in ("逾期", "账龄")) or (
-        "回款" in question and any(hint in question for hint in ("风险", "催收", "应收"))
-    ):
-        candidates.append("get_collection_aging")
-    elif any(hint in question for hint in ("延期项目", "交付风险", "里程碑")):
-        candidates.append("get_delivery_status")
-    elif any(hint in question for hint in ("目标完成率", "目标达成", "达成率")):
-        candidates.append("get_target_completion")
-    elif any(hint in question for hint in ("商机漏斗", "阶段分布")):
-        candidates.append("get_opportunity_funnel")
-    elif any(hint in question for hint in ("销售预测", "加权预测", "签约预测")):
-        candidates.append("get_sales_forecast")
-    elif any(hint in question for hint in ("客户排名", "重点客户", "哪些客户")):
-        candidates.append("get_customer_status")
-    elif any(hint in question for hint in ("毛利率", "毛利额", "收入与毛利")):
-        candidates.append("get_finance_margin")
-    elif any(hint in question for hint in ("今日变化", "今天变化", "昨日变化")):
-        candidates.append("get_daily_changes")
-    elif any(hint in question for hint in ("整体经营", "经营概览", "经营全貌")):
-        candidates.append("get_overall_business")
-    return [tool for tool in candidates if tool in allowed_tools]
-
-
-def _deterministic_period_arguments(
-    question: str,
-    timezone_name: str,
-    *,
-    today: date | None = None,
-) -> dict[str, str]:
-    current = today or datetime.now(ZoneInfo(timezone_name)).date()
-    if "上月" in question:
-        period_end = current.replace(day=1) - timedelta(days=1)
-        period_start = period_end.replace(day=1)
-    elif "本季度" in question:
-        quarter_month = ((current.month - 1) // 3) * 3 + 1
-        period_start = current.replace(month=quarter_month, day=1)
-        end_month = quarter_month + 2
-        period_end = current.replace(
-            month=end_month,
-            day=monthrange(current.year, end_month)[1],
-        )
-    elif "本月" in question:
-        period_start = current.replace(day=1)
-        period_end = current.replace(day=monthrange(current.year, current.month)[1])
-    else:
-        return {}
-    return {"period_start": period_start.isoformat(), "period_end": period_end.isoformat()}
 
 
 class OrchestrationPermanentError(RuntimeError):
@@ -140,24 +68,11 @@ def _organization_ids(job: Job) -> set[uuid.UUID]:
         ) from exc
 
 
-def _fallback_tool(question: str, allowed_tools: set[str]) -> str | None:
-    for tool, hints in TOOL_HINTS.items():
-        if tool in allowed_tools and any(hint in question for hint in hints):
-            return tool
-    if "get_overall_business" in allowed_tools:
-        return "get_overall_business"
-    return next(iter(sorted(allowed_tools)), None)
-
-
-def _fallback_route(question: str) -> str:
-    return "data" if any(hint in question for hint in BUSINESS_HINTS) else "general"
-
-
 def _conversation_context(
     conversation_id: uuid.UUID,
     current_message_id: uuid.UUID,
 ) -> list[dict[str, str]]:
-    with SessionLocal() as db:
+    with SessionLocal.begin() as db:
         rows = db.scalars(
             select(Message)
             .where(
@@ -198,6 +113,7 @@ def _active_memories(
     enterprise_id: uuid.UUID,
     user_id: uuid.UUID,
     organization_ids: set[uuid.UUID],
+    settings: Settings,
 ) -> tuple[bool, list[dict[str, str]]]:
     with SessionLocal() as db:
         user = db.get(User, user_id)
@@ -223,7 +139,7 @@ def _active_memories(
     remaining = 4000
     memories: list[dict[str, str]] = []
     for row in rows:
-        content = row.content[:remaining]
+        content = ensure_memory_encrypted(row, settings)[:remaining]
         if not content:
             break
         memories.append({"kind": row.kind, "title": row.title, "content": content})
@@ -250,13 +166,39 @@ def _authorized_organizations(
     return [{"id": str(row.id), "code": row.code, "name": row.name} for row in rows]
 
 
+def _outside_scope_organizations(
+    enterprise_id: uuid.UUID,
+    user_id: uuid.UUID,
+    question: str,
+    current_scope: set[uuid.UUID],
+) -> list[dict[str, str]]:
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+        if user is None:
+            return []
+        allowed = accessible_organization_unit_ids_for_user(db, user) - current_scope
+        if not allowed:
+            return []
+        rows = db.scalars(
+            select(OrganizationUnit).where(
+                OrganizationUnit.enterprise_id == enterprise_id,
+                OrganizationUnit.id.in_(allowed),
+                OrganizationUnit.is_active.is_(True),
+            )
+        ).all()
+    normalized = question.casefold()
+    return [
+        {"id": str(row.id), "code": row.code, "name": row.name}
+        for row in rows
+        if row.name in question or row.code.casefold() in normalized
+    ]
+
+
 def _execution_scope(
     question: str,
     organizations: list[dict[str, str]],
 ) -> set[uuid.UUID]:
     full_scope = {uuid.UUID(item["id"]) for item in organizations}
-    if any(hint in question for hint in WIDE_SCOPE_HINTS):
-        return full_scope
     matched = {
         uuid.UUID(item["id"])
         for item in organizations
@@ -265,29 +207,69 @@ def _execution_scope(
     return matched or full_scope
 
 
+def _record_stage(
+    job: Job,
+    message_id: uuid.UUID,
+    *,
+    stage: str,
+    status: str,
+    started_at: float,
+    response: dict[str, Any] | None = None,
+    route_source: str | None = None,
+    tool_names: list[str] | None = None,
+    summary: dict[str, Any] | None = None,
+    error_code: str | None = None,
+) -> None:
+    usage = (response or {}).get("usage", {})
+    with SessionLocal.begin() as db:
+        active = db.get(Job, job.id)
+        if active is None or active.lease_token != job.lease_token:
+            return
+        db.add(
+            HarnessStageRun(
+                enterprise_id=job.enterprise_id,
+                message_id=message_id,
+                harness_version_id=job.harness_version_id,
+                stage=stage,
+                status=status,
+                route_source=route_source,
+                model_name=(response or {}).get("model"),
+                latency_ms=max(0, round((monotonic() - started_at) * 1000)),
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                tool_names_json=tool_names or [],
+                summary_json=summary or {},
+                error_code=error_code,
+            )
+        )
+
+
 def _route(
     job: Job,
     settings: Settings,
     question: str,
     context: list[dict[str, str]],
-    memories: list[dict[str, str]],
     organizations: list[dict[str, str]],
     available_tools: list[dict[str, Any]],
     provider_config: dict[str, str],
+    harness_config: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deterministic = _deterministic_tools(
-        question,
-        {str(item["tool_name"]) for item in available_tools},
-    )
-    if deterministic:
+    rule = match_fast_rule(question, harness_config)
+    if rule:
         return (
             {
-                "route": "data",
-                "rewritten_query": question[:12000],
-                "reason": "explicit registered business intent",
+                "route": rule["route"],
+                "reason": f"matched configured rule: {rule['name']}",
                 "confidence": 0.99,
+                "route_source": "fast_rule",
+                "matched_rule_id": rule["id"],
+                "candidate_tools": [
+                    name
+                    for name in rule.get("candidate_tools", [])
+                    if name in {str(item["tool_name"]) for item in available_tools}
+                ],
             },
-            {"model": "deterministic-intent-v1", "usage": {}},
+            {"model": "configured-fast-rule-v1", "usage": {}},
         )
     response = run_hermes(
         settings,
@@ -296,28 +278,75 @@ def _route(
         payload={
             "question": question,
             "conversation_context": context,
-            "active_memories": memories,
             "authorized_organizations": organizations,
             "available_tool_names": [item["tool_name"] for item in available_tools],
+            "harness_config": harness_config,
         },
         provider_config=provider_config,
     )
     try:
         route = parse_json_response(response["text"])
     except HermesRuntimeError:
-        route = {"route": _fallback_route(question), "confidence": 0, "reason": "fallback"}
-    route_name = str(route.get("route") or _fallback_route(question))
+        route = {
+            "route": "clarification",
+            "confidence": 0,
+            "reason": "route output failed validation",
+            "clarification_question": (
+                "我还不能可靠判断这是否需要企业经营数据，请补充要分析的对象或目标。"
+            ),
+        }
+    route_name = str(route.get("route") or "clarification")
     if route_name not in {"data", "general", "clarification"}:
-        route_name = _fallback_route(question)
-    if route_name == "clarification" and len(organizations) <= 1:
-        route_name = _fallback_route(question)
+        route_name = "clarification"
     route.update(
         {
             "route": route_name,
-            "rewritten_query": str(route.get("rewritten_query") or question)[:12000],
+            "route_source": "hermes",
+            "matched_rule_id": None,
+            "scope_action": "add",
+            "candidate_tools": [],
         }
     )
     return route, response
+
+
+def _rewrite_query(
+    job: Job,
+    settings: Settings,
+    question: str,
+    context: list[dict[str, str]],
+    organizations: list[dict[str, str]],
+    execution_scope: set[uuid.UUID],
+    provider_config: dict[str, str],
+    harness_config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    glossary_question = apply_glossary(question, harness_config)
+    server_scope = {
+        "mode": str(job.scope_snapshot_json.get("scope_mode") or "selected"),
+        "organization_unit_ids": sorted(str(item) for item in execution_scope),
+    }
+    response = run_hermes(
+        settings,
+        profile="rewrite",
+        request_id=f"{job.id}:rewrite",
+        payload={
+            "question": glossary_question,
+            "conversation_context": context,
+            "authorized_organizations": organizations,
+            "organization_scope": server_scope,
+            "harness_config": harness_config,
+        },
+        provider_config=provider_config,
+    )
+    parsed = parse_json_response(response["text"])
+    return (
+        normalize_query_spec(
+            parsed,
+            question=glossary_question,
+            organization_scope=server_scope,
+        ),
+        response,
+    )
 
 
 def _save_route(
@@ -325,6 +354,8 @@ def _save_route(
     conversation_id: uuid.UUID,
     route: dict[str, Any],
     hermes_response: dict[str, Any],
+    query_spec: dict[str, Any],
+    harness_version_id: uuid.UUID | None,
 ) -> None:
     with SessionLocal.begin() as db:
         existing = db.scalar(select(MessageRoute).where(MessageRoute.message_id == message_id))
@@ -339,6 +370,10 @@ def _save_route(
                 route=route["route"],
                 profile="route",
                 rewritten_query=route["rewritten_query"],
+                query_spec_json=query_spec,
+                harness_version_id=harness_version_id,
+                route_source=str(route.get("route_source") or "hermes"),
+                matched_rule_id=route.get("matched_rule_id"),
                 scope_status=scope_status,
                 rationale=str(route.get("reason") or "")[:4000],
                 confidence=max(0.0, min(float(route.get("confidence") or 0), 1.0)),
@@ -349,6 +384,10 @@ def _save_route(
         else:
             existing.route = route["route"]
             existing.rewritten_query = route["rewritten_query"]
+            existing.query_spec_json = query_spec
+            existing.harness_version_id = harness_version_id
+            existing.route_source = str(route.get("route_source") or "hermes")
+            existing.matched_rule_id = route.get("matched_rule_id")
             existing.scope_status = scope_status
             existing.rationale = str(route.get("reason") or "")[:4000]
             existing.confidence = max(0.0, min(float(route.get("confidence") or 0), 1.0))
@@ -370,7 +409,12 @@ def _create_scope_clarification(
         route.get("clarification_question") or "请确认这次需要查询哪个事业部。"
     )[:2000]
     options = [
-        {"label": item["name"], "value": item["id"], "code": item["code"]}
+        {
+            "label": item["name"],
+            "value": item["id"],
+            "code": item["code"],
+            "action": route.get("scope_action", "select"),
+        }
         for item in organizations[:20]
     ]
     with SessionLocal.begin() as db:
@@ -477,19 +521,6 @@ def _normalize_calls(
                     "timeout_seconds": int(by_name[tool_name]["timeout_seconds"]),
                 }
             )
-    if not calls:
-        fallback = _fallback_tool(question, set(by_name))
-        if fallback:
-            calls.append(
-                {
-                    "tool": fallback,
-                    "arguments": {
-                        "organization_unit_ids": sorted(str(value) for value in organization_ids)
-                    },
-                    "reason": "deterministic fallback",
-                    "timeout_seconds": int(by_name[fallback]["timeout_seconds"]),
-                }
-            )
     return calls
 
 
@@ -497,47 +528,25 @@ def _plan(
     job: Job,
     settings: Settings,
     question: str,
-    rewritten_query: str,
+    query_spec: dict[str, Any],
     context: list[dict[str, str]],
     available_tools: list[dict[str, Any]],
     organization_ids: set[uuid.UUID],
     provider_config: dict[str, str],
+    harness_config: dict[str, Any],
+    candidate_tools: list[str] | None = None,
+    repair_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deterministic = _deterministic_tools(
-        rewritten_query,
-        {str(item["tool_name"]) for item in available_tools},
-    )
-    if deterministic:
-        period_arguments = _deterministic_period_arguments(
-            rewritten_query,
-            settings.sync_timezone,
-        )
-        period_arguments["limit"] = 12
-        calls = _normalize_calls(
-            [
-                {
-                    "tool": tool,
-                    "arguments": period_arguments,
-                    "reason": "explicit registered business intent",
-                }
-                for tool in deterministic
-            ],
-            rewritten_query,
-            available_tools,
-            organization_ids,
-        )
-        return (
-            {"analysis_mode": "deterministic", "calls": calls},
-            {"model": "deterministic-planner-v1", "usage": {}},
-        )
     response = run_hermes(
         settings,
         profile="plan",
         request_id=f"{job.id}:plan",
         payload={
             "question": question,
-            "rewritten_query": rewritten_query,
+            "query_spec": query_spec,
             "conversation_context": context,
+            "candidate_tools": candidate_tools or [],
+            "repair_context": repair_context,
             "available_tools": [
                 {
                     "tool_name": item["tool_name"],
@@ -546,6 +555,7 @@ def _plan(
                 }
                 for item in available_tools
             ],
+            "harness_config": harness_config,
         },
         provider_config=provider_config,
     )
@@ -555,7 +565,7 @@ def _plan(
         parsed = {}
     calls = _normalize_calls(
         parsed.get("calls"),
-        rewritten_query,
+        str(query_spec.get("normalized_question") or question),
         available_tools,
         organization_ids,
     )
@@ -582,6 +592,71 @@ def _call_tool(
     if response.status_code >= 400:
         raise RuntimeError(f"MCP Hub rejected the query: {response.text[:1000]}")
     return response.json()
+
+
+def _execute_calls(
+    *,
+    job: Job,
+    message_id: uuid.UUID,
+    settings: Settings,
+    calls: list[dict[str, Any]],
+    organization_ids: set[uuid.UUID],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    if not calls:
+        return [], []
+    token = issue_capability_token(
+        settings=settings,
+        enterprise_id=job.enterprise_id,
+        user_id=job.created_by_user_id,
+        organization_unit_ids=organization_ids,
+        tools={item["tool"] for item in calls},
+        message_id=message_id,
+    )
+    indexed_results: list[tuple[int, dict[str, Any]]] = []
+    indexed_errors: list[tuple[int, dict[str, str]]] = []
+    with ThreadPoolExecutor(max_workers=min(3, len(calls))) as pool:
+        futures = {
+            pool.submit(
+                _call_tool,
+                settings=settings,
+                token=token,
+                tool=call["tool"],
+                arguments=call["arguments"],
+                timeout_seconds=call["timeout_seconds"],
+            ): (index, call)
+            for index, call in enumerate(calls)
+        }
+        for future in as_completed(futures):
+            index, call = futures[future]
+            try:
+                result = future.result()
+                indexed_results.append(
+                    (
+                        index,
+                        {
+                            "tool": call["tool"],
+                            "arguments": call["arguments"],
+                            "reason": call["reason"],
+                            "result": result,
+                        },
+                    )
+                )
+            except RuntimeError as exc:
+                indexed_errors.append(
+                    (index, {"tool": call["tool"], "error": str(exc)[:1000]})
+                )
+    return (
+        [item for _, item in sorted(indexed_results)],
+        [item for _, item in sorted(indexed_errors)],
+    )
+
+
+def _valid_evidence_count(tool_results: list[dict[str, Any]]) -> int:
+    return sum(
+        len(item["result"].get("freshness", []))
+        for item in tool_results
+        if isinstance(item.get("result"), dict)
+    )
 
 
 def _save_answer_with_evidence(
@@ -690,6 +765,16 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
                 ModelProviderConfig.enterprise_id == job.enterprise_id
             )
         )
+        harness_version = (
+            db.get(HarnessConfigVersion, job.harness_version_id)
+            if job.harness_version_id
+            else db.scalar(
+                select(HarnessConfigVersion).where(
+                    HarnessConfigVersion.enterprise_id == job.enterprise_id,
+                    HarnessConfigVersion.is_active.is_(True),
+                )
+            )
+        )
         if (
             conversation is None
             or message is None
@@ -712,32 +797,111 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
                 exc.code, str(exc), "Anspire 模型尚未配置或启用"
             ) from exc
         available_tools = planner_catalog(db, job.enterprise_id)
+        if harness_version is None:
+            raise OrchestrationPermanentError(
+                "harness_config_missing",
+                "任务没有可用的编排策略快照",
+                "编排策略尚未初始化",
+            )
+        harness_config = harness_version.config_json
 
     context = _conversation_context(conversation_id, message_id)
     memory_enabled, memories = _active_memories(
         job.enterprise_id,
         job.created_by_user_id,
         authorized_scope,
+        settings,
     )
     organizations = _authorized_organizations(job.enterprise_id, authorized_scope)
     execution_scope = _execution_scope(question, organizations)
+    outside_scope = _outside_scope_organizations(
+        job.enterprise_id,
+        job.created_by_user_id,
+        question,
+        authorized_scope,
+    )
+    if outside_scope:
+        route = {
+            "route": "clarification",
+            "rewritten_query": question,
+            "reason": "question references an authorized unit outside the message scope",
+            "confidence": 1.0,
+            "route_source": "validation",
+            "matched_rule_id": None,
+            "clarification_question": (
+                f"当前查询范围未包含{outside_scope[0]['name']}。"
+                "请在事业部选择中加入该事业部后继续。"
+            ),
+        }
+        response = {"model": "scope-validator-v1", "usage": {}}
+        _save_route(
+            message_id,
+            conversation_id,
+            route,
+            response,
+            {},
+            harness_version.id,
+        )
+        _record_stage(
+            job,
+            message_id,
+            stage="scope_validation",
+            status="clarification",
+            started_at=monotonic(),
+            response=response,
+            route_source="validation",
+            summary={"outside_scope_reference": True},
+        )
+        return _create_scope_clarification(
+            job_id=job.id,
+            lease_token=job.lease_token or "",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            assistant_message_id=assistant_message_id,
+            route=route,
+            organizations=outside_scope,
+        )
+    route_started = monotonic()
     try:
         route, route_response = _route(
             job,
             settings,
             question,
             context,
-            memories,
             organizations,
             available_tools,
             provider_config,
+            harness_config,
         )
     except HermesRuntimeError as exc:
         if exc.permanent:
             raise OrchestrationPermanentError(exc.code, str(exc), "无法连接已配置模型") from exc
         raise
-    _save_route(message_id, conversation_id, route, route_response)
+    _record_stage(
+        job,
+        message_id,
+        stage="intent_route",
+        status="completed",
+        started_at=route_started,
+        response=route_response,
+        route_source=route.get("route_source"),
+        summary={
+            "route": route["route"],
+            "matched_rule_id": route.get("matched_rule_id"),
+            "organization_unit_count": len(execution_scope),
+        },
+    )
+    query_spec: dict[str, Any] = {}
     if route["route"] == "clarification":
+        route["rewritten_query"] = question
+        _save_route(
+            message_id,
+            conversation_id,
+            route,
+            route_response,
+            query_spec,
+            harness_version.id,
+        )
         return _create_scope_clarification(
             job_id=job.id,
             lease_token=job.lease_token or "",
@@ -760,58 +924,181 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
             raise OrchestrationPermanentError(
                 "no_mcp_tools_available", "没有可用于规划的 MCP 工具", "经营查询工具暂不可用"
             )
-        plan, _ = _plan(
+        rewrite_started = monotonic()
+        try:
+            query_spec, rewrite_response = _rewrite_query(
+                job,
+                settings,
+                question,
+                context,
+                organizations,
+                execution_scope,
+                provider_config,
+                harness_config,
+            )
+        except HermesRuntimeError as exc:
+            raise OrchestrationPermanentError(
+                exc.code,
+                str(exc),
+                "我还不能可靠理解这次经营问题，请补充指标、时间或对象",
+            ) from exc
+        route["rewritten_query"] = query_spec["normalized_question"]
+        _record_stage(
+            job,
+            message_id,
+            stage="query_rewrite",
+            status="completed",
+            started_at=rewrite_started,
+            response=rewrite_response,
+            summary={
+                "metric_count": len(query_spec["metrics"]),
+                "entity_type_count": len(query_spec["entities"]),
+                "ambiguity_count": len(query_spec["unresolved_ambiguities"]),
+                "organization_unit_count": len(execution_scope),
+            },
+        )
+        _save_route(
+            message_id,
+            conversation_id,
+            route,
+            route_response,
+            query_spec,
+            harness_version.id,
+        )
+        plan_started = monotonic()
+        plan, plan_response = _plan(
             job,
             settings,
             question,
-            route["rewritten_query"],
+            query_spec,
             context,
             available_tools,
             execution_scope,
             provider_config,
+            harness_config,
+            candidate_tools=route.get("candidate_tools"),
         )
-        tool_names = {item["tool"] for item in plan["calls"]}
-        token = issue_capability_token(
-            settings=settings,
-            enterprise_id=job.enterprise_id,
-            user_id=job.created_by_user_id,
-            organization_unit_ids=execution_scope,
-            tools=tool_names,
+        _record_stage(
+            job,
+            message_id,
+            stage="task_plan",
+            status="completed" if plan["calls"] else "failed",
+            started_at=plan_started,
+            response=plan_response,
+            tool_names=[item["tool"] for item in plan["calls"]],
+            summary={
+                "call_count": len(plan["calls"]),
+                "organization_unit_count": len(execution_scope),
+            },
+            error_code=None if plan["calls"] else "no_valid_tool_plan",
+        )
+        if not plan["calls"]:
+            raise OrchestrationPermanentError(
+                "no_valid_tool_plan",
+                "Hermes 没有生成有效的 MCP 计划",
+                "当前启用的经营工具无法完成这次查询",
+            )
+        execution_started = monotonic()
+        tool_results, tool_errors = _execute_calls(
+            job=job,
             message_id=message_id,
+            settings=settings,
+            calls=plan["calls"],
+            organization_ids=execution_scope,
         )
-        for call in plan["calls"]:
-            try:
-                result = _call_tool(
+        repair_used = False
+        if tool_errors or _valid_evidence_count(tool_results) == 0:
+            repair_started = monotonic()
+            succeeded_tools = {item["tool"] for item in tool_results}
+            repair_plan, repair_response = _plan(
+                job,
+                settings,
+                question,
+                query_spec,
+                context,
+                available_tools,
+                execution_scope,
+                provider_config,
+                harness_config,
+                candidate_tools=route.get("candidate_tools"),
+                repair_context={
+                    "successful_tools": sorted(succeeded_tools),
+                    "failed_tools": tool_errors,
+                    "instruction": "只补足仍缺少的证据，不要重复已成功工具。",
+                },
+            )
+            repair_calls = [
+                item for item in repair_plan["calls"] if item["tool"] not in succeeded_tools
+            ][:4]
+            if repair_calls:
+                repair_results, repair_errors = _execute_calls(
+                    job=job,
+                    message_id=message_id,
                     settings=settings,
-                    token=token,
-                    tool=call["tool"],
-                    arguments=call["arguments"],
-                    timeout_seconds=call["timeout_seconds"],
+                    calls=repair_calls,
+                    organization_ids=execution_scope,
                 )
-                tool_results.append(
-                    {
-                        "tool": call["tool"],
-                        "arguments": call["arguments"],
-                        "reason": call["reason"],
-                        "result": result,
-                    }
-                )
-            except RuntimeError as exc:
-                tool_errors.append({"tool": call["tool"], "error": str(exc)[:1000]})
-        if not tool_results:
-            raise RuntimeError("all planned MCP tool calls failed")
+                tool_results.extend(repair_results)
+                tool_errors.extend(repair_errors)
+                repair_used = True
+            _record_stage(
+                job,
+                message_id,
+                stage="repair_plan",
+                status="completed" if repair_calls else "skipped",
+                started_at=repair_started,
+                response=repair_response,
+                tool_names=[item["tool"] for item in repair_calls],
+                summary={"repair_call_count": len(repair_calls)},
+            )
+        evidence_count_before_answer = _valid_evidence_count(tool_results)
+        _record_stage(
+            job,
+            message_id,
+            stage="mcp_execution",
+            status="completed" if evidence_count_before_answer else "failed",
+            started_at=execution_started,
+            tool_names=[item["tool"] for item in tool_results],
+            summary={
+                "success_count": len(tool_results),
+                "failure_count": len(tool_errors),
+                "evidence_count": evidence_count_before_answer,
+                "repair_used": repair_used,
+                "organization_unit_count": len(execution_scope),
+            },
+            error_code=None if evidence_count_before_answer else "insufficient_evidence",
+        )
+        if not tool_results or evidence_count_before_answer == 0:
+            raise OrchestrationPermanentError(
+                "insufficient_evidence",
+                "MCP 工具未返回可验证证据",
+                "本次查询没有取得足够的经营数据证据，因此没有生成推测性回答",
+            )
+    else:
+        route["rewritten_query"] = question
+        _save_route(
+            message_id,
+            conversation_id,
+            route,
+            route_response,
+            query_spec,
+            harness_version.id,
+        )
 
     profile = "data" if route["route"] == "data" else "general"
     answer_payload = {
         "question": question,
         "rewritten_query": route["rewritten_query"],
+        "query_spec": query_spec,
         "conversation_context": context,
         "memory_enabled": memory_enabled,
         "active_memories": memories,
         "authorized_results": tool_results,
         "tool_errors": tool_errors,
         "execution_plan": plan,
+        "harness_config": harness_config,
     }
+    answer_started = monotonic()
     try:
         answer_response = run_hermes(
             settings,
@@ -824,6 +1111,20 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
         if exc.permanent:
             raise OrchestrationPermanentError(exc.code, str(exc), "无法连接已配置模型") from exc
         raise
+    _record_stage(
+        job,
+        message_id,
+        stage="answer",
+        status="completed",
+        started_at=answer_started,
+        response=answer_response,
+        tool_names=[item["tool"] for item in tool_results],
+        summary={
+            "route": route["route"],
+            "evidence_count": _valid_evidence_count(tool_results),
+            "organization_unit_count": len(execution_scope),
+        },
+    )
 
     freshness = [
         row
@@ -842,6 +1143,9 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
         }
     content_json = {
         "route": route["route"],
+        "route_source": route.get("route_source"),
+        "query_spec": query_spec,
+        "harness_version": harness_version.version,
         "tools": [item["tool"] for item in tool_results],
         "execution_plan": plan,
         "structured_data": structured_data,

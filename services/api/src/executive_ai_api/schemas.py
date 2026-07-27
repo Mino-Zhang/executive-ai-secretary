@@ -4,7 +4,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 class ORMModel(BaseModel):
@@ -99,6 +99,77 @@ class McpToolValidationOut(BaseModel):
     issues: list[str]
 
 
+class HarnessConfigOut(BaseModel):
+    id: uuid.UUID
+    version: int
+    schema_version: str
+    config_hash: str
+    config: dict[str, Any]
+    safety_kernel: dict[str, Any]
+    activated_at: datetime
+    updated_at: datetime
+
+
+class HarnessConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_version: int = Field(ge=1)
+    config: dict[str, Any]
+
+
+class HarnessVersionOut(BaseModel):
+    id: uuid.UUID
+    version: int
+    config_hash: str
+    is_active: bool
+    source_version_id: uuid.UUID | None
+    created_by_user_id: uuid.UUID | None
+    activated_at: datetime
+    created_at: datetime
+
+
+class HarnessSimulationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=12000)
+    config: dict[str, Any] | None = None
+    organization_scope: dict[str, Any] | None = None
+
+
+class HarnessSimulationOut(BaseModel):
+    route: Literal["data", "general", "clarification"]
+    route_source: Literal["fast_rule", "hermes", "validation"]
+    matched_rule_id: str | None
+    candidate_tools: list[str]
+    query_spec: dict[str, Any]
+    validation_issues: list[str]
+    config_hash: str
+
+
+class HarnessMetricsOut(BaseModel):
+    window_days: int
+    message_count: int
+    intent_accuracy_sample_size: int
+    structured_output_rate: float
+    tool_success_rate: float
+    route_counts: dict[str, int]
+    stage_latency_p95_ms: dict[str, int]
+
+
+class HarnessTraceOut(BaseModel):
+    message_id: uuid.UUID
+    conversation_id: uuid.UUID | None = None
+    route: str | None
+    route_source: str | None
+    query_spec_summary: dict[str, Any]
+    harness_version: int | None
+    organization_unit_count: int
+    tools: list[str]
+    stages: list[dict[str, Any]]
+    diagnostic_shared_until: datetime | None = None
+    shared_content: dict[str, Any] | None = None
+
+
 class UserOut(ORMModel):
     id: uuid.UUID
     email: str
@@ -115,6 +186,26 @@ class UserPreferenceUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     memory_enabled: bool
+
+
+class ExecutivePersonalProfileOut(BaseModel):
+    salutation: str
+    amount_unit: Literal["yuan", "wan", "yi"]
+    response_style: Literal["concise", "balanced", "detailed"]
+    locale: Literal["zh-CN", "zh-TW", "en-US"]
+    memory_enabled: bool
+    version: int
+    updated_at: datetime | None
+
+
+class ExecutivePersonalProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    salutation: str = Field(min_length=1, max_length=40)
+    amount_unit: Literal["yuan", "wan", "yi"] = "wan"
+    response_style: Literal["concise", "balanced", "detailed"] = "balanced"
+    locale: Literal["zh-CN", "zh-TW", "en-US"] = "zh-CN"
+    memory_enabled: bool = True
 
 
 class EnterpriseOut(ORMModel):
@@ -221,22 +312,69 @@ class ProjectOut(ORMModel):
     updated_at: datetime
 
 
+class OrganizationScopeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["all_authorized", "selected"]
+    organization_unit_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_scope(self):
+        unique_ids = list(dict.fromkeys(self.organization_unit_ids))
+        if len(unique_ids) != len(self.organization_unit_ids):
+            raise ValueError("organization_unit_ids must be unique")
+        if self.mode == "all_authorized" and self.organization_unit_ids:
+            raise ValueError("all_authorized must not include explicit organization units")
+        if self.mode == "selected" and not self.organization_unit_ids:
+            raise ValueError("selected scope requires at least one organization unit")
+        return self
+
+
+class OrganizationScopeOut(OrganizationScopeInput):
+    resolved_organization_unit_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
 class ConversationCreate(BaseModel):
     title: str = Field(default="新会话", min_length=1, max_length=300)
     organization_unit_id: uuid.UUID | None = None
+    organization_scope: OrganizationScopeInput | None = None
     project_id: uuid.UUID | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_mixed_scope_fields(cls, value):
+        if (
+            isinstance(value, dict)
+            and "organization_scope" in value
+            and "organization_unit_id" in value
+        ):
+            raise ValueError("organization_scope and organization_unit_id cannot be used together")
+        return value
 
 
 class ConversationUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=300)
     organization_unit_id: uuid.UUID | None = None
+    organization_scope: OrganizationScopeInput | None = None
     status: Literal["active", "archived"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_mixed_scope_fields(cls, value):
+        if (
+            isinstance(value, dict)
+            and "organization_scope" in value
+            and "organization_unit_id" in value
+        ):
+            raise ValueError("organization_scope and organization_unit_id cannot be used together")
+        return value
 
 
 class ConversationOut(ORMModel):
     id: uuid.UUID
     title: str
     organization_unit_id: uuid.UUID | None
+    organization_scope: OrganizationScopeOut
     status: str
     pinned_at: datetime | None
     archived_at: datetime | None
@@ -248,6 +386,7 @@ class ConversationOut(ORMModel):
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
     file_ids: list[uuid.UUID] = Field(default_factory=list, max_length=20)
+    organization_scope: OrganizationScopeInput | None = None
 
 
 class MessageOut(ORMModel):
@@ -555,3 +694,9 @@ class MessageEvidenceOut(ORMModel):
     query_json: dict[str, Any]
     row_references_json: list[dict[str, Any]]
     created_at: datetime
+
+
+class DiagnosticShareOut(BaseModel):
+    message_id: uuid.UUID
+    expires_at: datetime
+    revoked_at: datetime | None

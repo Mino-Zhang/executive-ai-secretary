@@ -194,12 +194,34 @@ class Conversation(UUIDMixin, TimestampMixin, Base):
     organization_unit_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("organization_units.id", ondelete="SET NULL")
     )
+    scope_mode: Mapped[str] = mapped_column(
+        String(32), default="all_authorized", nullable=False
+    )
     title: Mapped[str] = mapped_column(String(300), nullable=False, default="新会话")
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+
+
+class ConversationOrganizationScope(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "conversation_organization_scopes"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "organization_unit_id",
+            name="uq_conversation_organization_scope",
+        ),
+        Index("ix_conversation_scope_conversation", "conversation_id"),
+    )
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    organization_unit_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="CASCADE"), nullable=False
+    )
 
 
 class ProjectConversation(UUIDMixin, TimestampMixin, Base):
@@ -375,6 +397,9 @@ class Memory(UUIDMixin, TimestampMixin, Base):
     kind: Mapped[str] = mapped_column(String(50), default="preference", nullable=False)
     title: Mapped[str] = mapped_column(String(240), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_ciphertext: Mapped[str | None] = mapped_column(Text)
+    content_nonce: Mapped[str | None] = mapped_column(String(64))
+    encryption_key_version: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(30), default="active", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -451,6 +476,9 @@ class Job(UUIDMixin, TimestampMixin, Base):
     )
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
+    )
+    harness_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("harness_config_versions.id", ondelete="SET NULL"), index=True
     )
     job_type: Mapped[str] = mapped_column(String(80), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
@@ -577,6 +605,48 @@ class McpToolConfig(UUIDMixin, TimestampMixin, Base):
     updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
     )
+
+
+class HarnessConfigVersion(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "harness_config_versions"
+    __table_args__ = (
+        UniqueConstraint("enterprise_id", "version", name="uq_harness_enterprise_version"),
+        Index("ix_harness_enterprise_active", "enterprise_id", "is_active"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), default="3.0", nullable=False)
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    source_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("harness_config_versions.id", ondelete="SET NULL")
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    activated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ExecutivePersonalProfile(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "executive_personal_profiles"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_executive_personal_profile_user"),)
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    profile_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    encryption_key_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
 
 class DataSource(UUIDMixin, TimestampMixin, Base):
@@ -1010,10 +1080,67 @@ class MessageRoute(UUIDMixin, TimestampMixin, Base):
     profile: Mapped[str] = mapped_column(String(80), nullable=False)
     confidence: Mapped[float] = mapped_column(Numeric(6, 5), nullable=False)
     rewritten_query: Mapped[str] = mapped_column(Text, nullable=False)
+    query_spec_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    harness_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("harness_config_versions.id", ondelete="SET NULL"), index=True
+    )
+    route_source: Mapped[str] = mapped_column(String(40), default="hermes", nullable=False)
+    matched_rule_id: Mapped[str | None] = mapped_column(String(100))
     scope_status: Mapped[str] = mapped_column(String(40), nullable=False)
     rationale: Mapped[str | None] = mapped_column(Text)
     model_name: Mapped[str | None] = mapped_column(String(160))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class HarnessStageRun(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "harness_stage_runs"
+    __table_args__ = (
+        Index("ix_harness_stage_message_created", "message_id", "created_at"),
+        Index("ix_harness_stage_enterprise_created", "enterprise_id", "created_at"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    harness_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("harness_config_versions.id", ondelete="SET NULL"), index=True
+    )
+    stage: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    route_source: Mapped[str | None] = mapped_column(String(40))
+    model_name: Mapped[str | None] = mapped_column(String(160))
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    tool_names_json: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+    summary_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+
+
+class HarnessDiagnosticGrant(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "harness_diagnostic_grants"
+    __table_args__ = (
+        UniqueConstraint("message_id", name="uq_harness_diagnostic_message"),
+        Index("ix_harness_diagnostic_expiry", "expires_at", "revoked_at"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    granted_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Clarification(UUIDMixin, TimestampMixin, Base):

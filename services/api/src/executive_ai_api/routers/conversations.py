@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Request, status
@@ -11,20 +12,26 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..audit import record_audit
-from ..authz import (
-    Principal,
-    assert_org_scope,
-    build_assistant_scope_snapshot,
-    build_scope_snapshot,
-    get_executive_principal,
-)
+from ..authz import Principal, assert_org_scope, get_executive_principal
 from ..config import get_settings
+from ..conversation_scope import (
+    legacy_scope,
+    normalize_scope,
+    persisted_scope,
+    scope_changed,
+    scope_out,
+    scope_snapshot,
+    set_conversation_scope,
+)
 from ..database import SessionLocal, get_db
 from ..errors import AppError
+from ..harness_config import active_harness_config
 from ..idempotency import replay, save_response
 from ..models import (
     Clarification,
     Conversation,
+    HarnessConfigVersion,
+    HarnessDiagnosticGrant,
     Job,
     Message,
     MessageEvidence,
@@ -38,14 +45,35 @@ from ..schemas import (
     ConversationCreate,
     ConversationOut,
     ConversationUpdate,
+    DiagnosticShareOut,
     MessageCreate,
     MessageEvidenceOut,
     MessageOut,
+    OrganizationScopeInput,
     Page,
 )
 from ..security import utc_now
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+
+def conversation_out(
+    db: Session,
+    principal: Principal,
+    item: Conversation,
+) -> ConversationOut:
+    return ConversationOut(
+        id=item.id,
+        title=item.title,
+        organization_unit_id=item.organization_unit_id,
+        organization_scope=scope_out(db, principal, item),
+        status=item.status,
+        pinned_at=item.pinned_at,
+        archived_at=item.archived_at,
+        last_message_at=item.last_message_at,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
 
 
 def owned_conversation(
@@ -66,8 +94,7 @@ def owned_conversation(
     item = db.scalar(statement)
     if item is None:
         raise AppError(404, "conversation_not_found", "会话不存在")
-    if item.organization_unit_id is not None:
-        assert_org_scope(db, principal, item.organization_unit_id)
+    normalize_scope(db, principal, persisted_scope(db, item))
     return item
 
 
@@ -99,10 +126,10 @@ def list_conversations(
     visible = []
     for item in rows[:limit]:
         try:
-            assert_org_scope(db, principal, item.organization_unit_id)
+            normalize_scope(db, principal, persisted_scope(db, item))
         except AppError:
             continue
-        visible.append(ConversationOut.model_validate(item))
+        visible.append(conversation_out(db, principal, item))
     return Page(items=visible, next_cursor=next_cursor)
 
 
@@ -116,8 +143,6 @@ def create_conversation(
     previous = replay(db, request, principal, payload)
     if previous:
         return ORJSONResponse(status_code=previous[0], content=previous[1])
-    if payload.organization_unit_id is not None:
-        assert_org_scope(db, principal, payload.organization_unit_id)
     project = None
     if payload.project_id:
         project = db.scalar(
@@ -131,17 +156,30 @@ def create_conversation(
         if project is None:
             raise AppError(404, "project_not_found", "项目不存在")
         assert_org_scope(db, principal, project.organization_unit_id)
+    requested_scope = payload.organization_scope
+    if requested_scope is None:
+        if "organization_unit_id" in payload.model_fields_set:
+            requested_scope = legacy_scope(payload.organization_unit_id)
+        elif project and project.organization_unit_id:
+            requested_scope = legacy_scope(project.organization_unit_id)
+        else:
+            requested_scope = OrganizationScopeInput(
+                mode="all_authorized", organization_unit_ids=[]
+            )
+    normalized_scope, _ = normalize_scope(db, principal, requested_scope)
     item = Conversation(
         enterprise_id=principal.enterprise_id,
         owner_user_id=principal.user.id,
-        organization_unit_id=payload.organization_unit_id,
+        organization_unit_id=None,
+        scope_mode=normalized_scope.mode,
         title=payload.title,
     )
     db.add(item)
     db.flush()
+    set_conversation_scope(db, item, normalized_scope)
     if project:
         db.add(ProjectConversation(project_id=project.id, conversation_id=item.id))
-    output = ConversationOut.model_validate(item)
+    output = conversation_out(db, principal, item)
     record_audit(
         db,
         request,
@@ -163,7 +201,7 @@ def get_conversation(
     principal: Annotated[Principal, Depends(get_executive_principal)],
     db: Annotated[Session, Depends(get_db)],
 ) -> ConversationOut:
-    return ConversationOut.model_validate(owned_conversation(db, principal, conversation_id))
+    return conversation_out(db, principal, owned_conversation(db, principal, conversation_id))
 
 
 @router.patch("/{conversation_id}", response_model=ConversationOut)
@@ -176,8 +214,14 @@ def update_conversation(
 ) -> ConversationOut:
     item = owned_conversation(db, principal, conversation_id)
     changes = payload.model_dump(exclude_unset=True)
+    requested_scope = changes.pop("organization_scope", None)
     if "organization_unit_id" in changes:
-        assert_org_scope(db, principal, changes["organization_unit_id"])
+        requested_scope = legacy_scope(changes.pop("organization_unit_id"))
+    if requested_scope is not None:
+        if isinstance(requested_scope, dict):
+            requested_scope = OrganizationScopeInput.model_validate(requested_scope)
+        normalized_scope, _ = normalize_scope(db, principal, requested_scope)
+        set_conversation_scope(db, item, normalized_scope)
     for key, value in changes.items():
         setattr(item, key, value)
     if changes.get("status") == "archived":
@@ -192,11 +236,14 @@ def update_conversation(
         session=principal.session,
         target_type="conversation",
         target_id=item.id,
-        metadata={"fields": sorted(changes)},
+        metadata={
+            "fields": sorted(changes),
+            "scope_updated": requested_scope is not None,
+        },
     )
     db.commit()
     db.refresh(item)
-    return ConversationOut.model_validate(item)
+    return conversation_out(db, principal, item)
 
 
 @router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -241,7 +288,7 @@ def pin_conversation(
     )
     db.commit()
     db.refresh(item)
-    return ConversationOut.model_validate(item)
+    return conversation_out(db, principal, item)
 
 
 @router.delete("/{conversation_id}/pin", response_model=ConversationOut)
@@ -264,7 +311,7 @@ def unpin_conversation(
     )
     db.commit()
     db.refresh(item)
-    return ConversationOut.model_validate(item)
+    return conversation_out(db, principal, item)
 
 
 @router.get("/{conversation_id}/messages", response_model=Page)
@@ -428,6 +475,21 @@ def resolve_clarification(
     clarification.resolved_at = utc_now()
     original_message = db.get(Message, clarification.message_id)
     original_question = original_message.content if original_message else ""
+    current_scope = persisted_scope(db, conversation)
+    if option.get("action") == "add" and current_scope.mode == "selected":
+        requested_scope = OrganizationScopeInput(
+            mode="selected",
+            organization_unit_ids=list(
+                dict.fromkeys(
+                    [*current_scope.organization_unit_ids, selected_organization_id]
+                )
+            ),
+        )
+    else:
+        requested_scope = OrganizationScopeInput(
+            mode="selected", organization_unit_ids=[selected_organization_id]
+        )
+    normalized_scope, resolved_scope_ids = normalize_scope(db, principal, requested_scope)
     sequence = (
         db.scalar(
             select(func.coalesce(func.max(Message.sequence), 0)).where(
@@ -436,6 +498,30 @@ def resolve_clarification(
         )
         or 0
     ) + 1
+    if scope_changed(current_scope, normalized_scope):
+        db.add(
+            Message(
+                conversation_id=conversation.id,
+                role="system",
+                content=(
+                    "查询范围已更新为全部授权事业部"
+                    if normalized_scope.mode == "all_authorized"
+                    else f"查询范围已更新为 {len(resolved_scope_ids)} 个事业部"
+                ),
+                content_json={
+                    "event": "organization_scope_changed",
+                    "organization_scope": normalized_scope.model_dump(mode="json"),
+                    "resolved_organization_unit_ids": [
+                        str(item) for item in resolved_scope_ids
+                    ],
+                },
+                sequence=sequence,
+                status="completed",
+            )
+        )
+        sequence += 1
+        set_conversation_scope(db, conversation, normalized_scope)
+    message_scope_snapshot = scope_snapshot(normalized_scope, resolved_scope_ids)
     user_message = Message(
         conversation_id=conversation.id,
         author_user_id=principal.user.id,
@@ -449,6 +535,7 @@ def resolve_clarification(
             "clarification_id": str(clarification.id),
             "selected_value": payload.value,
             "original_message_id": str(clarification.message_id),
+            "organization_scope_snapshot": message_scope_snapshot,
         },
         sequence=sequence,
         status="completed",
@@ -463,20 +550,42 @@ def resolve_clarification(
     )
     db.add_all([user_message, assistant_message])
     db.flush()
+    source_job = next(
+        (
+            item
+            for item in db.scalars(
+                select(Job)
+                .where(
+                    Job.enterprise_id == principal.enterprise_id,
+                    Job.job_type == "assistant_response",
+                )
+                .order_by(Job.created_at.desc())
+                .limit(100)
+            ).all()
+            if str(item.payload_json.get("message_id")) == str(clarification.message_id)
+        ),
+        None,
+    )
+    harness_version = (
+        db.get(HarnessConfigVersion, source_job.harness_version_id)
+        if source_job and source_job.harness_version_id
+        else active_harness_config(db, principal.enterprise_id)
+    )
     db.add(
         Job(
             enterprise_id=principal.enterprise_id,
             created_by_user_id=principal.user.id,
+            harness_version_id=harness_version.id,
             job_type="assistant_response",
             payload_json={
                 "conversation_id": str(conversation.id),
                 "message_id": str(user_message.id),
                 "assistant_message_id": str(assistant_message.id),
                 "clarification_id": str(clarification.id),
+                "organization_scope": normalized_scope.model_dump(mode="json"),
+                "harness_version_id": str(harness_version.id),
             },
-            scope_snapshot_json=build_scope_snapshot(
-                db, principal, selected_organization_id
-            ),
+            scope_snapshot_json=message_scope_snapshot,
             status="queued",
             max_attempts=get_settings().worker_job_max_attempts,
         )
@@ -542,6 +651,10 @@ def create_message(
         raise AppError(409, "conversation_archived", "已归档会话不能继续发送消息")
     if payload.file_ids:
         raise AppError(410, "file_upload_disabled", "当前阶段不支持在会话中使用文件")
+    current_scope = persisted_scope(db, conversation)
+    requested_scope = payload.organization_scope or current_scope
+    normalized_scope, resolved_scope_ids = normalize_scope(db, principal, requested_scope)
+    active_harness = active_harness_config(db, principal.enterprise_id)
     sequence = (
         db.scalar(
             select(func.coalesce(func.max(Message.sequence), 0)).where(
@@ -550,12 +663,33 @@ def create_message(
         )
         or 0
     ) + 1
+    if scope_changed(current_scope, normalized_scope):
+        scope_event = Message(
+            conversation_id=conversation.id,
+            role="system",
+            content=(
+                "查询范围已更新为全部授权事业部"
+                if normalized_scope.mode == "all_authorized"
+                else f"查询范围已更新为 {len(resolved_scope_ids)} 个事业部"
+            ),
+            content_json={
+                "event": "organization_scope_changed",
+                "organization_scope": normalized_scope.model_dump(mode="json"),
+                "resolved_organization_unit_ids": [str(item) for item in resolved_scope_ids],
+            },
+            sequence=sequence,
+            status="completed",
+        )
+        db.add(scope_event)
+        sequence += 1
+        set_conversation_scope(db, conversation, normalized_scope)
+    message_scope_snapshot = scope_snapshot(normalized_scope, resolved_scope_ids)
     message = Message(
         conversation_id=conversation.id,
         author_user_id=principal.user.id,
         role="user",
         content=payload.content,
-        content_json={},
+        content_json={"organization_scope_snapshot": message_scope_snapshot},
         sequence=sequence,
         status="completed",
     )
@@ -571,24 +705,19 @@ def create_message(
     )
     db.add(assistant_message)
     db.flush()
-    allowed_scope = build_assistant_scope_snapshot(
-        db, principal, conversation.organization_unit_id
-    )
     job = Job(
         enterprise_id=principal.enterprise_id,
         created_by_user_id=principal.user.id,
+        harness_version_id=active_harness.id,
         job_type="assistant_response",
         payload_json={
             "conversation_id": str(conversation.id),
             "message_id": str(message.id),
             "assistant_message_id": str(assistant_message.id),
-            "organization_unit_id": (
-                str(conversation.organization_unit_id)
-                if conversation.organization_unit_id
-                else None
-            ),
+            "organization_scope": normalized_scope.model_dump(mode="json"),
+            "harness_version_id": str(active_harness.id),
         },
-        scope_snapshot_json=allowed_scope,
+        scope_snapshot_json=message_scope_snapshot,
         status="queued",
         max_attempts=get_settings().worker_job_max_attempts,
     )
@@ -608,8 +737,102 @@ def create_message(
             "conversation_id": str(conversation.id),
             "job_id": str(job.id),
             "assistant_message_id": str(assistant_message.id),
+            "scope_mode": normalized_scope.mode,
+            "scope_count": len(resolved_scope_ids),
+            "harness_version": active_harness.version,
         },
     )
     save_response(db, request, principal, payload, 202, output)
     db.commit()
     return output
+
+
+@router.post(
+    "/{conversation_id}/messages/{message_id}/diagnostic-share",
+    response_model=DiagnosticShareOut,
+)
+def share_message_diagnostic(
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> DiagnosticShareOut:
+    conversation = owned_conversation(db, principal, conversation_id)
+    message = db.scalar(
+        select(Message).where(
+            Message.id == message_id,
+            Message.conversation_id == conversation.id,
+            Message.role == "assistant",
+        )
+    )
+    if message is None:
+        raise AppError(404, "message_not_found", "回答不存在")
+    expires_at = utc_now() + timedelta(hours=24)
+    grant = db.scalar(
+        select(HarnessDiagnosticGrant)
+        .where(HarnessDiagnosticGrant.message_id == message.id)
+        .with_for_update()
+    )
+    if grant is None:
+        grant = HarnessDiagnosticGrant(
+            enterprise_id=principal.enterprise_id,
+            conversation_id=conversation.id,
+            message_id=message.id,
+            granted_by_user_id=principal.user.id,
+            expires_at=expires_at,
+        )
+        db.add(grant)
+    else:
+        grant.expires_at = expires_at
+        grant.revoked_at = None
+    record_audit(
+        db,
+        request,
+        "harness.diagnostic_shared",
+        actor=principal.user,
+        session=principal.session,
+        target_type="message",
+        target_id=message.id,
+        metadata={"expires_at": expires_at.isoformat()},
+    )
+    db.commit()
+    return DiagnosticShareOut(
+        message_id=message.id,
+        expires_at=grant.expires_at,
+        revoked_at=grant.revoked_at,
+    )
+
+
+@router.delete(
+    "/{conversation_id}/messages/{message_id}/diagnostic-share",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def revoke_message_diagnostic(
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> None:
+    conversation = owned_conversation(db, principal, conversation_id)
+    grant = db.scalar(
+        select(HarnessDiagnosticGrant).where(
+            HarnessDiagnosticGrant.message_id == message_id,
+            HarnessDiagnosticGrant.conversation_id == conversation.id,
+            HarnessDiagnosticGrant.granted_by_user_id == principal.user.id,
+        )
+    )
+    if grant is None:
+        raise AppError(404, "diagnostic_share_not_found", "诊断共享不存在")
+    grant.revoked_at = utc_now()
+    record_audit(
+        db,
+        request,
+        "harness.diagnostic_revoked",
+        actor=principal.user,
+        session=principal.session,
+        target_type="message",
+        target_id=message_id,
+    )
+    db.commit()

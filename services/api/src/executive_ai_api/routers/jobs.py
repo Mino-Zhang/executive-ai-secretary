@@ -11,7 +11,6 @@ from sqlalchemy.orm import Session
 from ..audit import record_audit
 from ..authz import (
     Principal,
-    build_assistant_scope_snapshot,
     build_scope_snapshot,
     get_executive_principal,
     scope_snapshot_is_current_for_user,
@@ -246,11 +245,12 @@ def retry_job(
     retried = Job(
         enterprise_id=principal.enterprise_id,
         created_by_user_id=principal.user.id,
+        harness_version_id=previous.harness_version_id,
         job_type="assistant_response",
         payload_json=payload,
-        scope_snapshot_json=build_assistant_scope_snapshot(
-            db, principal, conversation.organization_unit_id
-        ),
+        # A retry is the same question under the same authority and Harness
+        # snapshot. Re-resolving current conversation state would change history.
+        scope_snapshot_json=dict(previous.scope_snapshot_json),
         status="queued",
         max_attempts=get_settings().worker_job_max_attempts,
     )

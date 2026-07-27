@@ -51,16 +51,123 @@ export type OrganizationUnit = {
   sort_order: number;
 };
 
+export type OrganizationScope = {
+  mode: "all_authorized" | "selected";
+  organization_unit_ids: string[];
+  resolved_organization_unit_ids?: string[];
+};
+
 export type Conversation = {
   id: string;
   title: string;
   organization_unit_id: string | null;
+  organization_scope: OrganizationScope;
   status: string;
   pinned_at: string | null;
   last_message_at: string | null;
   created_at: string;
   updated_at: string;
   archived_at?: string | null;
+};
+
+export type ExecutivePersonalProfile = {
+  salutation: string;
+  amount_unit: "yuan" | "wan" | "yi";
+  response_style: "concise" | "balanced" | "detailed";
+  locale: "zh-CN" | "zh-TW" | "en-US";
+  memory_enabled: boolean;
+  version: number;
+  updated_at: string | null;
+};
+
+export type HarnessPrompts = {
+  system: string;
+  route: string;
+  rewrite: string;
+  plan: string;
+  data_answer: string;
+  general_answer: string;
+};
+
+export type HarnessGlossaryEntry = {
+  term: string;
+  canonical: string;
+  category: string;
+  enabled: boolean;
+};
+
+export type HarnessFastRule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  match_mode: "any" | "all";
+  terms: string[];
+  exclusions: string[];
+  route: "data" | "general";
+  candidate_tools: string[];
+};
+
+export type HarnessBusinessConfig = {
+  prompts: HarnessPrompts;
+  glossary: HarnessGlossaryEntry[];
+  fast_rules: HarnessFastRule[];
+};
+
+export type HarnessConfig = {
+  id: string;
+  version: number;
+  schema_version: string;
+  config_hash: string;
+  config: HarnessBusinessConfig;
+  safety_kernel: Record<string, unknown>;
+  activated_at: string;
+  updated_at: string;
+};
+
+export type HarnessVersion = {
+  id: string;
+  version: number;
+  config_hash: string;
+  is_active: boolean;
+  source_version_id: string | null;
+  created_by_user_id: string | null;
+  activated_at: string;
+  created_at: string;
+};
+
+export type HarnessSimulation = {
+  route: "data" | "general" | "clarification";
+  route_source: "fast_rule" | "hermes" | "validation";
+  matched_rule_id: string | null;
+  candidate_tools: string[];
+  query_spec: Record<string, unknown>;
+  validation_issues: string[];
+  config_hash: string;
+};
+
+export type HarnessMetrics = {
+  window_days: number;
+  message_count: number;
+  intent_accuracy_sample_size: number;
+  structured_output_rate: number;
+  tool_success_rate: number;
+  route_counts: Record<string, number>;
+  stage_latency_p95_ms: Record<string, number>;
+};
+
+export type HarnessTrace = {
+  message_id: string;
+  conversation_id: string | null;
+  route: string | null;
+  route_source: string | null;
+  query_spec_summary: Record<string, unknown>;
+  harness_version: number | null;
+  organization_unit_count: number;
+  tools: string[];
+  stages: Array<Record<string, unknown>>;
+  diagnostic_shared_until: string | null;
+  shared_content: Record<string, unknown> | null;
 };
 
 export type ConversationMessage = {
@@ -241,7 +348,8 @@ export type ProductionBootstrap = {
   reports: Report[];
   jobs: Job[];
   dataCapabilities: DataCapabilities | null;
-  optionalErrors: Partial<Record<"memories" | "reports" | "jobs" | "dataCapabilities", string>>;
+  personalProfile: ExecutivePersonalProfile | null;
+  optionalErrors: Partial<Record<"memories" | "reports" | "jobs" | "dataCapabilities" | "personalProfile", string>>;
 };
 
 export type ApiErrorPayload = {

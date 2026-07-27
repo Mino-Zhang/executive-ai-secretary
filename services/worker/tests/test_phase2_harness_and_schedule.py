@@ -15,13 +15,12 @@ os.environ.update(
     }
 )
 
+from executive_ai_api.harness_config import default_harness_config, match_fast_rule
 from executive_ai_api.mcp_registry import MCP_TOOL_SPECS
+from executive_ai_api.query_spec import normalize_query_spec
 
 from executive_ai_worker.assistant_orchestrator import (
     _bounded_conversation_context,
-    _deterministic_period_arguments,
-    _deterministic_tools,
-    _fallback_route,
     _normalize_calls,
 )
 from executive_ai_worker.scheduler import next_cron_time
@@ -36,12 +35,6 @@ def _tool(tool_name: str, *, max_rows: int = 50) -> dict[str, object]:
         "max_rows": max_rows,
         "timeout_seconds": 12,
     }
-
-
-def test_deterministic_route_fallback_separates_business_and_general_questions() -> None:
-    assert _fallback_route("本月整体回款情况") == "data"
-    assert _fallback_route("解释一下什么是现金转换周期") == "general"
-    assert _fallback_route("帮我整理一份董事会沟通框架") == "general"
 
 
 def test_planner_calls_are_allowlisted_bounded_and_server_scoped() -> None:
@@ -78,7 +71,7 @@ def test_planner_calls_are_allowlisted_bounded_and_server_scoped() -> None:
     assert calls[0]["timeout_seconds"] == 12
 
 
-def test_empty_or_invalid_plan_uses_only_an_available_registered_tool() -> None:
+def test_empty_or_invalid_plan_does_not_guess_a_tool() -> None:
     organization_id = uuid.uuid4()
     calls = _normalize_calls(
         [{"tool": "not_registered", "arguments": {}}],
@@ -86,33 +79,39 @@ def test_empty_or_invalid_plan_uses_only_an_available_registered_tool() -> None:
         [_tool("get_collection_aging")],
         {organization_id},
     )
-    assert [item["tool"] for item in calls] == ["get_collection_aging"]
-    assert calls[0]["arguments"]["organization_unit_ids"] == [str(organization_id)]
+    assert calls == []
 
 
-def test_deterministic_fast_path_only_accepts_explicit_registered_intents() -> None:
-    allowed = {"get_collection_aging", "get_organization_performance"}
-    assert _deterministic_tools("本月最需要关注哪些回款风险？", allowed) == [
-        "get_collection_aging"
-    ]
-    assert _deterministic_tools("比较六个事业部的回款差距", allowed) == [
-        "get_organization_performance"
-    ]
-    assert _deterministic_tools("再展开看看", allowed) == []
-    assert _deterministic_tools("哪些项目延期", allowed) == []
+def test_fast_path_is_driven_by_versioned_configuration() -> None:
+    config = default_harness_config()
+    rule = match_fast_rule("本月最需要关注哪些回款风险？", config)
+    assert rule is not None
+    assert rule["route"] == "data"
+    assert match_fast_rule("帮我润色这段话", config)["route"] == "general"
+    assert match_fast_rule("解释现金转换周期", config) is None
 
 
-def test_deterministic_periods_are_timezone_ready_and_stable() -> None:
-    reference = datetime(2026, 7, 28, tzinfo=UTC).date()
-    assert _deterministic_period_arguments(
-        "本月回款风险", "Asia/Shanghai", today=reference
-    ) == {"period_start": "2026-07-01", "period_end": "2026-07-31"}
-    assert _deterministic_period_arguments(
-        "上月回款风险", "Asia/Shanghai", today=reference
-    ) == {"period_start": "2026-06-01", "period_end": "2026-06-30"}
-    assert _deterministic_period_arguments(
-        "本季度回款风险", "Asia/Shanghai", today=reference
-    ) == {"period_start": "2026-07-01", "period_end": "2026-09-30"}
+def test_query_spec_keeps_model_scope_out_of_the_authority_boundary() -> None:
+    authorized_id = uuid.uuid4()
+    spec = normalize_query_spec(
+        {
+            "normalized_question": "本月回款风险",
+            "metrics": ["collection_amount"],
+            "organization_scope": {
+                "mode": "all_authorized",
+                "organization_unit_ids": [str(uuid.uuid4())],
+            },
+        },
+        question="本月回款风险",
+        organization_scope={
+            "mode": "selected",
+            "organization_unit_ids": [str(authorized_id)],
+        },
+    )
+    assert spec["organization_scope"] == {
+        "mode": "selected",
+        "organization_unit_ids": [str(authorized_id)],
+    }
 
 
 def test_conversation_context_preserves_recent_turns_with_a_total_budget() -> None:

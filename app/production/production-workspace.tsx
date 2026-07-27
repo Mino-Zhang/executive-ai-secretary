@@ -17,9 +17,11 @@ import type {
   Conversation,
   ConversationMessage,
   DataCapabilities,
+  ExecutivePersonalProfile,
   Job,
   Memory,
   OrganizationUnit,
+  OrganizationScope,
   ProductionBootstrap,
   Project,
   Report,
@@ -40,9 +42,17 @@ type ConfirmState = {
   tone?: "normal" | "danger";
   action: () => void | Promise<void>;
 };
-type ProfilePreferences = { salutation: string; amountUnit: string };
+type ProfilePreferences = {
+  salutation: string;
+  amountUnit: ExecutivePersonalProfile["amount_unit"];
+  responseStyle: ExecutivePersonalProfile["response_style"];
+};
 
 const ALL_SCOPE_ID = "all";
+const ALL_ORGANIZATIONS_SCOPE: OrganizationScope = {
+  mode: "all_authorized",
+  organization_unit_ids: [],
+};
 const COMPOSER_MAX_LENGTH = 8000;
 const COMPOSER_HINT_THRESHOLD = COMPOSER_MAX_LENGTH * 0.8;
 
@@ -70,7 +80,6 @@ const copy = {
     profile: "个人资料",
     appearance: "外观",
     scope: "全部事业部",
-    greetingQuestion: "今天需要我先看什么？",
     placeholder: "向 AI 秘书提问经营数据，或讨论需要分析的问题",
     disclaimer: "AI 可能出错。关键经营数字请结合来源与数据时间核对。",
     noProject: "尚未创建项目",
@@ -95,7 +104,6 @@ const copy = {
     profile: "個人資料",
     appearance: "外觀",
     scope: "全部事業部",
-    greetingQuestion: "今天需要我先看什麼？",
     placeholder: "向 AI 秘書提問經營資料，或討論需要分析的問題",
     disclaimer: "AI 可能出錯。關鍵經營數字請結合來源與資料時間核對。",
     noProject: "尚未建立項目",
@@ -120,7 +128,6 @@ const copy = {
     profile: "Profile",
     appearance: "Appearance",
     scope: "All business units",
-    greetingQuestion: "What should I look into first?",
     placeholder: "Ask about the business or discuss a question that needs analysis",
     disclaimer: "AI can make mistakes. Verify critical figures against sources and data timestamps.",
     noProject: "No projects yet",
@@ -230,6 +237,24 @@ function sortByPinnedAndRecent<T extends { pinned_at: string | null; updated_at:
   });
 }
 
+function scopeLabel(scope: OrganizationScope, units: OrganizationUnit[], language: UiLanguage) {
+  const c = copy[language];
+  if (scope.mode === "all_authorized") return c.scope;
+  const names = scope.organization_unit_ids
+    .map((id) => units.find((unit) => unit.id === id)?.name)
+    .filter((name): name is string => Boolean(name));
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return names.join("、");
+  return language === "en" ? `${names.length} business units selected` : `已选 ${names.length} 个事业部`;
+}
+
+function scopeFromConversation(conversation: Conversation): OrganizationScope {
+  return {
+    mode: conversation.organization_scope.mode,
+    organization_unit_ids: [...conversation.organization_scope.organization_unit_ids],
+  };
+}
+
 export function ProductionWorkspace({
   initialBootstrap,
   onSessionExpired,
@@ -245,14 +270,11 @@ export function ProductionWorkspace({
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [messagesError, setMessagesError] = useState("");
   const [draft, setDraft] = useState("");
-  const [selectedOrganizationId, setSelectedOrganizationId] = useState(
-    initialBootstrap.organizationUnits.length > 1
-      ? ALL_SCOPE_ID
-      : initialBootstrap.organizationUnits[0]?.id ?? ALL_SCOPE_ID,
-  );
+  const [selectedOrganizationScope, setSelectedOrganizationScope] = useState<OrganizationScope>(ALL_ORGANIZATIONS_SCOPE);
   const [sending, setSending] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [toast, setToast] = useState("");
+  const [, setClockTick] = useState(0);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -285,25 +307,19 @@ export function ProductionWorkspace({
   });
   const [languagePreference, setLanguagePreference] = useState<UiLanguage>(() => {
     if (typeof window === "undefined") return "zh-CN";
-    const saved = window.localStorage.getItem("executive-workbench-language");
-    if (saved === "zh-CN" || saved === "zh-TW" || saved === "en") return saved;
+    const profileLocale = initialBootstrap.personalProfile?.locale;
+    if (profileLocale === "zh-CN" || profileLocale === "zh-TW") return profileLocale;
+    if (profileLocale === "en-US") return "en";
     return initialBootstrap.me.user.locale === "zh-TW" || initialBootstrap.me.user.locale === "en"
       ? initialBootstrap.me.user.locale
       : "zh-CN";
   });
-  const [profilePreferences, setProfilePreferences] = useState<ProfilePreferences>(() => {
-    if (typeof window === "undefined") return { salutation: "董事长", amountUnit: "万元" };
-    try {
-      const saved = JSON.parse(window.localStorage.getItem("executive-workbench-profile-preferences") || "null") as Partial<ProfilePreferences> | null;
-      return {
-        salutation: saved?.salutation?.trim() || "董事长",
-        amountUnit: saved?.amountUnit?.trim() || "万元",
-      };
-    } catch {
-      return { salutation: "董事长", amountUnit: "万元" };
-    }
+  const [profilePreferences, setProfilePreferences] = useState<ProfilePreferences>({
+    salutation: initialBootstrap.personalProfile?.salutation || "董事长",
+    amountUnit: initialBootstrap.personalProfile?.amount_unit || "wan",
+    responseStyle: initialBootstrap.personalProfile?.response_style || "balanced",
   });
-  const [memoryEnabled, setMemoryEnabled] = useState(initialBootstrap.me.user.memory_enabled);
+  const [memoryEnabled, setMemoryEnabled] = useState(initialBootstrap.personalProfile?.memory_enabled ?? initialBootstrap.me.user.memory_enabled);
   const accountRef = useRef<HTMLDivElement>(null);
   const sidebarMenuRef = useRef<HTMLDivElement>(null);
   const deepLinkHandled = useRef(false);
@@ -314,10 +330,7 @@ export function ProductionWorkspace({
   const businessDataReady = organizationUnits.length > 0;
   const dataCapabilities = bootstrap.dataCapabilities;
   const activeConversation = bootstrap.conversations.find((item) => item.id === activeConversationId) ?? null;
-  const selectedOrganization = selectedOrganizationId === ALL_SCOPE_ID
-    ? null
-    : organizationUnits.find((unit) => unit.id === selectedOrganizationId) ?? null;
-  const selectedScopeLabel = selectedOrganization?.name ?? c.scope;
+  const selectedScopeLabel = scopeLabel(selectedOrganizationScope, organizationUnits, languagePreference);
   const sortedProjects = useMemo(() => sortByPinnedAndRecent(bootstrap.projects), [bootstrap.projects]);
   const pinnedConversations = useMemo(
     () => sortByPinnedAndRecent(bootstrap.conversations.filter((item) => item.pinned_at && !item.archived_at)),
@@ -376,14 +389,24 @@ export function ProductionWorkspace({
   }, [languagePreference]);
 
   useEffect(() => {
-    window.localStorage.setItem("executive-workbench-profile-preferences", JSON.stringify(profilePreferences));
-  }, [profilePreferences]);
-
-  useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockTick((value) => value + 1), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const closeSidebar = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", closeSidebar);
+    return () => window.removeEventListener("keydown", closeSidebar);
+  }, [sidebarOpen]);
 
   useEffect(() => {
     window.localStorage.setItem("executive-workbench-unread-conversations", JSON.stringify(unreadConversationIds));
@@ -445,6 +468,7 @@ export function ProductionWorkspace({
     setSidebarOpen(false);
     setActivePanel(null);
     setUnreadConversationIds((current) => current.filter((id) => id !== conversation.id));
+    setSelectedOrganizationScope(scopeFromConversation(conversation));
     try {
       const result = await productionServices.conversations.messages(conversation.id);
       setMessages(result.items);
@@ -479,7 +503,9 @@ export function ProductionWorkspace({
     setSidebarOpen(false);
     setActivePanel(null);
     const project = bootstrap.projects.find((item) => item.id === projectId);
-    if (project?.organization_unit_id) setSelectedOrganizationId(project.organization_unit_id);
+    setSelectedOrganizationScope(project?.organization_unit_id
+      ? { mode: "selected", organization_unit_ids: [project.organization_unit_id] }
+      : ALL_ORGANIZATIONS_SCOPE);
     window.history.replaceState(null, "", window.location.pathname);
   }
 
@@ -493,7 +519,7 @@ export function ProductionWorkspace({
       if (!conversationId) {
         const createdConversation = await productionServices.conversations.create({
           title: content.slice(0, 42),
-          organization_unit_id: selectedOrganization?.id,
+          organization_scope: selectedOrganizationScope,
           project_id: activeProjectId ?? undefined,
         });
         conversationId = createdConversation.id;
@@ -509,7 +535,7 @@ export function ProductionWorkspace({
           }));
         }
       }
-      const message = await productionServices.conversations.sendMessage(conversationId, content);
+      const message = await productionServices.conversations.sendMessage(conversationId, content, selectedOrganizationScope);
       setMessages((current) => [...current, message]);
       setDraft("");
       window.history.replaceState(null, "", `${window.location.pathname}?conversation=${encodeURIComponent(conversationId)}`);
@@ -559,16 +585,70 @@ export function ProductionWorkspace({
   async function changeMemoryEnabled(value: boolean) {
     const previous = memoryEnabled;
     setMemoryEnabled(value);
-    const updated = await runRequest(() => productionServices.auth.updatePreferences(value));
+    const updated = await runRequest(() => productionServices.auth.updatePersonalProfile({
+      salutation: profilePreferences.salutation,
+      amount_unit: profilePreferences.amountUnit,
+      response_style: profilePreferences.responseStyle,
+      locale: languagePreference === "en" ? "en-US" : languagePreference,
+      memory_enabled: value,
+    }));
     if (!updated) {
       setMemoryEnabled(previous);
       return;
     }
     setBootstrap((current) => ({
       ...current,
-      me: { ...current.me, user: updated },
+      personalProfile: updated,
+      me: { ...current.me, user: { ...current.me.user, memory_enabled: updated.memory_enabled } },
     }));
     setToast(value ? "长期记忆已开启" : "长期记忆已关闭");
+  }
+
+  async function saveProfilePreferences(value: ProfilePreferences) {
+    const updated = await runRequest(() => productionServices.auth.updatePersonalProfile({
+      salutation: value.salutation,
+      amount_unit: value.amountUnit,
+      response_style: value.responseStyle,
+      locale: languagePreference === "en" ? "en-US" : languagePreference,
+      memory_enabled: memoryEnabled,
+    }));
+    if (!updated) return false;
+    setProfilePreferences({
+      salutation: updated.salutation,
+      amountUnit: updated.amount_unit,
+      responseStyle: updated.response_style,
+    });
+    setBootstrap((current) => ({
+      ...current,
+      personalProfile: updated,
+      me: {
+        ...current.me,
+        user: {
+          ...current.me.user,
+          locale: updated.locale,
+          memory_enabled: updated.memory_enabled,
+        },
+      },
+    }));
+    setToast("服务偏好已安全保存");
+    return true;
+  }
+
+  async function changeLanguage(value: UiLanguage) {
+    const previous = languagePreference;
+    setLanguagePreference(value);
+    const updated = await runRequest(() => productionServices.auth.updatePersonalProfile({
+      salutation: profilePreferences.salutation,
+      amount_unit: profilePreferences.amountUnit,
+      response_style: profilePreferences.responseStyle,
+      locale: value === "en" ? "en-US" : value,
+      memory_enabled: memoryEnabled,
+    }));
+    if (!updated) {
+      setLanguagePreference(previous);
+      return;
+    }
+    setBootstrap((current) => ({ ...current, personalProfile: updated }));
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -890,7 +970,7 @@ export function ProductionWorkspace({
               <button type="button" className="account-menu-item" role="menuitem" onClick={() => { setPreferencesView("appearance"); setAccountMenuOpen(false); }}><UiIcon name="settings" /><span>{c.settings}</span></button>
               <div className="account-language-control">
                 <button type="button" className="account-menu-item" role="menuitem" aria-haspopup="menu" aria-expanded={languageMenuOpen} onClick={() => setLanguageMenuOpen((current) => !current)}><UiIcon name="language" /><span>{c.language}</span><small>{languageOptions.find((option) => option.id === languagePreference)?.label}</small><UiIcon name="chevron" /></button>
-                {languageMenuOpen && <div className="language-submenu" role="menu" aria-label="选择界面语言">{languageOptions.map((option) => <button type="button" key={option.id} className={languagePreference === option.id ? "selected" : ""} role="menuitemradio" aria-checked={languagePreference === option.id} onClick={() => { setLanguagePreference(option.id); setLanguageMenuOpen(false); setAccountMenuOpen(false); }}><span>{option.label}</span><span aria-hidden="true">{languagePreference === option.id ? "✓" : ""}</span></button>)}</div>}
+                {languageMenuOpen && <div className="language-submenu" role="menu" aria-label="选择界面语言">{languageOptions.map((option) => <button type="button" key={option.id} className={languagePreference === option.id ? "selected" : ""} role="menuitemradio" aria-checked={languagePreference === option.id} onClick={() => { void changeLanguage(option.id); setLanguageMenuOpen(false); setAccountMenuOpen(false); }}><span>{option.label}</span><span aria-hidden="true">{languagePreference === option.id ? "✓" : ""}</span></button>)}</div>}
               </div>
               <div className="profile-menu-divider" />
               <button type="button" className="account-menu-item account-menu-logout" role="menuitem" onClick={() => void logout()}><UiIcon name="logout" /><span>{c.logout}</span></button>
@@ -924,6 +1004,7 @@ export function ProductionWorkspace({
         <header className="workspace-topbar">
           <button className="mobile-sidebar-trigger" type="button" aria-label="打开侧栏" onClick={() => setSidebarOpen(true)}>☰</button>
           <div className="workspace-title-block"><strong>{activeConversation?.title || (activeProjectId ? bootstrap.projects.find((item) => item.id === activeProjectId)?.name : null) || c.newConversation}</strong><small>{environmentLabel(me)} · {selectedScopeLabel}</small></div>
+          <time className="workspace-topbar-date" dateTime={new Date().toISOString()}>{localizedDate(languagePreference, me.user.timezone)}</time>
           <div className="workspace-topbar-actions"><span className={`production-environment-badge data-${dataCapabilities?.overall_status ?? "unavailable"}`}>{dataStatusLabel(dataCapabilities)}</span><button className="topbar-scope-button" type="button" onClick={() => void refreshWorkspace()}>刷新状态</button><button className="topbar-new-button" type="button" aria-label="新建会话" onClick={() => newConversation()}>＋</button></div>
         </header>
         <main id="main-content" className="workspace-main">
@@ -939,8 +1020,8 @@ export function ProductionWorkspace({
               onKeyDown={handleComposerKeyDown}
               onSubmit={submit}
               organizationUnits={organizationUnits}
-              selectedOrganizationId={selectedOrganizationId}
-              setSelectedOrganizationId={setSelectedOrganizationId}
+              organizationScope={selectedOrganizationScope}
+              setOrganizationScope={setSelectedOrganizationScope}
               language={languagePreference}
               disclaimer={c.disclaimer}
               jobs={bootstrap.jobs}
@@ -953,8 +1034,8 @@ export function ProductionWorkspace({
               language={languagePreference}
               salutation={profilePreferences.salutation}
               organizationUnits={organizationUnits}
-              selectedOrganizationId={selectedOrganizationId}
-              setSelectedOrganizationId={setSelectedOrganizationId}
+              organizationScope={selectedOrganizationScope}
+              setOrganizationScope={setSelectedOrganizationScope}
               latestReport={latestDailyReport}
               dataCapabilities={dataCapabilities}
               onOpenReport={() => void openReport("daily", latestDailyReport?.id)}
@@ -1012,7 +1093,7 @@ export function ProductionWorkspace({
         setTheme={setThemePreference}
         language={languagePreference}
         profilePreferences={profilePreferences}
-        setProfilePreferences={setProfilePreferences}
+        setProfilePreferences={saveProfilePreferences}
         memoryEnabled={memoryEnabled}
         setMemoryEnabled={(value) => void changeMemoryEnabled(value)}
         memories={bootstrap.memories}
@@ -1088,8 +1169,8 @@ function ProductionHome({
   language,
   salutation,
   organizationUnits,
-  selectedOrganizationId,
-  setSelectedOrganizationId,
+  organizationScope,
+  setOrganizationScope,
   latestReport,
   dataCapabilities,
   onOpenReport,
@@ -1104,8 +1185,8 @@ function ProductionHome({
   language: UiLanguage;
   salutation: string;
   organizationUnits: OrganizationUnit[];
-  selectedOrganizationId: string;
-  setSelectedOrganizationId: (value: string) => void;
+  organizationScope: OrganizationScope;
+  setOrganizationScope: (value: OrganizationScope) => void;
   latestReport: Report | null;
   dataCapabilities: DataCapabilities | null;
   onOpenReport: () => void;
@@ -1139,9 +1220,7 @@ function ProductionHome({
           )}
 
           <section className="workspace-greeting" aria-labelledby="production-greeting-title">
-            <p>{localizedDate(language, me.user.timezone)}</p>
             <div className="greeting-title-line"><span className="service-mark" aria-hidden="true" /><h1 id="production-greeting-title">{greetingForCurrentHour(me.user.timezone, language)}，{salutation}</h1></div>
-            <span>{c.greetingQuestion}</span>
             {!hasScope && <small className="active-project-context">经营数据尚未配置，仍可进行泛化问答。</small>}
             {activeProjectName && <small className="active-project-context">当前会话将归入项目：{activeProjectName}</small>}
           </section>
@@ -1154,13 +1233,13 @@ function ProductionHome({
             sending={sending}
             disabled={false}
             organizationUnits={organizationUnits}
-            selectedOrganizationId={selectedOrganizationId}
-            setSelectedOrganizationId={setSelectedOrganizationId}
+            organizationScope={organizationScope}
+            setOrganizationScope={setOrganizationScope}
             onKeyDown={onKeyDown}
             onSubmit={onSubmit}
           />
 
-          <section className="prompt-suggestions production-prompt-suggestions" aria-label="从一个问题开始"><h2>{language === "en" ? "Start with a question" : "从一个问题开始"}</h2><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>
+          <section className="prompt-suggestions production-prompt-suggestions" aria-label={language === "en" ? "Suggested questions" : "建议问题"}><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>
           <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? `数据来源：${dataCapabilities.source_label}。` : "当前尚未激活经营数据。"}{c.disclaimer}</p>
         </div>
       </div>
@@ -1179,8 +1258,8 @@ function ProductionConversation({
   onKeyDown,
   onSubmit,
   organizationUnits,
-  selectedOrganizationId,
-  setSelectedOrganizationId,
+  organizationScope,
+  setOrganizationScope,
   language,
   disclaimer,
   jobs,
@@ -1197,8 +1276,8 @@ function ProductionConversation({
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmit: (event: FormEvent) => void;
   organizationUnits: OrganizationUnit[];
-  selectedOrganizationId: string;
-  setSelectedOrganizationId: (value: string) => void;
+  organizationScope: OrganizationScope;
+  setOrganizationScope: (value: OrganizationScope) => void;
   language: UiLanguage;
   disclaimer: string;
   jobs: Job[];
@@ -1211,7 +1290,9 @@ function ProductionConversation({
         {loading && <MessageSkeleton />}
         {error && <section className="state-card" role="alert"><p className="eyebrow">加载失败</p><h3>暂时无法读取这条会话</h3><p>{error}</p></section>}
         {!loading && !error && !messages.length && <section className="chat-empty-state"><p className="eyebrow">空会话</p><h2>{conversation?.title || "新会话"}</h2><p>这条会话还没有消息，可以从下方输入框开始。</p></section>}
-        {messages.map((message) => message.role === "user" ? (
+        {messages.map((message) => message.role === "system" && message.content_json?.event === "organization_scope_changed" ? (
+          <div className="scope-change-divider" role="status" key={message.id}><span />{message.content}<span /></div>
+        ) : message.role === "user" ? (
           <article className="user-message" key={message.id}><span>您</span><p>{message.content}</p><time>{formatTimestamp(message.created_at, language)}</time></article>
         ) : (
           <article className={`structured-answer production-answer ${message.status === "failed" ? "failed" : ""}`} key={message.id}>
@@ -1238,8 +1319,8 @@ function ProductionConversation({
           sending={sending}
           disabled={false}
           organizationUnits={organizationUnits}
-          selectedOrganizationId={selectedOrganizationId}
-          setSelectedOrganizationId={setSelectedOrganizationId}
+          organizationScope={organizationScope}
+          setOrganizationScope={setOrganizationScope}
           onKeyDown={onKeyDown}
           onSubmit={onSubmit}
         />
@@ -1457,6 +1538,9 @@ function MessageDetails({
   const [evidenceRows, setEvidenceRows] = useState<Awaited<ReturnType<typeof productionServices.conversations.evidence>>>([]);
   const [clarificationResolved, setClarificationResolved] = useState(false);
   const [clarificationLoading, setClarificationLoading] = useState(false);
+  const [shareConfirmOpen, setShareConfirmOpen] = useState(false);
+  const [shareExpiresAt, setShareExpiresAt] = useState<string | null>(null);
+  const [shareBusy, setShareBusy] = useState(false);
 
   async function toggleEvidence() {
     const next = !evidenceOpen;
@@ -1481,7 +1565,30 @@ function MessageDetails({
     }
   }
 
-  if (!metrics.length && !sections.length && !structuredMetrics.length && !Array.isArray(structuredRows) && !citations.length && !freshness.length && !clarificationId && !message.source_data_as_of && !message.model_name) return null;
+  async function shareDiagnostic() {
+    if (shareBusy) return;
+    setShareBusy(true);
+    try {
+      const result = await productionServices.conversations.shareDiagnostic(conversationId, message.id);
+      setShareExpiresAt(result.expires_at);
+      setShareConfirmOpen(false);
+    } finally {
+      setShareBusy(false);
+    }
+  }
+
+  async function revokeDiagnosticShare() {
+    if (shareBusy) return;
+    setShareBusy(true);
+    try {
+      await productionServices.conversations.revokeDiagnosticShare(conversationId, message.id);
+      setShareExpiresAt(null);
+    } finally {
+      setShareBusy(false);
+    }
+  }
+
+  if (!metrics.length && !sections.length && !structuredMetrics.length && !Array.isArray(structuredRows) && !citations.length && !freshness.length && !clarificationId && !message.source_data_as_of && !message.model_name && message.role !== "assistant") return null;
   return (
     <div className="production-message-details">
       {metrics.length > 0 && <dl className="answer-metric-grid">{metrics.slice(0, 6).map((metric, index) => <div key={`${String(metric.label)}-${index}`}><dt>{String(metric.label ?? "指标")}</dt><dd>{String(metric.value ?? "—")}</dd>{metric.note ? <small>{String(metric.note)}</small> : null}</div>)}</dl>}
@@ -1493,6 +1600,10 @@ function MessageDetails({
       {clarificationResolved && <p className="clarification-resolved">已确认范围，正在继续处理。</p>}
       {(freshness.length > 0 || citations.length > 0 || message.source_data_as_of || message.model_name) && <details className="answer-evidence"><summary>来源与数据时间</summary><dl>{message.source_data_as_of && <div><dt>数据截至</dt><dd>{formatTimestamp(message.source_data_as_of)}</dd></div>}{freshness.map((item, index) => <div key={`${String(item.domain)}-${index}`}><dt>{domainLabels[String(item.domain)] ?? String(item.domain ?? "数据")}</dt><dd>{String(item.source_display_name ?? "未知来源")} · {formatTimestamp(typeof item.source_data_as_of === "string" ? item.source_data_as_of : null)} · {item.status === "fresh" ? "最新" : String(item.status ?? "")}</dd></div>)}{citations.map((citation, index) => <div key={`${citation.source}-${index}`}><dt>{citation.label}</dt><dd>{citation.source}{citation.as_of ? ` · ${citation.as_of}` : ""}</dd></div>)}{message.model_name && <div><dt>处理模型</dt><dd>{message.model_name}</dd></div>}</dl></details>}
       {evidenceCount > 0 && <section className="numeric-evidence"><button type="button" onClick={() => void toggleEvidence()}><span>{evidenceOpen ? "收起数字依据" : `查看数字依据（${evidenceCount}）`}</span><i aria-hidden="true">{evidenceOpen ? "⌃" : "⌄"}</i></button>{evidenceOpen && <div>{evidenceLoading ? <small>正在读取受控证据…</small> : evidenceRows.map((evidence) => <article key={evidence.id}><header><strong>{domainLabels[evidence.domain] ?? evidence.domain}</strong><span>{evidence.source_display_name}</span></header><p>数据截至 {formatTimestamp(evidence.source_data_as_of)}{evidence.dataset_version ? ` · ${evidence.dataset_version}` : ""}</p><small>{evidence.row_references_json.length ? `${evidence.row_references_json.length} 条源记录引用` : "聚合结果来自当前激活数据版本"}</small></article>)}</div>}</section>}
+      {message.role === "assistant" && message.status === "completed" && <section className="diagnostic-share-control">
+        {shareExpiresAt ? <><span>本次诊断已临时共享至 {formatTimestamp(shareExpiresAt)}</span><button type="button" disabled={shareBusy} onClick={() => void revokeDiagnosticShare()}>提前撤销</button></> : <button type="button" onClick={() => setShareConfirmOpen(true)}>共享本次诊断</button>}
+        {shareConfirmOpen && <div className="diagnostic-share-confirm" role="alertdialog" aria-label="确认共享本次诊断"><strong>向管理员共享 24 小时？</strong><p>仅共享这条问题、改写、执行计划与回答；不会共享长期记忆或其他会话。</p><div><button type="button" disabled={shareBusy} onClick={() => setShareConfirmOpen(false)}>取消</button><button type="button" disabled={shareBusy} onClick={() => void shareDiagnostic()}>{shareBusy ? "正在授权…" : "确认共享"}</button></div></div>}
+      </section>}
     </div>
   );
 }
@@ -1505,8 +1616,8 @@ function ProductionComposer({
   sending,
   disabled,
   organizationUnits,
-  selectedOrganizationId,
-  setSelectedOrganizationId,
+  organizationScope,
+  setOrganizationScope,
   onKeyDown,
   onSubmit,
 }: {
@@ -1517,8 +1628,8 @@ function ProductionComposer({
   sending: boolean;
   disabled: boolean;
   organizationUnits: OrganizationUnit[];
-  selectedOrganizationId: string;
-  setSelectedOrganizationId: (value: string) => void;
+  organizationScope: OrganizationScope;
+  setOrganizationScope: (value: OrganizationScope) => void;
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmit: (event: FormEvent) => void;
 }) {
@@ -1529,7 +1640,7 @@ function ProductionComposer({
       <textarea id={id} rows={2} maxLength={COMPOSER_MAX_LENGTH} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} placeholder={c.placeholder} disabled={disabled} />
       <div className="composer-footer">
         <div className="composer-tools">
-          <OrganizationPicker language={language} units={organizationUnits} value={selectedOrganizationId} onChange={setSelectedOrganizationId} disabled={!organizationUnits.length} />
+          <OrganizationPicker language={language} units={organizationUnits} value={organizationScope} onChange={setOrganizationScope} disabled={!organizationUnits.length} />
         </div>
         <div className="composer-send">
           {draft.length >= COMPOSER_HINT_THRESHOLD && <span className="composer-character-count">{language === "en" ? `${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString("en")} characters remaining` : `还可输入 ${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString(language)} 字`}</span>}
@@ -1549,40 +1660,81 @@ function OrganizationPicker({
 }: {
   language: UiLanguage;
   units: OrganizationUnit[];
-  value: string;
-  onChange: (value: string) => void;
+  value: OrganizationScope;
+  onChange: (value: OrganizationScope) => void;
   disabled: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [draftScope, setDraftScope] = useState<OrganizationScope>(value);
   const rootRef = useRef<HTMLDivElement>(null);
   const c = copy[language];
-  const label = value === ALL_SCOPE_ID ? c.scope : units.find((unit) => unit.id === value)?.name ?? c.scope;
+  const label = scopeLabel(value, units, language);
   const filtered = units.filter((unit) => unit.name.toLowerCase().includes(query.trim().toLowerCase()));
+  const selectedIds = new Set(draftScope.mode === "selected" ? draftScope.organization_unit_ids : units.map((unit) => unit.id));
+  const selectedCount = draftScope.mode === "all_authorized" ? units.length : draftScope.organization_unit_ids.length;
+
+  const closeWithoutApplying = useCallback(() => {
+    setDraftScope(value);
+    setQuery("");
+    setOpen(false);
+  }, [value]);
+
+  function toggleOpen() {
+    if (open) {
+      closeWithoutApplying();
+      return;
+    }
+    setDraftScope({ mode: value.mode, organization_unit_ids: [...value.organization_unit_ids] });
+    setOpen(true);
+  }
+
+  function toggleUnit(unitId: string) {
+    if (draftScope.mode === "all_authorized") {
+      setDraftScope({ mode: "selected", organization_unit_ids: [unitId] });
+      return;
+    }
+    const current = draftScope.organization_unit_ids;
+    const next = current.includes(unitId)
+      ? current.filter((id) => id !== unitId)
+      : [...current, unitId];
+    if (next.length === units.length) {
+      setDraftScope(ALL_ORGANIZATIONS_SCOPE);
+    } else {
+      setDraftScope({ mode: "selected", organization_unit_ids: next });
+    }
+  }
+
+  function apply() {
+    if (selectedCount < 1) return;
+    onChange({ mode: draftScope.mode, organization_unit_ids: [...draftScope.organization_unit_ids] });
+    setQuery("");
+    setOpen(false);
+  }
 
   useEffect(() => {
     if (!open) return;
     const close = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      if (!rootRef.current?.contains(event.target as Node)) closeWithoutApplying();
     };
-    const escape = (event: globalThis.KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    const escape = (event: globalThis.KeyboardEvent) => { if (event.key === "Escape") closeWithoutApplying(); };
     window.addEventListener("pointerdown", close);
     window.addEventListener("keydown", escape);
     return () => { window.removeEventListener("pointerdown", close); window.removeEventListener("keydown", escape); };
-  }, [open]);
+  }, [closeWithoutApplying, open]);
 
   return (
     <div ref={rootRef} className="organization-picker">
-      <button type="button" className="composer-tool-button scope" disabled={disabled} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((current) => !current)}><UiIcon name="organization" /><span>{label}</span><span className="organization-picker-chevron" aria-hidden="true">⌄</span></button>
+      <button type="button" className="composer-tool-button scope" disabled={disabled} aria-haspopup="dialog" aria-expanded={open} aria-label={`${label}，选择经营数据范围`} title={draftScope.mode === "selected" ? draftScope.organization_unit_ids.map((id) => units.find((unit) => unit.id === id)?.name).filter(Boolean).join("、") : c.scope} onClick={toggleOpen}><UiIcon name="organization" /><span>{label}</span><span className="organization-picker-chevron" aria-hidden="true">⌄</span></button>
       {open && <div className="organization-popover">
         <header><strong>{language === "en" ? "Business unit scope" : "选择事业部"}</strong></header>
         {units.length > 5 && <label className="organization-search"><UiIcon name="search" /><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={language === "en" ? "Search business units" : "搜索事业部"} autoFocus /></label>}
-        <div className="organization-options" role="listbox" aria-label="可分析事业部">
-          <button type="button" role="option" aria-selected={value === ALL_SCOPE_ID} className={value === ALL_SCOPE_ID ? "selected" : ""} onClick={() => { onChange(ALL_SCOPE_ID); setOpen(false); }}><span className="organization-check">{value === ALL_SCOPE_ID ? "✓" : ""}</span><span>{c.scope}</span><UiIcon name="organization" /></button>
-          {filtered.map((unit) => <button type="button" role="option" aria-selected={value === unit.id} className={value === unit.id ? "selected" : ""} key={unit.id} onClick={() => { onChange(unit.id); setOpen(false); }}><span className="organization-check">{value === unit.id ? "✓" : ""}</span><span>{unit.name}</span><UiIcon name="organization" /></button>)}
+        <div className="organization-options" role="listbox" aria-multiselectable="true" aria-label="可分析事业部">
+          <button type="button" role="option" aria-selected={draftScope.mode === "all_authorized"} className={draftScope.mode === "all_authorized" ? "selected" : ""} onClick={() => setDraftScope(ALL_ORGANIZATIONS_SCOPE)}><span className="organization-check">{draftScope.mode === "all_authorized" ? "✓" : ""}</span><span>{c.scope}</span><UiIcon name="organization" /></button>
+          {filtered.map((unit) => <button type="button" role="option" aria-selected={draftScope.mode === "selected" && selectedIds.has(unit.id)} className={selectedIds.has(unit.id) && draftScope.mode === "selected" ? "selected" : ""} key={unit.id} onClick={() => toggleUnit(unit.id)}><span className="organization-check">{selectedIds.has(unit.id) && draftScope.mode === "selected" ? "✓" : ""}</span><span>{unit.name}</span><UiIcon name="organization" /></button>)}
           {!filtered.length && <p className="organization-empty">没有匹配的事业部</p>}
         </div>
-        <footer><small>可选范围由企业管理员配置</small><span>{units.length} 个可分析事业部</span></footer>
+        <footer><small>可选范围由企业管理员配置</small><span>{selectedCount} / {units.length} 已选</span><button type="button" className="organization-apply" disabled={selectedCount < 1} onClick={apply}>{language === "en" ? "Apply" : "应用"}</button></footer>
       </div>}
     </div>
   );
@@ -1890,7 +2042,7 @@ function PreferencesWindow({
   setTheme: (theme: ThemePreference) => void;
   language: UiLanguage;
   profilePreferences: ProfilePreferences;
-  setProfilePreferences: (value: ProfilePreferences) => void;
+  setProfilePreferences: (value: ProfilePreferences) => Promise<boolean>;
   memoryEnabled: boolean;
   setMemoryEnabled: (value: boolean) => void;
   memories: Memory[];
@@ -1902,6 +2054,9 @@ function PreferencesWindow({
   const [editing, setEditing] = useState(false);
   const [salutation, setSalutation] = useState(profilePreferences.salutation);
   const [amountUnit, setAmountUnit] = useState(profilePreferences.amountUnit);
+  const [responseStyle, setResponseStyle] = useState(profilePreferences.responseStyle);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileError, setProfileError] = useState("");
   const labels = language === "en"
     ? { title: "Personal settings", back: "Back to workspace", profile: "Profile", appearance: "Appearance", memory: "Long-term memory", close: "Close" }
     : language === "zh-TW"
@@ -1935,10 +2090,14 @@ function PreferencesWindow({
     };
   }, [onClose]);
 
-  function savePreferences(event: FormEvent) {
+  async function savePreferences(event: FormEvent) {
     event.preventDefault();
-    setProfilePreferences({ salutation: salutation.trim() || "董事长", amountUnit });
-    setEditing(false);
+    setProfileSaving(true);
+    setProfileError("");
+    const saved = await setProfilePreferences({ salutation: salutation.trim() || "董事长", amountUnit, responseStyle });
+    setProfileSaving(false);
+    if (saved) setEditing(false);
+    else setProfileError("暂时无法保存，请稍后重试。");
   }
 
   return (
@@ -1960,10 +2119,10 @@ function PreferencesWindow({
           <header className="preferences-main-header"><div><small>{labels.title}</small><strong>{view === "profile" ? labels.profile : view === "appearance" ? labels.appearance : labels.memory}</strong></div><button type="button" onClick={onClose} aria-label={labels.close}>×</button></header>
 
           {view === "profile" && <div className="profile-settings-pane production-profile-pane">
-            <section className="profile-hero"><span className="profile-hero-avatar" aria-hidden="true">{initials}</span><div><h1>{preferredDisplayName(me)}</h1><p>{profilePreferences.salutation} · {selectedScopeLabel}</p><small>{me.user.email}</small></div>{!editing && <button type="button" className="profile-edit-button" onClick={() => { setSalutation(profilePreferences.salutation); setAmountUnit(profilePreferences.amountUnit); setEditing(true); }}><UiIcon name="edit" />编辑服务偏好</button>}</section>
-            <section className="profile-summary-rail" aria-label="账号摘要"><div><small>专属称呼</small><strong>{profilePreferences.salutation}</strong><span>用于首页问候</span></div><div><small>可分析事业部</small><strong>{organizationUnits.length} 个</strong><span>由服务端授权决定</span></div><div><small>默认金额单位</small><strong>{profilePreferences.amountUnit}</strong><span>用于界面表达偏好</span></div></section>
-            {editing ? <form className="profile-edit-form" onSubmit={savePreferences}><div className="profile-section-title"><span>编辑服务偏好</span><small>不会改变账号和数据权限</small></div><div className="profile-form-grid"><label><span>专属称呼</span><input value={salutation} maxLength={24} onChange={(event) => setSalutation(event.target.value)} placeholder="例如：张总、Ryan" autoFocus /></label><label><span>默认金额单位</span><select value={amountUnit} onChange={(event) => setAmountUnit(event.target.value)}><option>万元</option><option>亿元</option><option>元</option></select></label></div><div className="profile-form-actions"><button type="button" onClick={() => setEditing(false)}>取消</button><button type="submit">保存偏好</button></div></form> : <div className="profile-detail-grid"><section><div className="profile-section-title"><span>服务偏好</span><small>只影响界面表达</small></div><dl><div><dt>问候预览</dt><dd>早上好，{profilePreferences.salutation}</dd></div><div><dt>回答原则</dt><dd>先给结论，再展开依据</dd></div><div><dt>金额表达</dt><dd>{profilePreferences.amountUnit}</dd></div></dl></section><section><div className="profile-section-title"><span>账号与安全</span><small>正式身份信息</small></div><dl><div><dt>登录邮箱</dt><dd>{me.user.email}</dd></div><div><dt>角色</dt><dd>{me.user.role}</dd></div><div><dt>账号状态</dt><dd><span className="profile-status-dot" />正常</dd></div></dl></section></div>}
-            <p className="production-profile-note">显示名称与登录邮箱属于正式身份信息，由企业管理员维护；这里不会用浏览器数据覆盖。</p>
+            <section className="profile-hero"><span className="profile-hero-avatar" aria-hidden="true">{initials}</span><div><h1>{preferredDisplayName(me)}</h1><p>{profilePreferences.salutation} · {selectedScopeLabel}</p><small>{me.user.email}</small></div>{!editing && <button type="button" className="profile-edit-button" onClick={() => { setSalutation(profilePreferences.salutation); setAmountUnit(profilePreferences.amountUnit); setResponseStyle(profilePreferences.responseStyle); setEditing(true); }}><UiIcon name="edit" />编辑服务偏好</button>}</section>
+            <section className="profile-summary-rail" aria-label="账号摘要"><div><small>专属称呼</small><strong>{profilePreferences.salutation}</strong><span>用于首页问候</span></div><div><small>可分析事业部</small><strong>{organizationUnits.length} 个</strong><span>由服务端授权决定</span></div><div><small>默认金额单位</small><strong>{profilePreferences.amountUnit === "yi" ? "亿元" : profilePreferences.amountUnit === "yuan" ? "元" : "万元"}</strong><span>用于回答表达</span></div></section>
+            {editing ? <form className="profile-edit-form" onSubmit={(event) => void savePreferences(event)}><div className="profile-section-title"><span>编辑服务偏好</span><small>加密保存在您的个人配置中</small></div><div className="profile-form-grid"><label><span>专属称呼</span><input value={salutation} maxLength={24} onChange={(event) => setSalutation(event.target.value)} placeholder="例如：张总、Ryan" autoFocus /></label><label><span>默认金额单位</span><select value={amountUnit} onChange={(event) => setAmountUnit(event.target.value as ProfilePreferences["amountUnit"])}><option value="wan">万元</option><option value="yi">亿元</option><option value="yuan">元</option></select></label><label><span>回答风格</span><select value={responseStyle} onChange={(event) => setResponseStyle(event.target.value as ProfilePreferences["responseStyle"])}><option value="concise">简洁</option><option value="balanced">均衡</option><option value="detailed">详细</option></select></label></div>{profileError && <p className="anspire-error" role="alert">{profileError}</p>}<div className="profile-form-actions"><button type="button" disabled={profileSaving} onClick={() => setEditing(false)}>取消</button><button type="submit" disabled={profileSaving}>{profileSaving ? "正在保存…" : "保存偏好"}</button></div></form> : <div className="profile-detail-grid"><section><div className="profile-section-title"><span>服务偏好</span><small>仅您本人可读写</small></div><dl><div><dt>问候预览</dt><dd>早上好，{profilePreferences.salutation}</dd></div><div><dt>回答风格</dt><dd>{profilePreferences.responseStyle === "concise" ? "简洁" : profilePreferences.responseStyle === "detailed" ? "详细" : "均衡"}</dd></div><div><dt>金额表达</dt><dd>{profilePreferences.amountUnit === "yi" ? "亿元" : profilePreferences.amountUnit === "yuan" ? "元" : "万元"}</dd></div></dl></section><section><div className="profile-section-title"><span>账号与安全</span><small>正式身份信息</small></div><dl><div><dt>登录邮箱</dt><dd>{me.user.email}</dd></div><div><dt>角色</dt><dd>{me.user.role}</dd></div><div><dt>账号状态</dt><dd><span className="profile-status-dot" />正常</dd></div></dl></section></div>}
+            <p className="production-profile-note">称呼、金额单位与回答偏好已迁移至服务端加密个人配置；企业管理员无法读取其正文。</p>
           </div>}
 
           {view === "appearance" && <div className="appearance-settings-pane"><header><p className="eyebrow">界面显示</p><h1>选择适合您的外观</h1><p>外观偏好只保存在当前设备，不影响会话、数据或长期记忆。</p></header><div className="appearance-options" role="radiogroup" aria-label="外观模式">{([

@@ -114,3 +114,33 @@ test("management exposes a restrained MCP registry instead of arbitrary executio
   assert.match(types, /planner_enabled/);
   assert.doesNotMatch(admin, /SQL 编辑器|脚本编辑器|自定义工具 URL/);
 });
+
+test("phase three workspace uses scoped multi-organization chat without legacy empty-state copy", async () => {
+  const workspace = await read("../app/production/production-workspace.tsx");
+  const services = await read("../app/production/services.ts");
+  const types = await read("../app/production/types.ts");
+
+  assert.match(types, /mode: "all_authorized" \| "selected"/);
+  assert.match(services, /organization_scope: organizationScope/);
+  assert.match(workspace, /function OrganizationPicker/);
+  assert.match(workspace, /function apply\(\)/);
+  assert.match(workspace, /organization-apply/);
+  assert.match(workspace, /scope-change-divider/);
+  assert.match(workspace, /workspace-topbar-date/);
+  assert.doesNotMatch(workspace, /今天需要我先看什么？|今天需要我先看什麼？|从一个问题开始|從一個問題開始/);
+});
+
+test("phase three management exposes versioned harness configuration and redacted traces", async () => {
+  const admin = await read("../app/production/production-admin.tsx");
+  const services = await read("../app/production/services.ts");
+
+  assert.match(admin, /编排策略/);
+  assert.match(admin, /安全内核/);
+  assert.match(admin, /快速规则/);
+  assert.match(admin, /消息任务/);
+  assert.match(admin, /恢复会生成一个新的当前版本/);
+  assert.match(services, /\/admin\/harness\/config/);
+  assert.match(services, /\/admin\/harness\/simulate/);
+  assert.match(services, /\/admin\/harness\/traces/);
+  assert.doesNotMatch(admin, /type="url"|placeholder="SQL"|<textarea[^>]*aria-label="脚本/);
+});

@@ -12,7 +12,7 @@ from ..errors import AppError
 from ..storage import LocalEncryptedStorage
 
 router = APIRouter(tags=["health"])
-EXPECTED_DATABASE_REVISION = "d4a91f7c2e10"
+EXPECTED_DATABASE_REVISION = "f31a6d902b47"
 
 
 @router.get("/health/live", include_in_schema=False)

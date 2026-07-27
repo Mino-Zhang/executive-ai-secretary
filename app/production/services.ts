@@ -6,6 +6,13 @@ import type {
   ConversationMessage,
   CursorPage,
   DataCapabilities,
+  ExecutivePersonalProfile,
+  HarnessBusinessConfig,
+  HarnessConfig,
+  HarnessMetrics,
+  HarnessSimulation,
+  HarnessTrace,
+  HarnessVersion,
   Job,
   Memory,
   McpTool,
@@ -14,6 +21,7 @@ import type {
   ModelProviderConfig,
   ModelProviderTest,
   OrganizationUnit,
+  OrganizationScope,
   ProductionBootstrap,
   Project,
   Report,
@@ -71,6 +79,15 @@ export function createProductionServices(client: ApiClient = apiClient) {
         body: { memory_enabled: memoryEnabled },
       });
     },
+    async personalProfile() {
+      return client.request<ExecutivePersonalProfile>("/auth/personal-profile");
+    },
+    async updatePersonalProfile(values: Omit<ExecutivePersonalProfile, "version" | "updated_at">) {
+      return client.request<ExecutivePersonalProfile>("/auth/personal-profile", {
+        method: "PUT",
+        body: values,
+      });
+    },
   };
 
   const organizations = {
@@ -97,10 +114,10 @@ export function createProductionServices(client: ApiClient = apiClient) {
     async get(id: string) {
       return client.request<Conversation>(`/conversations/${encodeURIComponent(id)}`);
     },
-    async create(values: { title?: string; organization_unit_id?: string; project_id?: string }) {
+    async create(values: { title?: string; organization_scope?: OrganizationScope; project_id?: string }) {
       return client.request<Conversation>("/conversations", { method: "POST", headers: idempotencyHeaders(), body: values });
     },
-    async update(id: string, values: { title?: string; organization_unit_id?: string | null; status?: "active" | "archived" }) {
+    async update(id: string, values: { title?: string; organization_scope?: OrganizationScope; status?: "active" | "archived" }) {
       return client.request<Conversation>(`/conversations/${encodeURIComponent(id)}`, { method: "PATCH", body: values });
     },
     async archive(id: string) {
@@ -116,10 +133,10 @@ export function createProductionServices(client: ApiClient = apiClient) {
         `/conversations/${encodeURIComponent(id)}/messages${queryString({ after_sequence: cursor })}`,
       );
     },
-    async sendMessage(id: string, content: string) {
+    async sendMessage(id: string, content: string, organizationScope: OrganizationScope) {
       return client.request<ConversationMessage>(
         `/conversations/${encodeURIComponent(id)}/messages`,
-        { method: "POST", headers: idempotencyHeaders(), body: { content, file_ids: [] } },
+        { method: "POST", headers: idempotencyHeaders(), body: { content, file_ids: [], organization_scope: organizationScope } },
       );
     },
     async evidence(id: string, messageId: string) {
@@ -131,6 +148,18 @@ export function createProductionServices(client: ApiClient = apiClient) {
       return client.request(
         `/conversations/${encodeURIComponent(id)}/clarifications/${encodeURIComponent(clarificationId)}`,
         { method: "POST", body: { value } },
+      );
+    },
+    async shareDiagnostic(id: string, messageId: string) {
+      return client.request<{ message_id: string; expires_at: string; revoked_at: string | null }>(
+        `/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/diagnostic-share`,
+        { method: "POST" },
+      );
+    },
+    async revokeDiagnosticShare(id: string, messageId: string) {
+      return client.request<void>(
+        `/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/diagnostic-share`,
+        { method: "DELETE" },
       );
     },
     streamUrl(id: string, afterSequence: number) {
@@ -244,7 +273,40 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
   };
 
-  return { auth, organizations, conversations, projects, memories, reports, jobs, data, adminModels, adminMcp };
+  const adminHarness = {
+    async get() {
+      return client.request<HarnessConfig>("/admin/harness/config");
+    },
+    async update(baseVersion: number, config: HarnessBusinessConfig) {
+      return client.request<HarnessConfig>("/admin/harness/config", {
+        method: "PATCH",
+        body: { base_version: baseVersion, config },
+      });
+    },
+    async versions() {
+      return client.request<HarnessVersion[]>("/admin/harness/versions");
+    },
+    async restore(versionId: string) {
+      return client.request<HarnessConfig>(`/admin/harness/versions/${encodeURIComponent(versionId)}/restore`, { method: "POST" });
+    },
+    async simulate(question: string, config: HarnessBusinessConfig, organizationScope?: OrganizationScope) {
+      return client.request<HarnessSimulation>("/admin/harness/simulate", {
+        method: "POST",
+        body: { question, config, organization_scope: organizationScope },
+      });
+    },
+    async metrics(days = 30) {
+      return client.request<HarnessMetrics>(`/admin/harness/metrics${queryString({ days: String(days) })}`);
+    },
+    async traces() {
+      return client.request<HarnessTrace[]>("/admin/harness/traces");
+    },
+    async trace(messageId: string) {
+      return client.request<HarnessTrace>(`/admin/harness/traces/${encodeURIComponent(messageId)}`);
+    },
+  };
+
+  return { auth, organizations, conversations, projects, memories, reports, jobs, data, adminModels, adminHarness, adminMcp };
 }
 
 export type ProductionServices = ReturnType<typeof createProductionServices>;
@@ -265,6 +327,7 @@ export async function loadProductionBootstrap(
       reports: [],
       jobs: [],
       dataCapabilities: null,
+      personalProfile: null,
       optionalErrors: {},
     };
   }
@@ -281,6 +344,7 @@ export async function loadProductionBootstrap(
       reports: [],
       jobs: [],
       dataCapabilities: null,
+      personalProfile: null,
       optionalErrors: {},
     };
   }
@@ -296,10 +360,11 @@ export async function loadProductionBootstrap(
     services.reports.list(),
     services.jobs.list(),
     services.data.capabilities(),
+    services.auth.personalProfile(),
   ] as const);
   const optionalErrors: ProductionBootstrap["optionalErrors"] = {};
   const authorizedOrganizationIds = new Set(me.scopes.map((scope) => scope.id));
-  const optionalKeys = ["memories", "reports", "jobs", "dataCapabilities"] as const;
+  const optionalKeys = ["memories", "reports", "jobs", "dataCapabilities", "personalProfile"] as const;
   optional.forEach((result, index) => {
     if (result.status === "rejected") {
       optionalErrors[optionalKeys[index]] = humanizeApiError(result.reason);
@@ -317,6 +382,7 @@ export async function loadProductionBootstrap(
     reports: optional[1].status === "fulfilled" ? optional[1].value.items : [],
     jobs: optional[2].status === "fulfilled" ? optional[2].value.items : [],
     dataCapabilities: optional[3].status === "fulfilled" ? optional[3].value : null,
+    personalProfile: optional[4].status === "fulfilled" ? optional[4].value : null,
     optionalErrors,
   };
 }

@@ -14,13 +14,25 @@ from ..authz import (
     accessible_organization_unit_ids,
     get_authenticated_principal,
     get_current_principal,
+    get_executive_principal,
 )
 from ..config import Settings, get_settings
 from ..database import get_db
 from ..errors import AppError
-from ..models import Enterprise, OrganizationUnit, User, UserCredential, UserSession
+from ..models import (
+    Enterprise,
+    ExecutivePersonalProfile,
+    OrganizationUnit,
+    User,
+    UserCredential,
+    UserSession,
+    new_uuid,
+)
+from ..personal_data import decrypt_profile_payload, encrypt_profile_payload
 from ..schemas import (
     ChangePasswordRequest,
+    ExecutivePersonalProfileOut,
+    ExecutivePersonalProfileUpdate,
     LoginRequest,
     LoginResponse,
     MeResponse,
@@ -43,6 +55,29 @@ from ..security import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _default_personal_profile(user: User) -> dict[str, object]:
+    return {
+        "salutation": user.preferred_name or user.display_name or "董事长",
+        "amount_unit": "wan",
+        "response_style": "balanced",
+        "locale": user.locale if user.locale in {"zh-CN", "zh-TW", "en-US"} else "zh-CN",
+        "memory_enabled": user.memory_enabled,
+    }
+
+
+def _personal_profile_out(
+    row: ExecutivePersonalProfile | None,
+    user: User,
+    settings: Settings,
+) -> ExecutivePersonalProfileOut:
+    payload = decrypt_profile_payload(row, settings) if row else _default_personal_profile(user)
+    return ExecutivePersonalProfileOut(
+        **payload,
+        version=row.version if row else 0,
+        updated_at=row.updated_at if row else None,
+    )
 
 
 def set_auth_cookies(
@@ -245,6 +280,73 @@ def update_preferences(
     db.commit()
     db.refresh(principal.user)
     return UserOut.model_validate(principal.user)
+
+
+@router.get("/personal-profile", response_model=ExecutivePersonalProfileOut)
+def get_personal_profile(
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ExecutivePersonalProfileOut:
+    row = db.scalar(
+        select(ExecutivePersonalProfile).where(
+            ExecutivePersonalProfile.user_id == principal.user.id,
+            ExecutivePersonalProfile.enterprise_id == principal.enterprise_id,
+        )
+    )
+    return _personal_profile_out(row, principal.user, settings)
+
+
+@router.put("/personal-profile", response_model=ExecutivePersonalProfileOut)
+def update_personal_profile(
+    payload: ExecutivePersonalProfileUpdate,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ExecutivePersonalProfileOut:
+    row = db.scalar(
+        select(ExecutivePersonalProfile)
+        .where(
+            ExecutivePersonalProfile.user_id == principal.user.id,
+            ExecutivePersonalProfile.enterprise_id == principal.enterprise_id,
+        )
+        .with_for_update()
+    )
+    if row is None:
+        row = ExecutivePersonalProfile(
+            id=new_uuid(),
+            enterprise_id=principal.enterprise_id,
+            user_id=principal.user.id,
+            profile_ciphertext="",
+            profile_nonce="",
+            encryption_key_version=settings.integration_encryption_key_version,
+            version=1,
+        )
+        db.add(row)
+    else:
+        row.version += 1
+    values = payload.model_dump()
+    encrypt_profile_payload(values, profile=row, settings=settings)
+    principal.user.memory_enabled = payload.memory_enabled
+    principal.user.locale = payload.locale
+    record_audit(
+        db,
+        request,
+        "auth.personal_profile_updated",
+        actor=principal.user,
+        session=principal.session,
+        target_type="executive_personal_profile",
+        target_id=row.id,
+        metadata={
+            "version": row.version,
+            "locale": payload.locale,
+            "memory_enabled": payload.memory_enabled,
+        },
+    )
+    db.commit()
+    db.refresh(row)
+    return _personal_profile_out(row, principal.user, settings)
 
 
 @router.post("/change-password", response_model=LoginResponse)
