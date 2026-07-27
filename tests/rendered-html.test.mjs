@@ -23,7 +23,7 @@ async function render() {
   );
 }
 
-test("server-renders the protected executive assistant entry", async () => {
+test("server-renders the configured executive assistant entry", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -31,25 +31,32 @@ test("server-renders the protected executive assistant entry", async () => {
   const html = await response.text();
   assert.match(html, /<html lang="zh-CN">/i);
   assert.match(html, /<title>董事长 AI 秘书 \| 经营决策工作台<\/title>/i);
-  assert.match(html, /先核对范围，再回答经营问题/);
-  assert.match(html, /高层端/);
-  assert.match(html, /管理端/);
-  assert.match(html, /企业数字有来源、有时间、有口径/);
-  assert.match(html, /当前原型全部经营数据均为演示样本/);
+  if (/data-app-mode="production"/.test(html)) {
+    assert.match(html, /本机生产环境/);
+    assert.match(html, /可信经营服务正在准备/);
+    assert.match(html, /生产模式只读取已授权的企业数据/);
+    assert.match(html, /正在验证安全会话/);
+    assert.doesNotMatch(html, /当前原型全部经营数据均为演示样本/);
+  } else {
+    assert.match(html, /先核对范围，再回答经营问题/);
+    assert.match(html, /高层端/);
+    assert.match(html, /管理端/);
+    assert.match(html, /企业数字有来源、有时间、有口径/);
+    assert.match(html, /当前原型全部经营数据均为演示样本/);
+  }
   assert.doesNotMatch(html, /今日经营变化/);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/i);
 });
 
 test("includes accessible controls for login and first-use security", async () => {
-  const response = await render();
-  const html = await response.text();
+  const productionApp = await readFile(new URL("../app/production/production-app.tsx", import.meta.url), "utf8");
 
-  assert.match(html, /href="#login-form"/);
-  assert.match(html, /id="login-form"/);
-  assert.match(html, /autoComplete="username"/);
-  assert.match(html, /autoComplete="current-password"/);
-  assert.match(html, /type="password"/);
-  assert.match(html, /联系企业管理员/);
+  assert.match(productionApp, /href="#production-login-form"/);
+  assert.match(productionApp, /id="production-login-form"/);
+  assert.match(productionApp, /autoComplete="username"/);
+  assert.match(productionApp, /autoComplete="current-password"/);
+  assert.match(productionApp, /type=\{showPassword \? "text" : "password"\}/);
+  assert.match(productionApp, /联系企业管理员/);
 });
 
 test("prototype source contains the required functional contracts", async () => {

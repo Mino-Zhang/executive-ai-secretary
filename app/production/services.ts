@@ -71,9 +71,16 @@ export function createProductionServices(client: ApiClient = apiClient) {
   };
 
   const conversations = {
-    async list(cursor?: string | null) {
+    async list(
+      cursor?: string | null,
+      options: { projectId?: string | null; includeArchived?: boolean } = {},
+    ) {
       return client.request<CursorPage<Conversation>>(
-        `/conversations${queryString({ cursor })}`,
+        `/conversations${queryString({
+          cursor,
+          project_id: options.projectId,
+          include_archived: options.includeArchived,
+        })}`,
       );
     },
     async get(id: string) {
@@ -87,6 +94,11 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
     async archive(id: string) {
       return client.request<void>(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
+    },
+    async setPinned(id: string, pinned: boolean) {
+      return client.request<Conversation>(`/conversations/${encodeURIComponent(id)}/pin`, {
+        method: pinned ? "POST" : "DELETE",
+      });
     },
     async messages(id: string, cursor?: string | null) {
       return client.request<CursorPage<ConversationMessage>>(

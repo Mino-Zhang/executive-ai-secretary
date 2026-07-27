@@ -23,16 +23,19 @@ test("demo and production use physically separate route entrypoints", async () =
 
 test("production application has no fixture dependency or demo credential", async () => {
   const productionApp = await read("../app/production/production-app.tsx");
+  const productionWorkspace = await read("../app/production/production-workspace.tsx");
+  const productionSource = `${productionApp}\n${productionWorkspace}`;
   const types = await read("../app/production/types.ts");
-  assert.doesNotMatch(productionApp, /prototype-data|initialConversations|organizationCatalog|Demo@2026|Admin@2026/);
-  assert.match(productionApp, /生产模式不会使用演示数据/);
-  assert.match(productionApp, /尚未配置可分析事业部/);
-  assert.match(productionApp, /organizationUnits\.map/);
-  assert.match(productionApp, /脱敏演示环境/);
-  assert.match(productionApp, /data-app-environment/);
-  assert.match(productionApp, /report\.status === "published"/);
-  assert.match(productionApp, /正在等待真实处理结果/);
-  assert.match(productionApp, /hasPendingAssistant/);
+  assert.match(productionApp, /ProductionWorkspace/);
+  assert.doesNotMatch(productionSource, /prototype-data|initialConversations|organizationCatalog|Demo@2026|Admin@2026/);
+  assert.match(productionSource, /生产模式不会使用演示数据/);
+  assert.match(productionSource, /尚未配置可分析事业部/);
+  assert.match(productionSource, /organizationUnits\.map/);
+  assert.match(productionSource, /脱敏演示环境/);
+  assert.match(productionSource, /data-app-environment/);
+  assert.match(productionSource, /report\.status === "published"/);
+  assert.match(productionSource, /正在等待真实处理结果/);
+  assert.match(productionSource, /hasPendingAssistant/);
   assert.match(types, /app_env: AppEnvironment/);
   assert.match(types, /app_mode: BackendAppMode/);
 });
