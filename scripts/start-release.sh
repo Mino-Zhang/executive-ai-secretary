@@ -32,6 +32,7 @@ require_digest_image() {
 require_digest_image WEB_IMAGE "${WEB_IMAGE:-}"
 require_digest_image API_IMAGE "${API_IMAGE:-}"
 require_digest_image WORKER_IMAGE "${WORKER_IMAGE:-}"
+require_digest_image HERMES_IMAGE "${HERMES_IMAGE:-}"
 require_digest_image POSTGRES_IMAGE "${POSTGRES_IMAGE:-}"
 require_digest_image NGINX_IMAGE "${NGINX_IMAGE:-}"
 require_digest_image FILE_TOOL_IMAGE "${FILE_TOOL_IMAGE:-}"
@@ -44,14 +45,14 @@ release_signature_bundle_file="${RELEASE_BUNDLE_SIGSTORE_FILE:-${runtime_dir}/re
   "${release_signature_bundle_file}"
 
 info "Pulling immutable reviewed images; no local source build is allowed..."
-compose "${environment}" pull postgres db-role-init migrate db-permissions api worker web nginx
+compose "${environment}" pull postgres db-role-init migrate db-permissions api worker ingestion-worker embedding-cache-init embedding-model-init file-worker scheduler mcp-hub hermes-runtime web nginx
 compose "${environment}" --profile tools pull db-backup-tool file-tool
 compose "${environment}" up --detach --wait --no-build postgres
-for one_shot in db-role-init migrate db-permissions; do
+for one_shot in db-role-init migrate db-permissions embedding-cache-init embedding-model-init; do
   compose "${environment}" up --no-deps --force-recreate --no-build \
     --abort-on-container-exit --exit-code-from "${one_shot}" "${one_shot}"
 done
-compose "${environment}" up --detach --no-build --remove-orphans api worker web nginx
+compose "${environment}" up --detach --no-build --remove-orphans api mcp-hub hermes-runtime worker ingestion-worker file-worker scheduler web nginx
 compose "${environment}" ps
 "${SCRIPT_DIR}/smoke-test.sh" "${environment}"
 info "Release environment started from signed digest-pinned images at ${PUBLIC_BASE_URL}."

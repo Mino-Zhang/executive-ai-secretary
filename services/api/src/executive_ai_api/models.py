@@ -4,6 +4,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -304,6 +306,55 @@ class FileEvent(UUIDMixin, Base):
     )
 
 
+class FileExtraction(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "file_extractions"
+    __table_args__ = (
+        UniqueConstraint("file_id", name="uq_file_extraction_file"),
+        Index("ix_file_extraction_status", "status", "updated_at"),
+    )
+
+    file_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    parser_name: Mapped[str | None] = mapped_column(String(80))
+    parser_version: Mapped[str | None] = mapped_column(String(40))
+    page_count: Mapped[int | None] = mapped_column(Integer)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    character_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+
+
+class FileChunk(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "file_chunks"
+    __table_args__ = (
+        UniqueConstraint("extraction_id", "chunk_index", name="uq_file_chunk_index"),
+        Index("ix_file_chunk_file", "file_id", "chunk_index"),
+        Index(
+            "ix_file_chunk_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    extraction_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("file_extractions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    file_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    locator_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(512))
+
+
 class Memory(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "memories"
     __table_args__ = (Index("ix_memory_enterprise_user", "enterprise_id", "user_id"),)
@@ -475,6 +526,520 @@ class SecretReference(UUIDMixin, TimestampMixin, Base):
     key: Mapped[str] = mapped_column(String(200), nullable=False)
     provider: Mapped[str] = mapped_column(String(80), nullable=False)
     reference: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class ModelProviderConfig(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "model_provider_configs"
+    __table_args__ = (
+        UniqueConstraint("enterprise_id", name="uq_model_provider_enterprise"),
+        Index("ix_model_provider_enterprise_enabled", "enterprise_id", "is_enabled"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32), default="anspire", nullable=False)
+    endpoint_url: Mapped[str] = mapped_column(String(300), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    api_key_ciphertext: Mapped[str | None] = mapped_column(Text)
+    api_key_nonce: Mapped[str | None] = mapped_column(String(64))
+    api_key_hint: Mapped[str | None] = mapped_column(String(16))
+    encryption_key_version: Mapped[str] = mapped_column(String(64), default="v1", nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_test_status: Mapped[str | None] = mapped_column(String(32))
+    last_test_latency_ms: Mapped[int | None] = mapped_column(Integer)
+    last_test_error: Mapped[str | None] = mapped_column(Text)
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class DataSource(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "data_sources"
+    __table_args__ = (
+        UniqueConstraint("enterprise_id", "key", name="uq_data_source_enterprise_key"),
+        Index("ix_data_source_enterprise_enabled", "enterprise_id", "is_enabled"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key: Mapped[str] = mapped_column(String(100), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), default="2.0", nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    configuration_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONType, default=dict, nullable=False
+    )
+    secret_reference_key: Mapped[str | None] = mapped_column(String(200))
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_test_status: Mapped[str | None] = mapped_column(String(32))
+    last_test_error: Mapped[str | None] = mapped_column(Text)
+
+
+class ScheduledTask(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "scheduled_tasks"
+    __table_args__ = (
+        UniqueConstraint("enterprise_id", "key", name="uq_scheduled_task_enterprise_key"),
+        Index("ix_scheduled_task_due", "is_enabled", "next_run_at"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(120), nullable=False)
+    task_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    cron_expression: Mapped[str] = mapped_column(String(80), default="0 2 * * *", nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai", nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    configuration_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONType, default=dict, nullable=False
+    )
+
+
+class ScheduleRun(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "schedule_runs"
+    __table_args__ = (
+        UniqueConstraint("scheduled_task_id", "window_key", name="uq_schedule_run_window"),
+        Index("ix_schedule_run_status", "status", "created_at"),
+    )
+
+    scheduled_task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL"), index=True
+    )
+    window_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(32), default="schedule", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="enqueued", nullable=False)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class DataSyncRun(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "data_sync_runs"
+    __table_args__ = (
+        Index("ix_data_sync_enterprise_started", "enterprise_id", "started_at"),
+        Index("ix_data_sync_source_status", "data_source_id", "status"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL"), index=True
+    )
+    trigger_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    source_schema_version: Mapped[str | None] = mapped_column(String(32))
+    source_batch_id: Mapped[str | None] = mapped_column(String(160))
+    source_data_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    records_read: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    records_written: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    records_rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    domain_results_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONType, default=dict, nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class DataDomainStatus(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "data_domain_status"
+    __table_args__ = (
+        UniqueConstraint("enterprise_id", "domain", name="uq_data_domain_enterprise"),
+        Index("ix_data_domain_status_enterprise", "enterprise_id", "status"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    domain: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="never_synced", nullable=False)
+    active_sync_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="SET NULL")
+    )
+    previous_sync_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="SET NULL")
+    )
+    source_data_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    record_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class SourceCheckpoint(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "source_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("data_source_id", "domain", name="uq_source_checkpoint_domain"),
+    )
+
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    domain: Mapped[str] = mapped_column(String(40), nullable=False)
+    cursor_value: Mapped[str | None] = mapped_column(String(500))
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_batch_id: Mapped[str | None] = mapped_column(String(160))
+    checksum: Mapped[str | None] = mapped_column(String(64))
+
+
+class DimPerson(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "dim_person"
+    __table_args__ = (
+        UniqueConstraint(
+            "enterprise_id", "data_source_id", "source_record_id", name="uq_dim_person_source"
+        ),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    organization_unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="SET NULL"), index=True
+    )
+    source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    role_title: Mapped[str | None] = mapped_column(String(160))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    source_system: Mapped[str] = mapped_column(String(80), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DimCustomer(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "dim_customer"
+    __table_args__ = (
+        UniqueConstraint(
+            "enterprise_id", "data_source_id", "source_record_id", name="uq_dim_customer_source"
+        ),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    organization_unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="SET NULL"), index=True
+    )
+    owner_person_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_person.id", ondelete="SET NULL")
+    )
+    source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    industry: Mapped[str | None] = mapped_column(String(120))
+    region: Mapped[str | None] = mapped_column(String(120))
+    source_system: Mapped[str] = mapped_column(String(80), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class FactOpportunity(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "fact_opportunity"
+    __table_args__ = (
+        UniqueConstraint("sync_run_id", "source_record_id", name="uq_fact_opportunity_run_source"),
+        Index(
+            "ix_fact_opportunity_scope_current",
+            "enterprise_id",
+            "organization_unit_id",
+            "is_current",
+        ),
+        Index("ix_fact_opportunity_stage_close", "stage", "expected_close_date"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_unit_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_customer.id", ondelete="SET NULL")
+    )
+    owner_person_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_person.id", ondelete="SET NULL")
+    )
+    source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    opportunity_code: Mapped[str] = mapped_column(String(120), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    stage: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    probability: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    expected_gross_profit: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    created_date: Mapped[date] = mapped_column(Date, nullable=False)
+    expected_close_date: Mapped[date] = mapped_column(Date, nullable=False)
+    closed_date: Mapped[date | None] = mapped_column(Date)
+    source_system: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class FactDelivery(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "fact_delivery"
+    __table_args__ = (
+        UniqueConstraint("sync_run_id", "source_record_id", name="uq_fact_delivery_run_source"),
+        Index(
+            "ix_fact_delivery_scope_current", "enterprise_id", "organization_unit_id", "is_current"
+        ),
+        Index("ix_fact_delivery_risk_status", "risk_level", "status"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_unit_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_customer.id", ondelete="SET NULL")
+    )
+    manager_person_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_person.id", ondelete="SET NULL")
+    )
+    source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    opportunity_source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    project_code: Mapped[str] = mapped_column(String(120), nullable=False)
+    project_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    risk_level: Mapped[str] = mapped_column(String(40), nullable=False)
+    completion_percent: Mapped[int] = mapped_column(Integer, nullable=False)
+    contract_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    gross_margin_rate: Mapped[float] = mapped_column(Numeric(8, 4), nullable=False)
+    planned_start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    planned_end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    actual_end_date: Mapped[date | None] = mapped_column(Date)
+    current_milestone: Mapped[str | None] = mapped_column(String(200))
+    delay_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source_system: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class FactFinanceCollection(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "fact_finance_collection"
+    __table_args__ = (
+        UniqueConstraint("sync_run_id", "source_record_id", name="uq_fact_collection_run_source"),
+        Index(
+            "ix_fact_collection_scope_current",
+            "enterprise_id",
+            "organization_unit_id",
+            "is_current",
+        ),
+        Index("ix_fact_collection_due_status", "planned_collection_date", "status"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_unit_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_customer.id", ondelete="SET NULL")
+    )
+    source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    project_source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    invoice_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    receivable_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    collected_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    outstanding_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    planned_collection_date: Mapped[date] = mapped_column(Date, nullable=False)
+    actual_collection_date: Mapped[date | None] = mapped_column(Date)
+    overdue_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    aging_bucket: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_system: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class FactTarget(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "fact_target"
+    __table_args__ = (
+        UniqueConstraint("sync_run_id", "source_record_id", name="uq_fact_target_run_source"),
+        Index(
+            "ix_fact_target_scope_current", "enterprise_id", "organization_unit_id", "is_current"
+        ),
+        Index("ix_fact_target_metric_period", "metric_code", "period_start", "period_end"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_unit_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    metric_code: Mapped[str] = mapped_column(String(80), nullable=False)
+    metric_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    period_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    target_value: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    unit: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_system: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class DailySnapshot(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "daily_snapshot"
+    __table_args__ = (
+        UniqueConstraint(
+            "enterprise_id",
+            "organization_unit_id",
+            "snapshot_date",
+            name="uq_daily_snapshot_scope_date",
+        ),
+        Index("ix_daily_snapshot_enterprise_date", "enterprise_id", "snapshot_date"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization_units.id", ondelete="CASCADE"), index=True
+    )
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_data_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    metrics_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    anomalies_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONType, default=list, nullable=False
+    )
+
+
+class MessageRoute(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "message_routes"
+    __table_args__ = (UniqueConstraint("message_id", name="uq_message_route_message"),)
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    route: Mapped[str] = mapped_column(String(40), nullable=False)
+    profile: Mapped[str] = mapped_column(String(80), nullable=False)
+    confidence: Mapped[float] = mapped_column(Numeric(6, 5), nullable=False)
+    rewritten_query: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    rationale: Mapped[str | None] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(String(160))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Clarification(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "clarifications"
+    __table_args__ = (Index("ix_clarification_conversation_status", "conversation_id", "status"),)
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    options_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONType, default=list, nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    selected_value: Mapped[str | None] = mapped_column(String(500))
+    resolved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MessageEvidence(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "message_evidence"
+    __table_args__ = (
+        UniqueConstraint("message_id", "evidence_key", name="uq_message_evidence_key"),
+        Index("ix_message_evidence_message", "message_id", "created_at"),
+    )
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    evidence_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    domain: Mapped[str] = mapped_column(String(40), nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    metric_code: Mapped[str | None] = mapped_column(String(100))
+    metric_value: Mapped[float | None] = mapped_column(Numeric(24, 6))
+    metric_unit: Mapped[str | None] = mapped_column(String(40))
+    value_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    source_data_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dataset_version: Mapped[str | None] = mapped_column(String(80))
+    scope_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    query_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    row_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONType, default=list, nullable=False
+    )
 
 
 class AuditChainHead(Base):

@@ -96,7 +96,7 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: docker.io/library/postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        image: docker.io/pgvector/pgvector:0.8.5-pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0
         env:
           POSTGRES_USER: executive_ai_ci
           POSTGRES_PASSWORD: ci_ephemeral_password
@@ -172,6 +172,14 @@ jobs:
       - name: PostgreSQL worker lease concurrency test
         run: uv run --frozen --extra dev pytest -m postgres tests/test_postgres_leases.py
         working-directory: services/worker
+      - run: uv sync --frozen --extra dev
+        working-directory: services/hermes-runtime
+      - run: uv run --frozen --extra dev ruff check src tests
+        working-directory: services/hermes-runtime
+      - run: uv run --frozen --extra dev pytest
+        working-directory: services/hermes-runtime
+      - run: uv run --frozen hermes --version | grep -F '0.19.0'
+        working-directory: services/hermes-runtime
       - run: ./scripts/ci-recovery-drill.sh
       - run: ./scripts/test-infra.sh
 
@@ -323,7 +331,7 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          for component in web api worker; do
+          for component in web api worker hermes; do
             image="ghcr.io/${OWNER}/executive-ai-${component}:${VERSION}"
             if docker manifest inspect "${image}" >/dev/null 2>&1; then
               echo "Immutable image tag already exists: ${image}" >&2
@@ -378,6 +386,22 @@ jobs:
           sbom: true
           cache-from: type=gha,scope=release-worker
           cache-to: type=gha,mode=max,scope=release-worker
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build-hermes
+        with:
+          context: services/hermes-runtime
+          file: services/hermes-runtime/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-hermes:${{ needs.preflight.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-hermes
+          cache-to: type=gha,mode=max,scope=release-hermes
       - name: Sign application image digests with release identity
         shell: bash
         env:
@@ -386,13 +410,15 @@ jobs:
           WEB_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-web@${{ steps.build-web.outputs.digest }}
           API_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-api@${{ steps.build-api.outputs.digest }}
           WORKER_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-worker@${{ steps.build-worker.outputs.digest }}
+          HERMES_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-hermes@${{ steps.build-hermes.outputs.digest }}
         run: |
           set -euo pipefail
-          for component in web api worker; do
+          for component in web api worker hermes; do
             case "${component}" in
               web) image="${WEB_IMAGE}" ;;
               api) image="${API_IMAGE}" ;;
               worker) image="${WORKER_IMAGE}" ;;
+              hermes) image="${HERMES_IMAGE}" ;;
             esac
             cosign sign --yes \
               --annotations "release.version=${VERSION}" \
@@ -411,6 +437,7 @@ jobs:
           WEB_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-web@${{ steps.build-web.outputs.digest }}
           API_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-api@${{ steps.build-api.outputs.digest }}
           WORKER_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-worker@${{ steps.build-worker.outputs.digest }}
+          HERMES_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-hermes@${{ steps.build-hermes.outputs.digest }}
           POSTGRES_IMAGE: ${{ needs.preflight.outputs.postgres_image }}
           NGINX_IMAGE: ${{ needs.preflight.outputs.nginx_image }}
           FILE_TOOL_IMAGE: ${{ needs.preflight.outputs.file_tool_image }}
@@ -432,6 +459,7 @@ jobs:
             --arg web "${WEB_IMAGE}" \
             --arg api "${API_IMAGE}" \
             --arg worker "${WORKER_IMAGE}" \
+            --arg hermes "${HERMES_IMAGE}" \
             --arg postgres "${POSTGRES_IMAGE}" \
             --arg nginx "${NGINX_IMAGE}" \
             --arg fileTool "${FILE_TOOL_IMAGE}" \
@@ -452,6 +480,7 @@ jobs:
                 web: $web,
                 api: $api,
                 worker: $worker,
+                hermes: $hermes,
                 postgres: $postgres,
                 nginx: $nginx,
                 fileTool: $fileTool
@@ -470,6 +499,7 @@ jobs:
           WEB_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-web@${{ steps.build-web.outputs.digest }}
           API_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-api@${{ steps.build-api.outputs.digest }}
           WORKER_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-worker@${{ steps.build-worker.outputs.digest }}
+          HERMES_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-hermes@${{ steps.build-hermes.outputs.digest }}
           POSTGRES_IMAGE: ${{ needs.preflight.outputs.postgres_image }}
           NGINX_IMAGE: ${{ needs.preflight.outputs.nginx_image }}
           FILE_TOOL_IMAGE: ${{ needs.preflight.outputs.file_tool_image }}
@@ -497,5 +527,5 @@ jobs:
             printf -- '- Commit: `%s`\n' "${COMMIT}"
             printf -- '- Alembic head: `%s`\n' "${ALEMBIC_HEAD}"
             printf -- '- Evidence artifact: `executive-ai-release-%s-%s-%s`\n' "${VERSION}" "${COMMIT}" "${GITHUB_RUN_ID}"
-            printf '\nThe signed bundle binds all six deployment image digests.\n'
+            printf '\nThe signed bundle binds all seven deployment image digests.\n'
           } >> "${GITHUB_STEP_SUMMARY}"

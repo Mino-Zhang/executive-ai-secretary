@@ -35,7 +35,10 @@ test("production application has no fixture dependency or demo credential", asyn
   assert.match(productionSource, /data-app-environment/);
   assert.match(productionSource, /report\.status === "published"/);
   assert.match(productionSource, /正在等待真实处理结果/);
-  assert.match(productionSource, /hasPendingAssistant/);
+  assert.match(productionWorkspace, /new EventSource/);
+  assert.match(productionWorkspace, /streamUrl\(activeConversationId/);
+  assert.match(productionWorkspace, /StructuredBarChart/);
+  assert.match(productionWorkspace, /answer-structured-chart/);
   assert.match(types, /app_env: AppEnvironment/);
   assert.match(types, /app_mode: BackendAppMode/);
 });
@@ -73,4 +76,27 @@ test("production services cover phase-one user domains", async () => {
   assert.match(services, /organization_unit_id/);
   assert.match(services, /original_name|FileMetadata/);
   assert.doesNotMatch(services, /prototype-data|organizationCatalog/);
+});
+
+test("management surface exposes only the controlled Anspire model channel", async () => {
+  const application = await read("../app/production/production-app.tsx");
+  const admin = await read("../app/production/production-admin.tsx");
+  const services = await read("../app/production/services.ts");
+  const types = await read("../app/production/types.ts");
+
+  assert.match(application, /ProductionAdmin/);
+  assert.match(admin, /Anspire 单一模型通道/);
+  assert.match(admin, /open-gateway\.anspire\.ai/);
+  assert.match(admin, /modelFamilies/);
+  assert.match(admin, /optgroup/);
+  assert.match(admin, /全量模型目录/);
+  assert.match(admin, /item\.selectable/);
+  assert.match(admin, /固定|锁定/);
+  assert.match(admin, /保存配置/);
+  assert.match(admin, /测试连接/);
+  assert.match(admin, /启用 Anspire/);
+  assert.match(services, /\/admin\/model-provider/);
+  assert.match(types, /provider: "anspire"/);
+  assert.doesNotMatch(admin, /OpenAI|Anthropic|自定义接口|endpoint_url.*onChange/);
+  assert.doesNotMatch(services, /OPENAI_BASE_URL|HERMES_PROVIDER|model_api_key/);
 });

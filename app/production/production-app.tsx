@@ -12,6 +12,7 @@ import {
   productionServices,
 } from "./services";
 import { ProductionWorkspace } from "./production-workspace";
+import { ProductionAdmin } from "./production-admin";
 import type {
   AuthMe,
   ProductionBootstrap,
@@ -106,14 +107,10 @@ export function ProductionApplication() {
   }
   if (session.bootstrap.me.user.role !== "executive") {
     return (
-      <ProductionStatus
-        title="管理身份已验证"
-        description="当前入口只服务高层本人。管理账号不会加载高层会话、记忆或文件正文；管理功能将通过独立受控入口开放。"
-        action="退出登录"
-        onAction={() => {
-          void productionServices.auth.logout().finally(() => {
-            setSession({ status: "anonymous" });
-          });
+      <ProductionAdmin
+        me={session.bootstrap.me}
+        onLogout={() => {
+          void productionServices.auth.logout().finally(() => setSession({ status: "anonymous" }));
         }}
       />
     );
@@ -144,7 +141,7 @@ function ProductionStatus({
         <div className="login-statement">
           <p className="eyebrow">本机生产环境</p>
           <h1 id="production-status-title">可信经营服务正在准备。</h1>
-          <p>生产模式只读取已授权的企业数据，不会使用演示样本补位。</p>
+          <p>客户生产模式不会使用演示数据，只读取已授权的企业数据。</p>
         </div>
       </section>
       <section className="login-panel" aria-live="polite">
@@ -204,7 +201,7 @@ function ProductionLogin({
         <dl className="login-principles">
           <div><dt>01</dt><dd><strong>独立身份</strong><span>企业预建账号与受控会话</span></dd></div>
           <div><dt>02</dt><dd><strong>最小权限</strong><span>只展示已授权事业部</span></dd></div>
-          <div><dt>03</dt><dd><strong>真实数据</strong><span>生产模式不使用演示样本</span></dd></div>
+          <div><dt>03</dt><dd><strong>来源透明</strong><span>数据来源与截止时间清晰标注</span></dd></div>
         </dl>
       </section>
       <section className="login-panel" aria-labelledby="production-login-title">

@@ -44,7 +44,8 @@ def test_postgres_concurrent_claim_has_one_lease_and_one_attempt(monkeypatch) ->
     test_engine = create_engine(
         database_url,
         pool_pre_ping=True,
-        connect_args={"options": f"-csearch_path={schema}"},
+        # Keep tables isolated while retaining access to extensions installed in public.
+        connect_args={"options": f"-csearch_path={schema},public"},
     )
     session_factory = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(worker, "SessionLocal", session_factory)

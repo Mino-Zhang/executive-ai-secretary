@@ -31,7 +31,8 @@ def test_postgres_rotation_lock_survives_file_commit_and_is_released(tmp_path) -
         database_url,
         pool_pre_ping=True,
         poolclass=NullPool,
-        connect_args={"options": f"-csearch_path={schema}"},
+        # Keep tables isolated while retaining access to extensions installed in public.
+        connect_args={"options": f"-csearch_path={schema},public"},
     )
     session_factory = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     storage = LocalEncryptedStorage(

@@ -13,14 +13,32 @@ from datetime import timedelta
 from executive_ai_api.authz import scope_snapshot_is_current_for_user
 from executive_ai_api.config import get_settings
 from executive_ai_api.database import SessionLocal
+from executive_ai_api.ingestion import run_data_sync_job
 from executive_ai_api.job_state import (
     ASSISTANT_NOT_CONFIGURED_CONTENT,
     close_assistant_placeholder,
 )
 from executive_ai_api.logging_config import configure_logging
-from executive_ai_api.models import AuditEvent, Enterprise, Job, JobAttempt, User
+from executive_ai_api.models import (
+    AuditEvent,
+    Enterprise,
+    FileExtraction,
+    Job,
+    JobAttempt,
+    ScheduleRun,
+    User,
+)
 from executive_ai_api.security import as_utc, utc_now
 from sqlalchemy import func, or_, select
+
+from executive_ai_worker.assistant_orchestrator import (
+    OrchestrationPermanentError,
+    run_assistant_job,
+)
+from executive_ai_worker.file_extraction import (
+    FileExtractionPermanentError,
+    run_file_extract_job,
+)
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -28,6 +46,7 @@ logger = logging.getLogger("executive_ai_worker")
 stopping = False
 worker_id = f"{socket.gethostname()}:{os.getpid()}"
 RETRY_EXHAUSTED_CONTENT = "处理任务多次中断，请稍后重试"
+SYSTEM_JOB_TYPES = {"data.sync"}
 
 
 @dataclass(frozen=True)
@@ -56,7 +75,24 @@ def _database_now(db):
 
 
 def authorization_is_current(db, job: Job | None) -> bool:
-    if job is None or not job.created_by_user_id:
+    if job is None:
+        return False
+    if job.job_type in SYSTEM_JOB_TYPES:
+        enterprise = db.get(Enterprise, job.enterprise_id)
+        if enterprise is None or not enterprise.is_active:
+            return False
+        if job.created_by_user_id is None:
+            return job.scope_snapshot_json.get("system") is True and job.scope_snapshot_json.get(
+                "enterprise_id"
+            ) == str(job.enterprise_id)
+        user = db.get(User, job.created_by_user_id)
+        return bool(
+            user
+            and user.is_active
+            and user.enterprise_id == job.enterprise_id
+            and user.role in {"enterprise_admin", "fde"}
+        )
+    if not job.created_by_user_id:
         return False
     user = db.get(User, job.created_by_user_id)
     if user is None or not user.is_active or user.role != "executive":
@@ -112,6 +148,30 @@ def _clear_lease(job: Job) -> None:
     job.heartbeat_at = None
 
 
+def _update_file_extraction_status(
+    db,
+    job: Job,
+    *,
+    status: str,
+    error_code: str | None,
+    error_message: str | None,
+    completed_at=None,
+) -> None:
+    if job.job_type != "file.extract":
+        return
+    try:
+        file_id = uuid.UUID(str(job.payload_json["file_id"]))
+    except (KeyError, TypeError, ValueError):
+        return
+    extraction = db.scalar(select(FileExtraction).where(FileExtraction.file_id == file_id))
+    if extraction is None:
+        return
+    extraction.status = status
+    extraction.error_code = error_code
+    extraction.error_message = error_message[:2000] if error_message else None
+    extraction.completed_at = completed_at
+
+
 def _close_attempt(
     attempt: JobAttempt | None,
     *,
@@ -144,6 +204,14 @@ def _terminal_failure(
     job.error_message = error_message[:2000]
     job.completed_at = now
     job.dead_lettered_at = now if dead_lettered else None
+    _update_file_extraction_status(
+        db,
+        job,
+        status="failed",
+        error_code=error_code,
+        error_message=error_message,
+        completed_at=now,
+    )
     _close_attempt(
         attempt,
         status="failed",
@@ -152,6 +220,11 @@ def _terminal_failure(
         completed_at=now,
     )
     _clear_lease(job)
+    for schedule_run in db.scalars(select(ScheduleRun).where(ScheduleRun.job_id == job.id)).all():
+        schedule_run.status = "failed"
+        schedule_run.completed_at = now
+        schedule_run.error_code = error_code
+        schedule_run.error_message = error_message[:2000]
     close_assistant_placeholder(db, job, status="failed", content=placeholder_content)
     _audit(
         db,
@@ -189,6 +262,13 @@ def _retry_or_dead_letter(
     job.completed_at = None
     job.error_code = error_code
     job.error_message = error_message[:2000]
+    _update_file_extraction_status(
+        db,
+        job,
+        status="queued",
+        error_code=error_code,
+        error_message=error_message,
+    )
     _close_attempt(
         attempt,
         status=attempt_status,
@@ -244,15 +324,14 @@ def claim_one() -> ClaimedJob | None:
     recover_expired_leases()
     with SessionLocal.begin() as db:
         now = _database_now(db)
+        statement = select(Job).where(
+            Job.status == "queued",
+            or_(Job.scheduled_at.is_(None), Job.scheduled_at <= now),
+        )
+        if "*" not in settings.worker_job_types:
+            statement = statement.where(Job.job_type.in_(settings.worker_job_types))
         job = db.scalar(
-            select(Job)
-            .where(
-                Job.status == "queued",
-                or_(Job.scheduled_at.is_(None), Job.scheduled_at <= now),
-            )
-            .order_by(Job.created_at)
-            .limit(1)
-            .with_for_update(skip_locked=True)
+            statement.order_by(Job.created_at).limit(1).with_for_update(skip_locked=True)
         )
         if job is None:
             return None
@@ -333,6 +412,18 @@ heartbeat = renew_lease
 def execute_job_handler(job: Job) -> dict:
     if job.job_type == "system.noop":
         return {"ok": True}
+    if job.job_type == "data.sync":
+        return run_data_sync_job(job, settings)
+    if job.job_type == "assistant_response":
+        try:
+            return run_assistant_job(job, settings)
+        except OrchestrationPermanentError as exc:
+            raise PermanentJobError(exc.code, str(exc), exc.placeholder) from exc
+    if job.job_type == "file.extract":
+        try:
+            return run_file_extract_job(job, settings)
+        except FileExtractionPermanentError as exc:
+            raise PermanentJobError(exc.code, str(exc), "文件解析失败") from exc
     raise PermanentJobError(
         "integration_not_configured",
         "No production handler is configured for this job type",
@@ -350,8 +441,7 @@ def _owned_running_job(db, job_id: str, lease_token: str, *, unexpired: bool) ->
     ):
         return None
     if unexpired and (
-        job.lease_expires_at is None
-        or as_utc(job.lease_expires_at) <= _database_now(db)
+        job.lease_expires_at is None or as_utc(job.lease_expires_at) <= _database_now(db)
     ):
         return None
     return job
@@ -379,6 +469,11 @@ def _finish_success(job_id: str, lease_token: str, result: dict) -> bool:
             completed_at=now,
         )
         _clear_lease(job)
+        for schedule_run in db.scalars(
+            select(ScheduleRun).where(ScheduleRun.job_id == job.id)
+        ).all():
+            schedule_run.status = "completed"
+            schedule_run.completed_at = now
         content = result.get("content")
         close_assistant_placeholder(
             db,
@@ -491,6 +586,10 @@ def process(job_id: str, lease_token: str) -> bool:
 
 
 def run() -> None:
+    if settings.service_role == "assistant_worker":
+        settings.integration_encryption_keys()
+        if len(settings.hermes_runtime_hmac_key.get_secret_value()) < 32:
+            raise RuntimeError("HERMES_RUNTIME_HMAC_KEY must contain at least 32 characters")
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     logger.info("worker_started", extra={"structured": {"worker_id": worker_id}})

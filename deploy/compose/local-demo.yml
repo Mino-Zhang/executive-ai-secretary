@@ -1,0 +1,179 @@
+services:
+  source-postgres:
+    image: ${POSTGRES_IMAGE:-docker.io/pgvector/pgvector:0.8.5-pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: executive_ai_source
+      POSTGRES_DB: ${SOURCE_DB_NAME:-executive_ai_source_demo}
+      POSTGRES_PASSWORD_FILE: /run/secrets/source_postgres_password
+      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - source_postgres_password
+      - source_reader_password
+      - source_writer_password
+    volumes:
+      - source_postgres_data:/var/lib/postgresql/data
+      - ./deploy/source-postgres/01-init-source.sh:/docker-entrypoint-initdb.d/01-init-source.sh:ro
+      - ./deploy/source-postgres/standard-ods.sql:/opt/executive-ai-source/standard-ods.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U executive_ai_source -d $${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    environment:
+      SOURCE_CONNECTION_MODE: internal
+    secrets:
+      - source_reader_password
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+
+  ingestion-worker:
+    environment:
+      SOURCE_CONNECTION_MODE: internal
+    secrets:
+      - source_reader_password
+      - source_writer_password
+      - feishu_runtime_secret
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+
+  configure-data-source:
+    environment:
+      SOURCE_CONNECTION_MODE: internal
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+
+  seed-source-demo:
+    profiles: ["demo-seed"]
+    image: ${API_IMAGE:-executive-ai-api:local}
+    environment:
+      APP_ENV: local-demo
+      APP_MODE: demo
+      SERVICE_ROLE: seed
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      FILE_STORAGE_ROOT: /tmp/files
+      FILE_ENCRYPTION_KEY_RING_FILE: /run/secrets/file_encryption_key_ring
+      AUDIT_HMAC_KEY_RING_FILE: /run/secrets/audit_hmac_key_ring
+      AUDIT_HMAC_KEY_VERSION: ${AUDIT_HMAC_KEY_VERSION:-v1}
+      AUDIT_HMAC_LEGACY_KEY_VERSION: ${AUDIT_HMAC_LEGACY_KEY_VERSION:-v1}
+      DEMO_REFERENCE_DATE: ${DEMO_REFERENCE_DATE:-2026-07-26}
+      DEMO_DATASET_VERSION: ${DEMO_DATASET_VERSION:-phase2-demo-v1}
+      SOURCE_DB_HOST: source-postgres
+      SOURCE_DB_PORT: "5432"
+      SOURCE_DB_NAME: ${SOURCE_DB_NAME:-executive_ai_source_demo}
+      SOURCE_DB_WRITER_USER: source_writer
+      DEMO_ENTERPRISE_SLUG: ${DEMO_ENTERPRISE_SLUG:-}
+    secrets:
+      - postgres_runtime_password
+      - source_writer_password
+      - file_encryption_key
+      - file_encryption_key_ring
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    networks:
+      - backend
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -z "$${DEMO_ENTERPRISE_SLUG}" ]; then
+          echo "DEMO_ENTERPRISE_SLUG is required" >&2
+          exit 64
+        fi
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        SOURCE_PASSWORD="$$(cat /run/secrets/source_writer_password)"
+        export SOURCE_WRITER_DATABASE_URL="postgresql+psycopg://$${SOURCE_DB_WRITER_USER}:$${SOURCE_PASSWORD}@source-postgres:5432/$${SOURCE_DB_NAME}"
+        export FILE_ENCRYPTION_KEY="$$(cat /run/secrets/file_encryption_key)"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        exec python -m executive_ai_api.demo_source --enterprise-slug "$${DEMO_ENTERPRISE_SLUG}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  publish-feishu-demo:
+    profiles: ["feishu-provision"]
+    image: ${API_IMAGE:-executive-ai-api:local}
+    environment:
+      APP_ENV: local-demo
+      APP_MODE: demo
+      SERVICE_ROLE: seed
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      FILE_STORAGE_ROOT: /tmp/files
+      FILE_ENCRYPTION_KEY_RING_FILE: /run/secrets/file_encryption_key_ring
+      AUDIT_HMAC_KEY_RING_FILE: /run/secrets/audit_hmac_key_ring
+      AUDIT_HMAC_KEY_VERSION: ${AUDIT_HMAC_KEY_VERSION:-v1}
+      AUDIT_HMAC_LEGACY_KEY_VERSION: ${AUDIT_HMAC_LEGACY_KEY_VERSION:-v1}
+      DEMO_REFERENCE_DATE: ${DEMO_REFERENCE_DATE:-2026-07-26}
+      DEMO_DATASET_VERSION: ${DEMO_DATASET_VERSION:-phase2-demo-v1}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_BITABLE_APP_TOKEN: ${FEISHU_BITABLE_APP_TOKEN:-}
+      FEISHU_BITABLE_TABLE_ID: ${FEISHU_BITABLE_TABLE_ID:-}
+      DEMO_ENTERPRISE_SLUG: ${DEMO_ENTERPRISE_SLUG:-}
+    secrets:
+      - postgres_runtime_password
+      - feishu_provisioning_secret
+      - file_encryption_key
+      - file_encryption_key_ring
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    networks:
+      - backend
+      - ai-egress
+    depends_on:
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        export FILE_ENCRYPTION_KEY="$$(cat /run/secrets/file_encryption_key)"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        export FEISHU_PROVISIONING_SECRET="$$(cat /run/secrets/feishu_provisioning_secret)"
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        exec python -m executive_ai_api.feishu publish --enterprise-slug "$${DEMO_ENTERPRISE_SLUG}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  source_postgres_data:
+
+secrets:
+  source_postgres_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_postgres_password
+  source_reader_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_reader_password
+  source_writer_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_writer_password
+  feishu_runtime_secret:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/feishu_runtime_secret
+  feishu_provisioning_secret:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/feishu_provisioning_secret

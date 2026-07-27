@@ -7,24 +7,33 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Request, UploadFile, status
+from fastapi import APIRouter, Depends, Form, Request, UploadFile, status
 from fastapi import File as UploadBody
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..audit import record_audit
-from ..authz import Principal, get_executive_principal
+from ..authz import Principal, build_scope_snapshot, get_executive_principal
 from ..config import Settings, get_settings
 from ..database import get_db
 from ..errors import AppError
-from ..models import FileAsset, FileEvent
-from ..schemas import FileOut, Page
+from ..models import (
+    Conversation,
+    ConversationFile,
+    FileAsset,
+    FileChunk,
+    FileEvent,
+    FileExtraction,
+    Job,
+)
+from ..schemas import FileExtractionOut, FileOut, Page
 from ..security import utc_now
 from ..storage import LocalEncryptedStorage
 
 router = APIRouter(prefix="/files", tags=["files"])
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".txt"}
+EXTRACTABLE_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx"}
 SAFE_FILENAME = re.compile(r"[^\w.\-()\u4e00-\u9fff ]", re.UNICODE)
 
 
@@ -91,6 +100,7 @@ def upload_file(
     settings: Annotated[Settings, Depends(get_settings)],
     storage: Annotated[LocalEncryptedStorage, Depends(get_storage)],
     file: Annotated[UploadFile, UploadBody(...)],
+    conversation_id: Annotated[uuid.UUID | None, Form()] = None,
 ) -> FileOut:
     raw_name = Path(file.filename or "file").name
     safe_name = SAFE_FILENAME.sub("_", raw_name).strip()[:500] or "file"
@@ -108,10 +118,47 @@ def upload_file(
         sha256=stored.sha256,
         encryption_key_version=stored.encryption_key_version,
         status="ready",
+        metadata_json={"extractable": extension in EXTRACTABLE_EXTENSIONS},
     )
     try:
         db.add(item)
         db.flush()
+        conversation = None
+        if conversation_id is not None:
+            conversation = db.scalar(
+                select(Conversation).where(
+                    Conversation.id == conversation_id,
+                    Conversation.enterprise_id == principal.enterprise_id,
+                    Conversation.owner_user_id == principal.user.id,
+                    Conversation.archived_at.is_(None),
+                )
+            )
+            if conversation is None:
+                raise AppError(404, "conversation_not_found", "会话不存在")
+            db.add(ConversationFile(conversation_id=conversation.id, file_id=item.id))
+        if extension in EXTRACTABLE_EXTENSIONS:
+            extraction = FileExtraction(file_id=item.id, status="queued")
+            db.add(extraction)
+            db.flush()
+            db.add(
+                Job(
+                    enterprise_id=principal.enterprise_id,
+                    created_by_user_id=principal.user.id,
+                    job_type="file.extract",
+                    payload_json={
+                        "file_id": str(item.id),
+                        "extraction_id": str(extraction.id),
+                        "conversation_id": str(conversation.id) if conversation else None,
+                    },
+                    scope_snapshot_json=build_scope_snapshot(
+                        db,
+                        principal,
+                        conversation.organization_unit_id if conversation else None,
+                    ),
+                    status="queued",
+                    max_attempts=settings.worker_job_max_attempts,
+                )
+            )
         db.add(FileEvent(file_id=item.id, actor_user_id=principal.user.id, event_type="uploaded"))
         record_audit(
             db,
@@ -133,6 +180,23 @@ def upload_file(
         storage.delete(stored.storage_key)
         raise
     return FileOut.model_validate(item)
+
+
+@router.get("/{file_id}/extraction", response_model=FileExtractionOut)
+def get_file_extraction(
+    file_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> FileExtractionOut:
+    owned_file(db, principal, file_id)
+    extraction = db.scalar(select(FileExtraction).where(FileExtraction.file_id == file_id))
+    if extraction is None:
+        raise AppError(
+            404,
+            "file_extraction_unavailable",
+            "该文件类型不支持内容解析",
+        )
+    return FileExtractionOut.model_validate(extraction)
 
 
 @router.get("/{file_id}", response_model=FileOut)
@@ -187,6 +251,11 @@ def delete_file(
     item = owned_file(db, principal, file_id)
     item.deleted_at = utc_now()
     item.status = "deleted"
+    # Keep the encrypted file asset as an auditable tombstone, but remove every
+    # derived representation. Deleting the extraction cascades to pgvector and
+    # keyword chunks through the database foreign keys.
+    db.execute(delete(FileChunk).where(FileChunk.file_id == item.id))
+    db.execute(delete(FileExtraction).where(FileExtraction.file_id == item.id))
     db.add(FileEvent(file_id=item.id, actor_user_id=principal.user.id, event_type="deleted"))
     record_audit(
         db,

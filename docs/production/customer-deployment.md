@@ -17,10 +17,19 @@
 3. 复制 `compose.yml`、`deploy/`、`scripts/` 与对应文档，不复制本机 `runtime/`、`backups/`。
 4. 运行 `prepare-env.sh customer-template` 生成客户独立密钥，并将两个 release bundle 文件复制到 `runtime/customer-template/release/`。
 5. 在正式上线前增加 TLS 终止、反向代理信任范围和客户批准的监听地址；Phase 1 的 loopback guard 不能直接绕过。
-6. 安装 `cosign` 和 `jq`。从已验收 bundle 中把 `release.version`、`release.gitCommit`、`database.alembicHead` 和 `images` 六个完整值分别写入客户 `.env` 的 `RELEASE_VERSION`、`RELEASE_GIT_COMMIT`、`EXPECTED_ALEMBIC_HEAD`、`WEB_IMAGE`、`API_IMAGE`、`WORKER_IMAGE`、`POSTGRES_IMAGE`、`NGINX_IMAGE` 和 `FILE_TOOL_IMAGE`。不得抄写或截断 digest。
-7. 执行 `./scripts/start-release.sh customer-template`。脚本先验证 release bundle 的 Sigstore 签名、透明日志证据以及 GitHub OIDC 中的仓库、commit SHA、ref 和触发类型；再对六个镜像 digest 与 Alembic head 做逐项精确比对，并检查三个应用镜像签名的版本/commit/组件注解。任一字段不一致就会在拉取或迁移前停止。
+6. 安装 `cosign` 和 `jq`。从已验收 bundle 中把 `release.version`、`release.gitCommit`、`database.alembicHead` 和 `images` 七个完整值分别写入客户 `.env` 的 `RELEASE_VERSION`、`RELEASE_GIT_COMMIT`、`EXPECTED_ALEMBIC_HEAD`、`WEB_IMAGE`、`API_IMAGE`、`WORKER_IMAGE`、`HERMES_IMAGE`、`POSTGRES_IMAGE`、`NGINX_IMAGE` 和 `FILE_TOOL_IMAGE`。不得抄写或截断 digest。
+7. 执行 `./scripts/start-release.sh customer-template`。脚本先验证 release bundle 的 Sigstore 签名、透明日志证据以及 GitHub OIDC 中的仓库、commit SHA、ref 和触发类型；再对七个镜像 digest 与 Alembic head 做逐项精确比对，并检查 Web、API、Worker、Hermes 四个应用镜像签名的版本/commit/组件注解。任一字段不一致就会在拉取或迁移前停止。
 8. 交互创建首位企业管理员，配置组织与事业部范围。
-9. 执行安全、权限、备份恢复、日志和核心业务验收。
+9. 按 [标准脱敏源库数据契约](./source-data-contract.md) 准备 PostgreSQL 15 至 17。外部连接把含只读账号和 `sslmode=verify-full` 的完整 URL 写入 `source_database_url` 密钥文件；产品拒绝高权限账号、非 TLS 连接和非标准 Schema。
+10. 在客户出口策略中仅放行 Anspire 正式网关 `https://open-gateway.anspire.ai`。后端纳入 Anspire 全量 53 个模型目录，使用企业管理员或 FDE 账号登录管理端，在“模型服务”选择其中 39 个聊天与推理模型之一，录入客户提供的 API Key，依次执行“保存配置 → 测试连接 → 启用 Anspire”。默认模型为 GLM-5.2；图像、视频、Embedding 与 Rerank 模型不会误入经营回答，产品也不接受其他供应商或自定义模型网关，API Key 加密保存且不写入 `.env`。
+11. 注册数据源并立即执行首次同步：
+
+    ```bash
+    ./scripts/configure-source.sh customer-template customer "客户认可的数据源名称"
+    ./scripts/sync-now.sh customer-template customer
+    ```
+
+12. 执行安全、权限、备份恢复、日志、数据对账、问数证据和文件问答验收。
 
 `start.sh` 只用于本机开发与现场演示构建；客户交付不得使用它。`start-release.sh` 不解析可变 Tag，只使用签名 bundle 中已批准的 digest，并强制 `--no-build`。这意味着 Web、API、Worker 不能跨版本混搭，基础镜像与迁移契约也不能被临时替换。
 

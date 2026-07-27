@@ -1,0 +1,78 @@
+services:
+  source-postgres:
+    image: ${POSTGRES_IMAGE:-docker.io/pgvector/pgvector:0.8.5-pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: executive_ai_source
+      POSTGRES_DB: ${SOURCE_DB_NAME:-executive_ai_source_customer}
+      POSTGRES_PASSWORD_FILE: /run/secrets/source_postgres_password
+      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - source_postgres_password
+      - source_reader_password
+      - source_writer_password
+    volumes:
+      - managed_source_postgres_data:/var/lib/postgresql/data
+      - ./deploy/source-postgres/01-init-source.sh:/docker-entrypoint-initdb.d/01-init-source.sh:ro
+      - ./deploy/source-postgres/standard-ods.sql:/opt/executive-ai-source/standard-ods.sql:ro
+    ports:
+      - "127.0.0.1:${MANAGED_SOURCE_HOST_PORT:-55432}:5432"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U executive_ai_source -d $${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    environment:
+      SOURCE_CONNECTION_MODE: internal
+      SOURCE_DB_HOST: source-postgres
+      SOURCE_DB_PORT: "5432"
+      SOURCE_DB_NAME: ${SOURCE_DB_NAME:-executive_ai_source_customer}
+      SOURCE_DB_READER_USER: source_reader
+    secrets:
+      - source_reader_password
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+
+  ingestion-worker:
+    environment:
+      SOURCE_CONNECTION_MODE: internal
+      SOURCE_DB_HOST: source-postgres
+      SOURCE_DB_PORT: "5432"
+      SOURCE_DB_NAME: ${SOURCE_DB_NAME:-executive_ai_source_customer}
+      SOURCE_DB_READER_USER: source_reader
+    secrets:
+      - source_reader_password
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+
+  configure-data-source:
+    environment:
+      SOURCE_CONNECTION_MODE: internal
+      SOURCE_DB_HOST: source-postgres
+      SOURCE_DB_PORT: "5432"
+      SOURCE_DB_NAME: ${SOURCE_DB_NAME:-executive_ai_source_customer}
+      SOURCE_DB_READER_USER: source_reader
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+
+volumes:
+  managed_source_postgres_data:
+
+secrets:
+  source_postgres_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_postgres_password
+  source_reader_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_reader_password
+  source_writer_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_writer_password

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, status
-from fastapi.responses import ORJSONResponse
+from fastapi import APIRouter, Depends, Header, Query, Request, status
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -16,24 +18,29 @@ from ..authz import (
     get_executive_principal,
 )
 from ..config import get_settings
-from ..database import get_db
+from ..database import SessionLocal, get_db
 from ..errors import AppError
 from ..idempotency import replay, save_response
 from ..models import (
+    Clarification,
     Conversation,
     ConversationFile,
     FileAsset,
     Job,
     Message,
+    MessageEvidence,
     Project,
     ProjectConversation,
 )
 from ..pagination import decode_cursor, encode_cursor
 from ..schemas import (
+    ClarificationOut,
+    ClarificationResolve,
     ConversationCreate,
     ConversationOut,
     ConversationUpdate,
     MessageCreate,
+    MessageEvidenceOut,
     MessageOut,
     Page,
 )
@@ -282,6 +289,221 @@ def list_messages(
         items=[MessageOut.model_validate(item) for item in rows[:limit]],
         next_cursor=next_cursor,
     )
+
+
+@router.get("/{conversation_id}/stream")
+async def stream_conversation(
+    conversation_id: uuid.UUID,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+    after_sequence: int = Query(default=0, ge=0),
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+) -> StreamingResponse:
+    owned_conversation(db, principal, conversation_id)
+    resume_sequence = 0
+    resume_updated_ms = 0
+    try:
+        if last_event_id and ":" in last_event_id:
+            resume_sequence_text, resume_updated_text = last_event_id.split(":", 1)
+            resume_sequence = int(resume_sequence_text)
+            resume_updated_ms = int(resume_updated_text)
+        elif last_event_id:
+            resume_sequence = int(last_event_id)
+    except ValueError:
+        resume_sequence = 0
+        resume_updated_ms = 0
+    cursor = max(after_sequence, resume_sequence)
+    enterprise_id = principal.enterprise_id
+    owner_user_id = principal.user.id
+
+    async def events():
+        nonlocal cursor
+        seen_updates: dict[uuid.UUID, str] = {}
+        idle_cycles = 0
+        while not await request.is_disconnected():
+            with SessionLocal() as stream_db:
+                conversation = stream_db.scalar(
+                    select(Conversation).where(
+                        Conversation.id == conversation_id,
+                        Conversation.enterprise_id == enterprise_id,
+                        Conversation.owner_user_id == owner_user_id,
+                    )
+                )
+                if conversation is None:
+                    yield 'event: error\ndata: {"code":"conversation_not_found"}\n\n'
+                    return
+                rows = stream_db.scalars(
+                    select(Message)
+                    .where(
+                        Message.conversation_id == conversation_id,
+                        Message.sequence >= max(1, cursor),
+                    )
+                    .order_by(Message.sequence)
+                ).all()
+                emitted = False
+                for item in rows:
+                    updated_marker = item.updated_at.isoformat()
+                    updated_ms = int(item.updated_at.timestamp() * 1000)
+                    is_resumed_item = (
+                        item.sequence == resume_sequence and updated_ms <= resume_updated_ms
+                    )
+                    if (
+                        item.sequence < cursor
+                        or is_resumed_item
+                        or seen_updates.get(item.id) == updated_marker
+                    ):
+                        continue
+                    seen_updates[item.id] = updated_marker
+                    cursor = item.sequence
+                    emitted = True
+                    payload = MessageOut.model_validate(item).model_dump(mode="json")
+                    yield (
+                        f"id: {cursor}:{updated_ms}\nevent: message\ndata: "
+                        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                        + "\n\n"
+                    )
+            if emitted:
+                idle_cycles = 0
+            else:
+                idle_cycles += 1
+                if idle_cycles % 20 == 0:
+                    yield "event: heartbeat\ndata: {}\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/{conversation_id}/clarifications/{clarification_id}",
+    response_model=ClarificationOut,
+)
+def resolve_clarification(
+    conversation_id: uuid.UUID,
+    clarification_id: uuid.UUID,
+    payload: ClarificationResolve,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> ClarificationOut:
+    conversation = owned_conversation(db, principal, conversation_id, lock=True)
+    clarification = db.scalar(
+        select(Clarification)
+        .where(
+            Clarification.id == clarification_id,
+            Clarification.conversation_id == conversation.id,
+        )
+        .with_for_update()
+    )
+    if clarification is None:
+        raise AppError(404, "clarification_not_found", "范围确认不存在")
+    if clarification.status != "pending":
+        raise AppError(409, "clarification_resolved", "该范围确认已经处理")
+    clarification.status = "resolved"
+    clarification.selected_value = payload.value
+    clarification.resolved_by_user_id = principal.user.id
+    clarification.resolved_at = utc_now()
+    original_message = db.get(Message, clarification.message_id)
+    original_question = original_message.content if original_message else ""
+    sequence = (
+        db.scalar(
+            select(func.coalesce(func.max(Message.sequence), 0)).where(
+                Message.conversation_id == conversation.id
+            )
+        )
+        or 0
+    ) + 1
+    user_message = Message(
+        conversation_id=conversation.id,
+        author_user_id=principal.user.id,
+        role="user",
+        content=(
+            f"{original_question}\n\n已确认查询范围：{payload.value}"
+            if original_question
+            else payload.value
+        ),
+        content_json={
+            "clarification_id": str(clarification.id),
+            "selected_value": payload.value,
+            "original_message_id": str(clarification.message_id),
+        },
+        sequence=sequence,
+        status="completed",
+    )
+    assistant_message = Message(
+        conversation_id=conversation.id,
+        role="assistant",
+        content="",
+        content_json={},
+        sequence=sequence + 1,
+        status="queued",
+    )
+    db.add_all([user_message, assistant_message])
+    db.flush()
+    db.add(
+        Job(
+            enterprise_id=principal.enterprise_id,
+            created_by_user_id=principal.user.id,
+            job_type="assistant_response",
+            payload_json={
+                "conversation_id": str(conversation.id),
+                "message_id": str(user_message.id),
+                "assistant_message_id": str(assistant_message.id),
+                "clarification_id": str(clarification.id),
+            },
+            scope_snapshot_json=build_scope_snapshot(
+                db, principal, conversation.organization_unit_id
+            ),
+            status="queued",
+            max_attempts=get_settings().worker_job_max_attempts,
+        )
+    )
+    conversation.last_message_at = utc_now()
+    record_audit(
+        db,
+        request,
+        "clarification.resolved",
+        actor=principal.user,
+        session=principal.session,
+        target_type="clarification",
+        target_id=clarification.id,
+    )
+    db.commit()
+    return ClarificationOut.model_validate(clarification)
+
+
+@router.get(
+    "/{conversation_id}/messages/{message_id}/evidence",
+    response_model=list[MessageEvidenceOut],
+)
+def get_message_evidence(
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> list[MessageEvidenceOut]:
+    owned_conversation(db, principal, conversation_id)
+    message = db.scalar(
+        select(Message).where(
+            Message.id == message_id,
+            Message.conversation_id == conversation_id,
+        )
+    )
+    if message is None:
+        raise AppError(404, "message_not_found", "消息不存在")
+    rows = db.scalars(
+        select(MessageEvidence)
+        .where(MessageEvidence.message_id == message.id)
+        .order_by(MessageEvidence.created_at, MessageEvidence.id)
+    ).all()
+    return [MessageEvidenceOut.model_validate(row) for row in rows]
 
 
 @router.post(

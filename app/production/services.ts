@@ -5,9 +5,14 @@ import type {
   Conversation,
   ConversationMessage,
   CursorPage,
+  DataCapabilities,
+  FileExtraction,
   FileMetadata,
   Job,
   Memory,
+  MessageEvidence,
+  ModelProviderConfig,
+  ModelProviderTest,
   OrganizationUnit,
   ProductionBootstrap,
   Project,
@@ -111,6 +116,20 @@ export function createProductionServices(client: ApiClient = apiClient) {
         { method: "POST", headers: idempotencyHeaders(), body: { content, file_ids: fileIds } },
       );
     },
+    async evidence(id: string, messageId: string) {
+      return client.request<MessageEvidence[]>(
+        `/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/evidence`,
+      );
+    },
+    async resolveClarification(id: string, clarificationId: string, value: string) {
+      return client.request(
+        `/conversations/${encodeURIComponent(id)}/clarifications/${encodeURIComponent(clarificationId)}`,
+        { method: "POST", body: { value } },
+      );
+    },
+    streamUrl(id: string, afterSequence: number) {
+      return `${client.baseUrl}/conversations/${encodeURIComponent(id)}/stream${queryString({ after_sequence: String(afterSequence) })}`;
+    },
   };
 
   const projects = {
@@ -142,6 +161,9 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
     async get(id: string) {
       return client.request<FileMetadata>(`/files/${encodeURIComponent(id)}`);
+    },
+    async extraction(id: string) {
+      return client.request<FileExtraction>(`/files/${encodeURIComponent(id)}/extraction`);
     },
     contentUrl(id: string) {
       return `${client.baseUrl}/files/${encodeURIComponent(id)}/content`;
@@ -186,7 +208,30 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
   };
 
-  return { auth, organizations, conversations, projects, files, memories, reports, jobs };
+  const data = {
+    async capabilities() {
+      return client.request<DataCapabilities>("/data-capabilities");
+    },
+  };
+
+  const adminModels = {
+    async get() {
+      return client.request<ModelProviderConfig>("/admin/model-provider");
+    },
+    async update(values: { model_id: string; api_key?: string; is_enabled?: boolean }) {
+      return client.request<ModelProviderConfig>("/admin/model-provider", {
+        method: "PUT",
+        body: values,
+      });
+    },
+    async test() {
+      return client.request<ModelProviderTest>("/admin/model-provider/test", {
+        method: "POST",
+      });
+    },
+  };
+
+  return { auth, organizations, conversations, projects, files, memories, reports, jobs, data, adminModels };
 }
 
 export type ProductionServices = ReturnType<typeof createProductionServices>;
@@ -206,6 +251,7 @@ export async function loadProductionBootstrap(
       memories: [],
       reports: [],
       jobs: [],
+      dataCapabilities: null,
       optionalErrors: {},
     };
   }
@@ -221,6 +267,7 @@ export async function loadProductionBootstrap(
       memories: [],
       reports: [],
       jobs: [],
+      dataCapabilities: null,
       optionalErrors: {},
     };
   }
@@ -235,10 +282,11 @@ export async function loadProductionBootstrap(
     services.memories.list(),
     services.reports.list(),
     services.jobs.list(),
+    services.data.capabilities(),
   ] as const);
   const optionalErrors: ProductionBootstrap["optionalErrors"] = {};
   const authorizedOrganizationIds = new Set(me.scopes.map((scope) => scope.id));
-  const optionalKeys = ["memories", "reports", "jobs"] as const;
+  const optionalKeys = ["memories", "reports", "jobs", "dataCapabilities"] as const;
   optional.forEach((result, index) => {
     if (result.status === "rejected") {
       optionalErrors[optionalKeys[index]] = humanizeApiError(result.reason);
@@ -255,6 +303,7 @@ export async function loadProductionBootstrap(
     memories: optional[0].status === "fulfilled" ? optional[0].value.items : [],
     reports: optional[1].status === "fulfilled" ? optional[1].value.items : [],
     jobs: optional[2].status === "fulfilled" ? optional[2].value.items : [],
+    dataCapabilities: optional[3].status === "fulfilled" ? optional[3].value : null,
     optionalErrors,
   };
 }

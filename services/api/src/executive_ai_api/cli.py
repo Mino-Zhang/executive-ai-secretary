@@ -3,20 +3,26 @@ from __future__ import annotations
 import argparse
 import getpass
 import sys
+import uuid
 
 from sqlalchemy import select
 
 from .config import get_settings
 from .database import SessionLocal
+from .ingestion import IngestionError, require_isolated_data_source, test_source_connection
 from .models import (
     AuditEvent,
     DataScopeGrant,
+    DataSource,
     Enterprise,
+    Job,
     OrganizationUnit,
     User,
     UserCredential,
 )
-from .security import hash_password, validate_new_password
+from .security import hash_password, utc_now, validate_new_password
+
+SOURCE_DATABASE_CONFIG_REFERENCE = "SOURCE_DATABASE_URL"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,6 +53,23 @@ def parser() -> argparse.ArgumentParser:
     scope = create_user.add_mutually_exclusive_group(required=True)
     scope.add_argument("--enterprise-wide-scope", action="store_true")
     scope.add_argument("--organization-unit-code", action="append", default=[])
+    configure_source = commands.add_parser(
+        "configure-source",
+        help="Validate and register the standard sanitized PostgreSQL source",
+    )
+    configure_source.add_argument("--enterprise-slug", required=True)
+    configure_source.add_argument("--display-name", required=True)
+    configure_source.add_argument(
+        "--secret-reference-key",
+        default=SOURCE_DATABASE_CONFIG_REFERENCE,
+        help="Environment variable containing this DataSource's read-only PostgreSQL URL",
+    )
+    trigger_sync = commands.add_parser(
+        "trigger-sync",
+        help="Enqueue an immediate sanitized-source synchronization",
+    )
+    trigger_sync.add_argument("--enterprise-slug", required=True)
+    trigger_sync.add_argument("--source-key")
     return root
 
 
@@ -189,12 +212,152 @@ def create_user(args: argparse.Namespace) -> None:
     print(f"Created user {user_id}")
 
 
+def configure_source(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    source_type = (
+        "simulated_generator" if settings.app_env == "local-demo" else "customer_sanitized_database"
+    )
+    source_key = (
+        "demo-sanitized-source" if settings.app_env == "local-demo" else "customer-sanitized-source"
+    )
+    with SessionLocal.begin() as db:
+        enterprise = db.scalar(select(Enterprise).where(Enterprise.slug == args.enterprise_slug))
+        if enterprise is None:
+            raise SystemExit("Enterprise does not exist; run create-admin first")
+        source = db.scalar(
+            select(DataSource).where(
+                DataSource.enterprise_id == enterprise.id,
+                DataSource.key == source_key,
+            )
+        )
+        if source is None:
+            source = DataSource(
+                enterprise_id=enterprise.id,
+                key=source_key,
+                display_name=args.display_name.strip(),
+                source_type=source_type,
+                schema_version=settings.source_schema_version,
+                secret_reference_key=args.secret_reference_key.strip(),
+            )
+            db.add(source)
+        source.display_name = args.display_name.strip()
+        source.source_type = source_type
+        source.schema_version = settings.source_schema_version
+        source.is_enabled = True
+        source.configuration_json = {
+            "schema": settings.source_schema,
+            "connection_mode": settings.source_connection_mode,
+        }
+        source.secret_reference_key = args.secret_reference_key.strip()
+        db.flush()
+        require_isolated_data_source(db, source)
+        inspection = test_source_connection(source, db=db, settings=settings)
+        source.configuration_json = {
+            **source.configuration_json,
+            "database_version": inspection["database_version"],
+            "read_only": inspection["read_only"],
+            "tls_active": inspection["tls_active"],
+        }
+        source.last_tested_at = utc_now()
+        source.last_test_status = "success"
+        source.last_test_error = None
+        db.flush()
+        db.add(
+            AuditEvent(
+                enterprise_id=enterprise.id,
+                action="cli.data_source_configured",
+                target_type="data_source",
+                target_id=str(source.id),
+                outcome="success",
+                metadata_json={
+                    "source_type": source_type,
+                    "schema_version": settings.source_schema_version,
+                },
+            )
+        )
+        source_id = source.id
+    print(f"Configured sanitized source {source_id}")
+
+
+def trigger_sync(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    with SessionLocal.begin() as db:
+        enterprise = db.scalar(select(Enterprise).where(Enterprise.slug == args.enterprise_slug))
+        if enterprise is None:
+            raise SystemExit("Enterprise does not exist; run create-admin first")
+        source_statement = select(DataSource).where(
+            DataSource.enterprise_id == enterprise.id,
+            DataSource.is_enabled.is_(True),
+        )
+        if args.source_key:
+            source_statement = source_statement.where(DataSource.key == args.source_key)
+        sources = db.scalars(source_statement.order_by(DataSource.created_at)).all()
+        if not sources:
+            raise SystemExit("No enabled sanitized data source exists; run configure-source first")
+        if len(sources) > 1 and not args.source_key:
+            raise SystemExit("Multiple enabled data sources exist; specify --source-key")
+        source = sources[0]
+        try:
+            require_isolated_data_source(db, source)
+        except IngestionError as exc:
+            raise SystemExit(str(exc)) from exc
+        organization_ids = db.scalars(
+            select(OrganizationUnit.id).where(
+                OrganizationUnit.enterprise_id == enterprise.id,
+                OrganizationUnit.is_active.is_(True),
+                OrganizationUnit.enabled_for_analysis.is_(True),
+                OrganizationUnit.data_connected.is_(True),
+            )
+        ).all()
+        job = Job(
+            enterprise_id=enterprise.id,
+            created_by_user_id=None,
+            job_type="data.sync",
+            status="queued",
+            scheduled_at=utc_now(),
+            max_attempts=settings.worker_job_max_attempts,
+            payload_json={
+                "data_source_id": str(source.id),
+                "scheduled_task_id": None,
+                "trigger_type": "fde_cli",
+                "request_id": uuid.uuid4().hex,
+            },
+            scope_snapshot_json={
+                "system": True,
+                "enterprise_id": str(enterprise.id),
+                "organization_unit_ids": [str(value) for value in organization_ids],
+            },
+        )
+        db.add(job)
+        db.flush()
+        db.add(
+            AuditEvent(
+                enterprise_id=enterprise.id,
+                action="cli.data_sync_requested",
+                target_type="job",
+                target_id=str(job.id),
+                outcome="success",
+                metadata_json={
+                    "data_source_id": str(source.id),
+                    "source_key": source.key,
+                    "trigger_type": "fde_cli",
+                },
+            )
+        )
+        job_id = job.id
+    print(f"Enqueued sanitized source sync {job_id}")
+
+
 def main() -> None:
     args = parser().parse_args()
     if args.command == "create-admin":
         create_admin(args)
     elif args.command == "create-user":
         create_user(args)
+    elif args.command == "configure-source":
+        configure_source(args)
+    elif args.command == "trigger-sync":
+        trigger_sync(args)
 
 
 if __name__ == "__main__":

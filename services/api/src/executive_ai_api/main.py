@@ -24,8 +24,11 @@ from .logging_config import configure_logging
 from .middleware import RequestContextMiddleware
 from .routers import (
     admin,
+    admin_data,
+    admin_models,
     auth,
     conversations,
+    data,
     files,
     health,
     jobs,
@@ -43,6 +46,9 @@ configure_logging(settings.log_level)
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Settings construction is deliberately part of startup; unsafe production values fail closed.
     settings.decoded_file_encryption_key()
+    settings.integration_encryption_keys()
+    if len(settings.hermes_runtime_hmac_key.get_secret_value()) < 32:
+        raise RuntimeError("HERMES_RUNTIME_HMAC_KEY must contain at least 32 characters")
     with engine.begin() as connection:
         initialize_audit_chains(connection)
     yield
@@ -86,6 +92,9 @@ for api_router in (
     reports.router,
     jobs.router,
     admin.router,
+    admin_data.router,
+    admin_models.router,
+    data.router,
 ):
     app.include_router(
         api_router,

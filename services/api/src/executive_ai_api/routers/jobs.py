@@ -167,9 +167,7 @@ def cancel_job(
         JobAttempt.status == "running",
     )
     if active_lease_token:
-        attempt_statement = attempt_statement.where(
-            JobAttempt.lease_token == active_lease_token
-        )
+        attempt_statement = attempt_statement.where(JobAttempt.lease_token == active_lease_token)
     for attempt in db.scalars(attempt_statement).all():
         attempt.status = "canceled"
         attempt.completed_at = item.completed_at

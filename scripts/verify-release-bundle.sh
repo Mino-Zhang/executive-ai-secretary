@@ -23,9 +23,9 @@ jq -e '
   (keys == ["database", "images", "release", "schemaVersion"]) and
   (.schemaVersion == "executive-ai.release-bundle/v1") and
   (.database | keys == ["alembicHead"]) and
-  (.images | keys == ["api", "fileTool", "nginx", "postgres", "web", "worker"]) and
+  (.images | keys == ["api", "fileTool", "hermes", "nginx", "postgres", "web", "worker"]) and
   (.release | keys == ["generatedAt", "gitCommit", "repository", "sourceRef", "trigger", "version", "workflow", "workflowRunId"]) and
-  ([.database.alembicHead, .images.api, .images.fileTool, .images.nginx,
+  ([.database.alembicHead, .images.api, .images.fileTool, .images.hermes, .images.nginx,
     .images.postgres, .images.web, .images.worker, .release.generatedAt,
     .release.gitCommit, .release.repository, .release.sourceRef,
     .release.trigger, .release.version, .release.workflow] | all(type == "string")) and
@@ -72,7 +72,7 @@ expected_repository="${RELEASE_GITHUB_REPOSITORY:-Mino-Zhang/executive-ai-secret
 [ "${alembic_head}" = "${EXPECTED_ALEMBIC_HEAD}" ] \
   || die "release bundle Alembic head does not match EXPECTED_ALEMBIC_HEAD"
 
-for image_key in web api worker postgres nginx fileTool; do
+for image_key in web api worker hermes postgres nginx fileTool; do
   signed_image="$(jq -er --arg key "${image_key}" '.images[$key]' "${bundle_file}")"
   [[ "${signed_image}" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] \
     || die "signed ${image_key} image is not pinned by a valid sha256 digest"
@@ -92,6 +92,7 @@ assert_image_match() {
 assert_image_match web WEB_IMAGE "${WEB_IMAGE:-}"
 assert_image_match api API_IMAGE "${API_IMAGE:-}"
 assert_image_match worker WORKER_IMAGE "${WORKER_IMAGE:-}"
+assert_image_match hermes HERMES_IMAGE "${HERMES_IMAGE:-}"
 assert_image_match postgres POSTGRES_IMAGE "${POSTGRES_IMAGE:-}"
 assert_image_match nginx NGINX_IMAGE "${NGINX_IMAGE:-}"
 assert_image_match fileTool FILE_TOOL_IMAGE "${FILE_TOOL_IMAGE:-}"
@@ -113,7 +114,7 @@ cosign verify-blob \
   "${workflow_claims[@]}" \
   "${bundle_file}" >/dev/null
 
-for component in web api worker; do
+for component in web api worker hermes; do
   image="$(jq -er --arg key "${component}" '.images[$key]' "${bundle_file}")"
   case "${image}" in
     ghcr.io/*@sha256:*) ;;
@@ -128,4 +129,4 @@ for component in web api worker; do
     "${image}" >/dev/null
 done
 
-info "Signed release bundle, six image digests and Alembic head are consistent."
+info "Signed release bundle, seven image digests and Alembic head are consistent."

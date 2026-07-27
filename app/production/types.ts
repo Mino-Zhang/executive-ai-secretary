@@ -95,8 +95,96 @@ export type FileMetadata = {
   size_bytes: number;
   sha256: string;
   status: "uploaded" | "processing" | "ready" | "partial" | "failed";
+  metadata_json: { extractable?: boolean };
+  extraction_status?: "queued" | "processing" | "completed" | "failed" | "unsupported";
   created_at: string;
   deleted_at: string | null;
+};
+
+export type FileExtraction = {
+  file_id: string;
+  status: "queued" | "processing" | "completed" | "failed";
+  parser_name: string | null;
+  parser_version: string | null;
+  page_count: number | null;
+  chunk_count: number;
+  error_code: string | null;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DataDomainStatus = {
+  domain: "opportunity" | "delivery" | "collection" | "target" | string;
+  status: "fresh" | "stale" | "partial" | "failed" | "unavailable" | string;
+  source_data_as_of: string | null;
+  last_success_at: string | null;
+  record_count: number;
+  dataset_version: string | null;
+  source_type: string;
+  source_display_name: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
+};
+
+export type DataCapabilities = {
+  source_kind: string;
+  source_label: string;
+  organization_unit_ids: string[];
+  capabilities: Record<string, boolean>;
+  domains: DataDomainStatus[];
+  overall_status: "fresh" | "stale" | "partial" | "failed" | "unavailable" | string;
+  generated_at: string;
+};
+
+export type AnspireModelOption = {
+  id: string;
+  name: string;
+  family: string;
+  profile: string;
+  capability: "chat" | "image" | "video" | "embedding" | "rerank";
+  selectable: boolean;
+};
+
+export type ModelProviderConfig = {
+  provider: "anspire";
+  endpoint_url: string;
+  documentation_url: string;
+  model_id: string;
+  is_enabled: boolean;
+  is_configured: boolean;
+  api_key_masked: string | null;
+  last_tested_at: string | null;
+  last_test_status: "pending" | "success" | "failed" | null;
+  last_test_latency_ms: number | null;
+  last_test_error: string | null;
+  models: AnspireModelOption[];
+  updated_at: string | null;
+};
+
+export type ModelProviderTest = {
+  status: "success";
+  model: string;
+  latency_ms: number;
+  tested_at: string;
+};
+
+export type MessageEvidence = {
+  id: string;
+  evidence_key: string;
+  domain: string;
+  title: string;
+  value_json: Record<string, unknown>;
+  source_type: string;
+  source_display_name: string;
+  source_data_as_of: string;
+  dataset_version: string | null;
+  scope_json: Record<string, unknown>;
+  query_json: Record<string, unknown>;
+  row_references_json: Array<Record<string, unknown>>;
+  created_at: string;
 };
 
 export type Memory = {
@@ -154,7 +242,8 @@ export type ProductionBootstrap = {
   memories: Memory[];
   reports: Report[];
   jobs: Job[];
-  optionalErrors: Partial<Record<"memories" | "reports" | "jobs", string>>;
+  dataCapabilities: DataCapabilities | null;
+  optionalErrors: Partial<Record<"memories" | "reports" | "jobs" | "dataCapabilities", string>>;
 };
 
 export type ApiErrorPayload = {

@@ -17,12 +17,18 @@ info "Starting ${environment}; the only host listener will be 127.0.0.1:${HTTP_P
 # submits duplicate BuildKit targets in one parallel bake session.
 compose "${environment}" build api
 compose "${environment}" build worker
+compose "${environment}" build hermes-runtime
 compose "${environment}" build web
-compose "${environment}" up --detach --wait postgres
-for one_shot in db-role-init migrate db-permissions; do
+if compose "${environment}" config --services | grep -qx source-postgres; then
+  compose "${environment}" up --detach --wait postgres source-postgres
+else
+  compose "${environment}" up --detach --wait postgres
+fi
+for one_shot in db-role-init migrate db-permissions embedding-cache-init embedding-model-init; do
   compose "${environment}" up --no-deps --force-recreate \
     --abort-on-container-exit --exit-code-from "${one_shot}" "${one_shot}"
 done
-compose "${environment}" up --detach --no-deps --no-build --remove-orphans api worker web nginx
+compose "${environment}" up --detach --wait --no-deps --no-build --remove-orphans \
+  api mcp-hub hermes-runtime worker ingestion-worker file-worker scheduler web nginx
 compose "${environment}" ps
 info "Open ${PUBLIC_BASE_URL}"

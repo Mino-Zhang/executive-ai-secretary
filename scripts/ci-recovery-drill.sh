@@ -64,7 +64,13 @@ for database_secret in \
   postgres_password \
   postgres_migrator_password \
   postgres_runtime_password \
-  postgres_backup_password; do
+  postgres_backup_password \
+  postgres_api_password \
+  postgres_assistant_worker_password \
+  postgres_file_worker_password \
+  postgres_ingestion_password \
+  postgres_scheduler_password \
+  postgres_mcp_password; do
   sudo chmod 0444 "${runtime_dir}/secrets/${database_secret}"
 done
 # Application-only secrets stay private to uid/gid 999. In particular, the key
@@ -75,6 +81,8 @@ for app_secret in \
   csrf_secret \
   file_encryption_key \
   file_encryption_key_ring \
+  integration_encryption_key \
+  integration_encryption_key_ring \
   audit_hmac_key \
   audit_hmac_key_ring; do
   sudo chown 999:999 "${runtime_dir}/secrets/${app_secret}"

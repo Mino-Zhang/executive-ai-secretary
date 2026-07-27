@@ -141,9 +141,7 @@ def test_audit_hmac_verification_detects_tampering(client, seeded) -> None:
     with SessionLocal() as db:
         audit_count_before = len(
             db.scalars(
-                select(AuditEvent).where(
-                    AuditEvent.enterprise_id == seeded["enterprise_id"]
-                )
+                select(AuditEvent).where(AuditEvent.enterprise_id == seeded["enterprise_id"])
             ).all()
         )
     verified = client.post(
@@ -177,9 +175,7 @@ def test_audit_hmac_verification_detects_tampering(client, seeded) -> None:
     with SessionLocal() as db:
         audit_count_after_tampering = len(
             db.scalars(
-                select(AuditEvent).where(
-                    AuditEvent.enterprise_id == seeded["enterprise_id"]
-                )
+                select(AuditEvent).where(AuditEvent.enterprise_id == seeded["enterprise_id"])
             ).all()
         )
     detected_again = client.post(
@@ -189,13 +185,14 @@ def test_audit_hmac_verification_detects_tampering(client, seeded) -> None:
     assert detected_again.status_code == 200
     assert detected_again.json() == detected.json()
     with SessionLocal() as db:
-        assert len(
-            db.scalars(
-                select(AuditEvent).where(
-                    AuditEvent.enterprise_id == seeded["enterprise_id"]
-                )
-            ).all()
-        ) == audit_count_after_tampering
+        assert (
+            len(
+                db.scalars(
+                    select(AuditEvent).where(AuditEvent.enterprise_id == seeded["enterprise_id"])
+                ).all()
+            )
+            == audit_count_after_tampering
+        )
 
 
 def test_audit_chain_detects_middle_event_deletion(client, seeded) -> None:
@@ -266,15 +263,13 @@ def test_audit_chain_detects_tail_deletion_and_anchor_tampering(client, seeded) 
         assert response.json()["valid"] is False
         assert response.json()["errors"] == ["chain_anchor_missing"]
         with SessionLocal() as db:
-            assert db.scalars(
-                select(AuditEvent).where(
-                    AuditEvent.enterprise_id == seeded["enterprise_id"]
-                )
-            ).all() == []
             assert (
-                db.get(AuditChainHead, f"enterprise:{seeded['enterprise_id']}")
-                is None
+                db.scalars(
+                    select(AuditEvent).where(AuditEvent.enterprise_id == seeded["enterprise_id"])
+                ).all()
+                == []
             )
+            assert db.get(AuditChainHead, f"enterprise:{seeded['enterprise_id']}") is None
 
 
 def test_legacy_v1_audit_signature_remains_verifiable() -> None:

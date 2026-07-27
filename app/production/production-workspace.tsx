@@ -17,6 +17,7 @@ import type {
   AuthMe,
   Conversation,
   ConversationMessage,
+  DataCapabilities,
   FileMetadata,
   Memory,
   OrganizationUnit,
@@ -196,15 +197,27 @@ function formatDate(value: string, locale: string = "zh-CN") {
   return new Intl.DateTimeFormat(locale, { year: "numeric", month: "short", day: "numeric" }).format(date);
 }
 
+const domainLabels: Record<string, string> = {
+  opportunity: "商机",
+  delivery: "交付",
+  collection: "回款",
+  target: "目标",
+};
+
+function dataStatusLabel(capabilities: DataCapabilities | null) {
+  if (!capabilities) return "数据状态待确认";
+  if (capabilities.overall_status === "fresh") return "经营数据已就绪";
+  if (capabilities.overall_status === "stale") return "部分数据时间较早";
+  if (capabilities.overall_status === "partial") return "部分数据可用";
+  if (capabilities.overall_status === "failed") return "数据同步失败";
+  return "尚未完成数据同步";
+}
+
 function messageStatusLabel(status: ConversationMessage["status"]) {
   if (status === "queued") return "等待受控处理";
   if (status === "running") return "正在处理";
   if (status === "failed") return "未完成";
   return status ?? "";
-}
-
-function wait(milliseconds: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function makeInitials(value: string) {
@@ -309,6 +322,7 @@ export function ProductionWorkspace({
   const c = copy[languagePreference];
   const organizationUnits = bootstrap.organizationUnits;
   const businessDataReady = organizationUnits.length > 0;
+  const dataCapabilities = bootstrap.dataCapabilities;
   const activeConversation = bootstrap.conversations.find((item) => item.id === activeConversationId) ?? null;
   const selectedOrganization = selectedOrganizationId === ALL_SCOPE_ID
     ? null
@@ -334,6 +348,59 @@ export function ProductionWorkspace({
   );
   const optionalWarning = Object.values(bootstrap.optionalErrors)[0];
   const userInitials = makeInitials(preferredDisplayName(me)).toUpperCase();
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+    const source = new EventSource(
+      productionServices.conversations.streamUrl(activeConversationId, 0),
+      { withCredentials: true },
+    );
+    source.addEventListener("message", (event) => {
+      try {
+        const message = JSON.parse((event as MessageEvent<string>).data) as ConversationMessage;
+        setMessages((current) => {
+          const existingIndex = current.findIndex((item) => item.id === message.id);
+          if (existingIndex < 0) {
+            return [...current, message].sort((first, second) => first.sequence - second.sequence);
+          }
+          const next = [...current];
+          next[existingIndex] = message;
+          return next;
+        });
+      } catch {
+        // A malformed event is ignored; EventSource remains connected for the next update.
+      }
+    });
+    return () => source.close();
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    const pending = uploadedFiles.filter(
+      (file) => file.metadata_json?.extractable
+        && (file.extraction_status === "queued" || file.extraction_status === "processing"),
+    );
+    if (!pending.length) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      const updates = await Promise.all(pending.map(async (file) => {
+        try {
+          const extraction = await productionServices.files.extraction(file.id);
+          return { id: file.id, status: extraction.status };
+        } catch {
+          return { id: file.id, status: "failed" as const };
+        }
+      }));
+      if (cancelled) return;
+      setUploadedFiles((current) => current.map((file) => {
+        const update = updates.find((item) => item.id === file.id);
+        return update ? { ...file, extraction_status: update.status } : file;
+      }));
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [uploadedFiles]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = themePreference;
@@ -468,7 +535,14 @@ export function ProductionWorkspace({
       const uploaded: FileMetadata[] = [];
       for (const file of incoming.slice(0, 10)) {
         if (file.size > 50 * 1024 * 1024) throw new Error(`${file.name} 超过 50 MB 限制。`);
-        uploaded.push(await productionServices.files.upload(file, activeConversationId ?? undefined));
+        const item = await productionServices.files.upload(file, activeConversationId ?? undefined);
+        if (item.metadata_json?.extractable) {
+          const extraction = await productionServices.files.extraction(item.id);
+          item.extraction_status = extraction.status;
+        } else {
+          item.extraction_status = "unsupported";
+        }
+        uploaded.push(item);
       }
       return uploaded;
     });
@@ -513,23 +587,16 @@ export function ProductionWorkspace({
       const message = await productionServices.conversations.sendMessage(
         conversationId,
         content,
-        uploadedFiles.filter((file) => file.status === "ready" || file.status === "partial").map((file) => file.id),
+        uploadedFiles
+          .filter((file) => file.extraction_status === "completed")
+          .map((file) => file.id),
       );
       setMessages((current) => [...current, message]);
       setDraft("");
       setUploadedFiles([]);
       window.history.replaceState(null, "", `${window.location.pathname}?conversation=${encodeURIComponent(conversationId)}`);
-      let refreshed = await productionServices.conversations.messages(conversationId);
+      const refreshed = await productionServices.conversations.messages(conversationId);
       setMessages(refreshed.items);
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        const hasPendingAssistant = refreshed.items.some(
-          (item) => item.role === "assistant" && (item.status === "queued" || item.status === "running"),
-        );
-        if (!hasPendingAssistant) break;
-        await wait(750);
-        refreshed = await productionServices.conversations.messages(conversationId);
-        setMessages(refreshed.items);
-      }
       await refreshWorkspace();
     });
     setSending(false);
@@ -845,7 +912,7 @@ export function ProductionWorkspace({
         </div>
 
         <footer className="sidebar-footer">
-          <button type="button" className="sidebar-data-status" onClick={() => setActivePanel("scope")}><span className={`status-dot ${businessDataReady ? "positive" : ""}`} aria-hidden="true" /><span className="sidebar-label"><strong>{businessDataReady ? c.dataReady : c.dataMissing}</strong><small>{businessDataReady ? `${organizationUnits.length} 个授权事业部` : "请联系企业管理员"}</small></span></button>
+          <button type="button" className="sidebar-data-status" onClick={() => setActivePanel("scope")}><span className={`status-dot ${dataCapabilities?.overall_status === "fresh" ? "positive" : dataCapabilities?.overall_status === "failed" ? "risk" : ""}`} aria-hidden="true" /><span className="sidebar-label"><strong>{businessDataReady ? dataStatusLabel(dataCapabilities) : c.dataMissing}</strong><small>{dataCapabilities ? `${dataCapabilities.source_label} · ${organizationUnits.length} 个事业部` : businessDataReady ? "等待首次数据同步" : "请联系企业管理员"}</small></span></button>
           <div ref={accountRef} className="profile-control workspace-profile">
             <button className="profile-button" type="button" aria-label="打开个人菜单" aria-expanded={accountMenuOpen} onClick={() => { setAccountMenuOpen((current) => !current); setLanguageMenuOpen(false); }}><span className="profile-avatar" aria-hidden="true">{userInitials}</span><span className="sidebar-label"><strong>{preferredDisplayName(me)}</strong><small>{selectedScopeLabel}</small></span><span className="profile-menu-chevron sidebar-label" aria-hidden="true">{accountMenuOpen ? "⌄" : "›"}</span></button>
             {accountMenuOpen && <div className="profile-menu account-menu" role="menu" aria-label="个人菜单">
@@ -888,7 +955,7 @@ export function ProductionWorkspace({
         <header className="workspace-topbar">
           <button className="mobile-sidebar-trigger" type="button" aria-label="打开侧栏" onClick={() => setSidebarOpen(true)}>☰</button>
           <div className="workspace-title-block"><strong>{activeConversation?.title || (activeProjectId ? bootstrap.projects.find((item) => item.id === activeProjectId)?.name : null) || c.newConversation}</strong><small>{environmentLabel(me)} · {selectedScopeLabel}</small></div>
-          <div className="workspace-topbar-actions"><span className="production-environment-badge">{environmentLabel(me)}</span><button className="topbar-scope-button" type="button" onClick={() => void refreshWorkspace()}>刷新数据</button><button className="topbar-new-button" type="button" aria-label="新建会话" onClick={() => newConversation()}>＋</button></div>
+          <div className="workspace-topbar-actions"><span className={`production-environment-badge data-${dataCapabilities?.overall_status ?? "unavailable"}`}>{dataStatusLabel(dataCapabilities)}</span><button className="topbar-scope-button" type="button" onClick={() => void refreshWorkspace()}>刷新状态</button><button className="topbar-new-button" type="button" aria-label="新建会话" onClick={() => newConversation()}>＋</button></div>
         </header>
         <main id="main-content" className="workspace-main">
           {activeConversationId ? (
@@ -922,6 +989,7 @@ export function ProductionWorkspace({
               selectedOrganizationId={selectedOrganizationId}
               setSelectedOrganizationId={setSelectedOrganizationId}
               latestReport={latestDailyReport}
+              dataCapabilities={dataCapabilities}
               onOpenReport={() => void openReport("daily", latestDailyReport?.id)}
               draft={draft}
               setDraft={setDraft}
@@ -948,6 +1016,7 @@ export function ProductionWorkspace({
         conversations={bootstrap.conversations}
         memories={bootstrap.memories}
         organizationUnits={organizationUnits}
+        dataCapabilities={dataCapabilities}
         language={languagePreference}
         memoryEnabled={memoryEnabled}
         setMemoryEnabled={setMemoryEnabled}
@@ -1060,6 +1129,7 @@ function ProductionHome({
   selectedOrganizationId,
   setSelectedOrganizationId,
   latestReport,
+  dataCapabilities,
   onOpenReport,
   draft,
   setDraft,
@@ -1080,6 +1150,7 @@ function ProductionHome({
   selectedOrganizationId: string;
   setSelectedOrganizationId: (value: string) => void;
   latestReport: Report | null;
+  dataCapabilities: DataCapabilities | null;
   onOpenReport: () => void;
   draft: string;
   setDraft: (value: string) => void;
@@ -1112,7 +1183,7 @@ function ProductionHome({
               <span>查看晨间摘要 <b aria-hidden="true">›</b></span>
             </button>
           ) : (
-            <div className="morning-brief-trigger production-brief-trigger empty" role="status"><span className="morning-brief-dot" aria-hidden="true" /><span><strong>今日简报尚未生成</strong><small>连接经营数据与简报任务后将在这里出现</small></span><span>尚未配置</span></div>
+            <div className={`morning-brief-trigger production-brief-trigger data-status ${dataCapabilities?.overall_status ?? "unavailable"}`} role="status"><span className="morning-brief-dot" aria-hidden="true" /><span><strong>{dataStatusLabel(dataCapabilities)}</strong><small>{dataCapabilities?.domains.length ? dataCapabilities.domains.map((domain) => `${domainLabels[domain.domain] ?? domain.domain}截至 ${formatTimestamp(domain.source_data_as_of, language)}`).join(" · ") : "完成首次同步后将在这里显示各数据域时间"}</small></span><span>{dataCapabilities?.source_label ?? "尚未配置"}</span></div>
           )}
 
           <section className="workspace-greeting" aria-labelledby="production-greeting-title">
@@ -1142,7 +1213,7 @@ function ProductionHome({
           />
 
           {hasScope && <section className="prompt-suggestions production-prompt-suggestions" aria-label="从一个问题开始"><h2>{language === "en" ? "Start with a question" : "从一个问题开始"}</h2><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>}
-          <p className="home-service-note">生产模式不会使用演示数据。{c.disclaimer}</p>
+          <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? `数据来源：${dataCapabilities.source_label}。` : "当前尚未激活经营数据。"}{c.disclaimer}</p>
         </div>
       </div>
     </div>
@@ -1202,7 +1273,7 @@ function ProductionConversation({
           <article className={`structured-answer production-answer ${message.status === "failed" ? "failed" : ""}`} key={message.id}>
             <div className="answer-meta"><span>{message.role === "assistant" ? "AI 秘书" : message.role === "tool" ? "数据工具" : "系统"}</span><time>{formatTimestamp(message.created_at, language)}</time></div>
             <section className="answer-conclusion"><p>{message.content || "正在等待真实处理结果…"}</p></section>
-            <MessageDetails message={message} />
+            <MessageDetails conversationId={conversation?.id ?? message.conversation_id} message={message} />
             {message.status && message.status !== "completed" && <small className={`message-status ${message.status}`}>状态：{messageStatusLabel(message.status)}</small>}
           </article>
         ))}
@@ -1237,17 +1308,152 @@ function MessageSkeleton() {
   return <section className="message-skeleton" aria-live="polite" aria-label="正在读取会话消息"><span /><span /><span /><span /></section>;
 }
 
-function MessageDetails({ message }: { message: ConversationMessage }) {
+function humanizeMetricKey(key: string) {
+  const labels: Record<string, string> = {
+    opportunity_count: "商机数量",
+    pipeline_amount: "商机金额",
+    weighted_pipeline_amount: "加权商机",
+    delivery_count: "交付项目",
+    delivery_attention_count: "交付关注",
+    receivable_amount: "应收金额",
+    collected_amount: "已回款",
+    outstanding_amount: "未回款",
+    overdue_amount: "逾期金额",
+    weighted_forecast: "加权预测",
+    project_count: "项目数量",
+    attention_count: "关注项目",
+    contract_amount: "合同金额",
+    gross_profit_amount: "毛利金额",
+    gross_margin_rate: "毛利率",
+  };
+  return labels[key] ?? key.replaceAll("_", " ");
+}
+
+function formatStructuredValue(key: string, value: unknown) {
+  if (typeof value !== "number") return String(value ?? "—");
+  if (key.endsWith("_rate")) return `${(value * 100).toFixed(1)}%`;
+  if (key.includes("amount") || key.includes("forecast")) {
+    return `${(value / 10000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })} 万`;
+  }
+  return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+type StructuredChartDatum = {
+  label: string;
+  value: number;
+};
+
+function buildStructuredChart(rows: unknown[]) {
+  const records = rows.filter(
+    (row): row is Record<string, unknown> => Boolean(row && typeof row === "object" && !Array.isArray(row)),
+  );
+  if (records.length < 2) return null;
+  const first = records[0];
+  const visibleKeys = Object.keys(first).filter(
+    (key) => !key.includes("source_record_id") && !key.endsWith("_id"),
+  );
+  const labelPriority = ["name", "stage", "bucket", "organization_name", "customer_alias", "risk_level", "status", "period"];
+  const labelKey = labelPriority.find((key) => typeof first[key] === "string")
+    ?? visibleKeys.find((key) => typeof first[key] === "string");
+  const numericKeys = visibleKeys.filter((key) => typeof first[key] === "number");
+  const metricKey = numericKeys.sort((left, right) => {
+    const score = (key: string) => key.includes("amount") || key.includes("forecast")
+      ? 4
+      : key.includes("count")
+        ? 3
+        : key.includes("rate") || key.includes("probability")
+          ? 2
+          : 1;
+    return score(right) - score(left);
+  })[0];
+  if (!labelKey || !metricKey) return null;
+  const items: StructuredChartDatum[] = records
+    .map((record) => ({ label: String(record[labelKey] ?? "—"), value: Number(record[metricKey]) }))
+    .filter((item) => Number.isFinite(item.value))
+    .slice(0, 8);
+  if (items.length < 2) return null;
+  return { metricKey, items };
+}
+
+function StructuredBarChart({
+  metricKey,
+  items,
+}: {
+  metricKey: string;
+  items: StructuredChartDatum[];
+}) {
+  const maximum = Math.max(...items.map((item) => Math.abs(item.value)), 0);
+  return (
+    <section className="answer-structured-chart" aria-label={`${humanizeMetricKey(metricKey)}对比图`}>
+      <header><div><small>数据对比</small><strong>{humanizeMetricKey(metricKey)}</strong></div><span>前 {items.length} 项</span></header>
+      <div>{items.map((item, index) => <article key={`${item.label}-${index}`}><span title={item.label}>{item.label}</span><i aria-hidden="true"><b style={{ width: `${maximum ? Math.max(3, Math.abs(item.value) / maximum * 100) : 0}%` }} /></i><strong>{formatStructuredValue(metricKey, item.value)}</strong></article>)}</div>
+    </section>
+  );
+}
+
+function MessageDetails({
+  conversationId,
+  message,
+}: {
+  conversationId: string;
+  message: ConversationMessage;
+}) {
   const content = message.content_json && typeof message.content_json === "object" ? message.content_json : {};
   const metrics = Array.isArray(content.metrics) ? content.metrics.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
   const sections = Array.isArray(content.sections) ? content.sections.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
+  const structuredData = content.structured_data && typeof content.structured_data === "object" && !Array.isArray(content.structured_data) ? content.structured_data as Record<string, unknown> : {};
+  const structuredMetrics = Object.entries(structuredData)
+    .filter(([, value]) => typeof value === "number" || typeof value === "string")
+    .slice(0, 6);
+  const structuredRows = Object.entries(structuredData).find(([, value]) => Array.isArray(value))?.[1];
+  const structuredChart = Array.isArray(structuredRows) ? buildStructuredChart(structuredRows) : null;
+  const freshness = Array.isArray(content.freshness) ? content.freshness.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
+  const fileCitations = Array.isArray(content.file_citations) ? content.file_citations.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
   const citations = message.citations ?? (Array.isArray(content.citations) ? content.citations.filter((item): item is { label: string; source: string; as_of?: string | null } => Boolean(item && typeof item === "object" && "label" in item && "source" in item)) : []);
-  if (!metrics.length && !sections.length && !citations.length && !message.source_data_as_of && !message.model_name) return null;
+  const clarificationId = typeof content.clarification_id === "string" ? content.clarification_id : null;
+  const clarificationOptions = Array.isArray(content.options) ? content.options.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
+  const evidenceCount = typeof content.evidence_count === "number" ? content.evidence_count : 0;
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
+  const [evidenceRows, setEvidenceRows] = useState<Awaited<ReturnType<typeof productionServices.conversations.evidence>>>([]);
+  const [clarificationResolved, setClarificationResolved] = useState(false);
+  const [clarificationLoading, setClarificationLoading] = useState(false);
+
+  async function toggleEvidence() {
+    const next = !evidenceOpen;
+    setEvidenceOpen(next);
+    if (!next || evidenceRows.length || evidenceLoading) return;
+    setEvidenceLoading(true);
+    try {
+      setEvidenceRows(await productionServices.conversations.evidence(conversationId, message.id));
+    } finally {
+      setEvidenceLoading(false);
+    }
+  }
+
+  async function resolveClarification(value: string) {
+    if (!clarificationId || clarificationLoading) return;
+    setClarificationLoading(true);
+    try {
+      await productionServices.conversations.resolveClarification(conversationId, clarificationId, value);
+      setClarificationResolved(true);
+    } finally {
+      setClarificationLoading(false);
+    }
+  }
+
+  if (!metrics.length && !sections.length && !structuredMetrics.length && !Array.isArray(structuredRows) && !citations.length && !fileCitations.length && !freshness.length && !clarificationId && !message.source_data_as_of && !message.model_name) return null;
   return (
     <div className="production-message-details">
       {metrics.length > 0 && <dl className="answer-metric-grid">{metrics.slice(0, 6).map((metric, index) => <div key={`${String(metric.label)}-${index}`}><dt>{String(metric.label ?? "指标")}</dt><dd>{String(metric.value ?? "—")}</dd>{metric.note ? <small>{String(metric.note)}</small> : null}</div>)}</dl>}
+      {structuredMetrics.length > 0 && <dl className="answer-metric-grid">{structuredMetrics.map(([key, value]) => <div key={key}><dt>{humanizeMetricKey(key)}</dt><dd>{formatStructuredValue(key, value)}</dd></div>)}</dl>}
+      {structuredChart && <StructuredBarChart metricKey={structuredChart.metricKey} items={structuredChart.items} />}
+      {Array.isArray(structuredRows) && structuredRows.length > 0 && <div className="answer-structured-table">{structuredRows.slice(0, 12).map((row, index) => { const record: Record<string, unknown> = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : { value: row }; return <article key={`${index}-${String(record.source_record_id ?? record.name ?? record.stage ?? record.bucket ?? "row")}`}><span>{String(index + 1).padStart(2, "0")}</span><div>{Object.entries(record).filter(([key]) => !key.includes("source_record_id") && !key.endsWith("_id")).slice(0, 4).map(([key, value]) => <p key={key}><small>{humanizeMetricKey(key)}</small><strong>{formatStructuredValue(key, value)}</strong></p>)}</div></article>; })}</div>}
       {sections.length > 0 && <div className="answer-section-list">{sections.slice(0, 8).map((section, index) => <section key={`${String(section.title)}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{String(section.title ?? "分析")}</strong>{section.content || section.detail ? <p>{String(section.content ?? section.detail)}</p> : null}</div></section>)}</div>}
-      {(citations.length > 0 || message.source_data_as_of || message.model_name) && <details className="answer-evidence"><summary>来源与处理信息</summary><dl>{message.source_data_as_of && <div><dt>数据截至</dt><dd>{formatTimestamp(message.source_data_as_of)}</dd></div>}{message.model_name && <div><dt>处理模型</dt><dd>{message.model_name}</dd></div>}{citations.map((citation, index) => <div key={`${citation.source}-${index}`}><dt>{citation.label}</dt><dd>{citation.source}{citation.as_of ? ` · ${citation.as_of}` : ""}</dd></div>)}</dl></details>}
+      {clarificationId && !clarificationResolved && <section className="clarification-options"><small>请确认后继续</small><div>{clarificationOptions.map((option, index) => { const label = String(option.label ?? option.value ?? `选项 ${index + 1}`); const value = String(option.value ?? option.label ?? ""); return <button type="button" key={`${value}-${index}`} disabled={!value || clarificationLoading} onClick={() => void resolveClarification(value)}>{label}<span aria-hidden="true">›</span></button>; })}</div>{!clarificationOptions.length && <p>请在输入框中补充需要查询的事业部范围。</p>}</section>}
+      {clarificationResolved && <p className="clarification-resolved">已确认范围，正在继续处理。</p>}
+      {(freshness.length > 0 || citations.length > 0 || fileCitations.length > 0 || message.source_data_as_of || message.model_name) && <details className="answer-evidence"><summary>来源与数据时间</summary><dl>{message.source_data_as_of && <div><dt>数据截至</dt><dd>{formatTimestamp(message.source_data_as_of)}</dd></div>}{freshness.map((item, index) => <div key={`${String(item.domain)}-${index}`}><dt>{domainLabels[String(item.domain)] ?? String(item.domain ?? "数据")}</dt><dd>{String(item.source_display_name ?? "未知来源")} · {formatTimestamp(typeof item.source_data_as_of === "string" ? item.source_data_as_of : null)} · {item.status === "fresh" ? "最新" : String(item.status ?? "")}</dd></div>)}{fileCitations.map((citation, index) => <div key={`${String(citation.file_id)}-${index}`}><dt>文件</dt><dd>{String(citation.file_name ?? "文件")} · {JSON.stringify(citation.locator ?? {})}</dd></div>)}{citations.map((citation, index) => <div key={`${citation.source}-${index}`}><dt>{citation.label}</dt><dd>{citation.source}{citation.as_of ? ` · ${citation.as_of}` : ""}</dd></div>)}{message.model_name && <div><dt>处理模型</dt><dd>{message.model_name}</dd></div>}</dl></details>}
+      {evidenceCount > 0 && <section className="numeric-evidence"><button type="button" onClick={() => void toggleEvidence()}><span>{evidenceOpen ? "收起数字依据" : `查看数字依据（${evidenceCount}）`}</span><i aria-hidden="true">{evidenceOpen ? "⌃" : "⌄"}</i></button>{evidenceOpen && <div>{evidenceLoading ? <small>正在读取受控证据…</small> : evidenceRows.map((evidence) => <article key={evidence.id}><header><strong>{domainLabels[evidence.domain] ?? evidence.domain}</strong><span>{evidence.source_display_name}</span></header><p>数据截至 {formatTimestamp(evidence.source_data_as_of)}{evidence.dataset_version ? ` · ${evidence.dataset_version}` : ""}</p><small>{evidence.row_references_json.length ? `${evidence.row_references_json.length} 条源记录引用` : "聚合结果来自当前激活数据版本"}</small></article>)}</div>}</section>}
     </div>
   );
 }
@@ -1288,11 +1494,14 @@ function ProductionComposer({
   onSubmit: (event: FormEvent) => void;
 }) {
   const c = copy[language];
+  const filesReady = uploadedFiles.every(
+    (file) => !file.metadata_json?.extractable || file.extraction_status === "completed",
+  );
   return (
     <form className="composer workbench-composer home-primary-composer production-composer" onSubmit={onSubmit}>
       <label className="sr-only" htmlFor={id}>输入经营问题</label>
       <textarea id={id} rows={2} maxLength={COMPOSER_MAX_LENGTH} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} placeholder={disabled ? "尚未配置可分析事业部" : c.placeholder} disabled={disabled} />
-      {uploadedFiles.length > 0 && <div className="composer-file-list" aria-label="待发送文件">{uploadedFiles.map((file) => <span key={file.id}><UiIcon name="file" /><strong>{file.original_name}</strong><small>{file.status}</small><button type="button" aria-label={`移除 ${file.original_name}`} onClick={() => onRemoveFile(file)}>×</button></span>)}</div>}
+      {uploadedFiles.length > 0 && <div className="composer-file-list" aria-label="待发送文件">{uploadedFiles.map((file) => <span key={file.id}><UiIcon name="file" /><strong>{file.original_name}</strong><small>{file.extraction_status === "completed" ? "解析完成" : file.extraction_status === "failed" ? "解析失败" : file.extraction_status === "unsupported" ? "不可解析" : "正在解析"}</small><button type="button" aria-label={`移除 ${file.original_name}`} onClick={() => onRemoveFile(file)}>×</button></span>)}</div>}
       <div className="composer-footer">
         <div className="composer-tools">
           <input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} />
@@ -1301,7 +1510,8 @@ function ProductionComposer({
         </div>
         <div className="composer-send">
           {draft.length >= COMPOSER_HINT_THRESHOLD && <span className="composer-character-count">{language === "en" ? `${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString("en")} characters remaining` : `还可输入 ${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString(language)} 字`}</span>}
-          <button className="composer-submit-button" type="submit" disabled={disabled || sending || !draft.trim()} aria-label="发送问题">↑</button>
+          {!filesReady && <span className="composer-file-progress">文件解析完成后可发送</span>}
+          <button className="composer-submit-button" type="submit" disabled={disabled || sending || !draft.trim() || !filesReady} aria-label="发送问题">↑</button>
         </div>
       </div>
     </form>
@@ -1369,6 +1579,7 @@ function WorkspaceDetailPanel({
   conversations,
   memories,
   organizationUnits,
+  dataCapabilities,
   language,
   memoryEnabled,
   setMemoryEnabled,
@@ -1389,6 +1600,7 @@ function WorkspaceDetailPanel({
   conversations: Conversation[];
   memories: Memory[];
   organizationUnits: OrganizationUnit[];
+  dataCapabilities: DataCapabilities | null;
   language: UiLanguage;
   memoryEnabled: boolean;
   setMemoryEnabled: (value: boolean) => void;
@@ -1417,7 +1629,7 @@ function WorkspaceDetailPanel({
           {reportPanel && <ProductionReportPanel kind={panel} report={report} loading={reportLoading} reports={reports} language={language} onSelectReport={onSelectReport} />}
           {panel === "history" && <ProductionHistoryPanel conversations={conversations} language={language} onOpen={onOpenConversation} onNew={onNewConversation} onRename={onRenameConversation} onArchive={onArchiveConversation} />}
           {panel === "memory" && <ProductionMemoryPanel memories={memories} organizationUnits={organizationUnits} enabled={memoryEnabled} setEnabled={setMemoryEnabled} onCreate={onCreateMemory} onUpdate={onUpdateMemory} onDelete={onDeleteMemory} />}
-          {panel === "scope" && <ProductionScopePanel organizationUnits={organizationUnits} />}
+          {panel === "scope" && <ProductionScopePanel organizationUnits={organizationUnits} dataCapabilities={dataCapabilities} />}
         </div>
       </aside>
     </div>
@@ -1530,10 +1742,20 @@ function ProductionMemoryPanel({
   );
 }
 
-function ProductionScopePanel({ organizationUnits }: { organizationUnits: OrganizationUnit[] }) {
+function ProductionScopePanel({
+  organizationUnits,
+  dataCapabilities,
+}: {
+  organizationUnits: OrganizationUnit[];
+  dataCapabilities: DataCapabilities | null;
+}) {
   return (
     <div className="page subpage production-scope-page">
       <section className="page-heading"><p className="eyebrow">服务端授权结果</p><h1>可查询范围</h1><p>这里仅展示已经接入数据、已启用分析并且当前账号获准访问的事业部。前端不能自行添加。</p></section>
+      <section className={`data-capability-summary ${dataCapabilities?.overall_status ?? "unavailable"}`}>
+        <header><div><span className="status-dot" aria-hidden="true" /><div><strong>{dataStatusLabel(dataCapabilities)}</strong><small>{dataCapabilities?.source_label ?? "尚未配置数据源"}</small></div></div><time>{dataCapabilities ? `状态生成于 ${formatTimestamp(dataCapabilities.generated_at)}` : "—"}</time></header>
+        {dataCapabilities?.domains.length ? <div className="data-domain-grid">{dataCapabilities.domains.map((domain) => <article key={domain.domain}><span>{domainLabels[domain.domain] ?? domain.domain}</span><strong>{domain.record_count.toLocaleString("zh-CN")} 条</strong><small>数据截至 {formatTimestamp(domain.source_data_as_of)}</small><i className={domain.status}>{domain.status === "fresh" ? "最新" : domain.status === "stale" ? "较旧" : domain.status === "failed" ? "失败" : "部分可用"}</i>{domain.last_error_message && <p>{domain.last_error_message}</p>}</article>)}</div> : <p className="data-capability-empty">首次数据同步完成后，将按商机、交付、回款和目标分别展示状态。</p>}
+      </section>
       {organizationUnits.length ? <div className="scope-unit-list">{organizationUnits.map((unit) => <article key={unit.id}><span className="scope-unit-mark" aria-hidden="true" /><div><strong>{unit.name}</strong><small>{unit.code} · {unit.unit_type}</small></div><span className="scope-unit-status">数据可用</span></article>)}</div> : <EmptyState title="尚未配置可分析事业部" description="请由企业管理员完成数据连接、启用分析并授予当前账号访问范围。" />}
       <aside className="scope-security-note"><UiIcon name="shield" /><div><strong>范围由服务端控制</strong><p>创建会话、生成任务和读取资源时都会再次校验权限，不依赖前端选择结果。</p></div></aside>
     </div>

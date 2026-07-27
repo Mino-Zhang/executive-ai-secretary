@@ -4,7 +4,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 
 class ORMModel(BaseModel):
@@ -14,6 +14,46 @@ class ORMModel(BaseModel):
 class Page(BaseModel):
     items: list[Any]
     next_cursor: str | None = None
+
+
+class ModelCatalogItem(BaseModel):
+    id: str
+    name: str
+    family: str
+    profile: str
+    capability: Literal["chat", "image", "video", "embedding", "rerank"]
+    selectable: bool
+
+
+class ModelProviderOut(BaseModel):
+    provider: Literal["anspire"] = "anspire"
+    endpoint_url: str
+    documentation_url: str
+    model_id: str
+    is_enabled: bool
+    is_configured: bool
+    api_key_masked: str | None
+    last_tested_at: datetime | None
+    last_test_status: str | None
+    last_test_latency_ms: int | None
+    last_test_error: str | None
+    models: list[ModelCatalogItem]
+    updated_at: datetime | None
+
+
+class ModelProviderUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str = Field(min_length=1, max_length=100)
+    api_key: SecretStr | None = Field(default=None)
+    is_enabled: bool | None = None
+
+
+class ModelProviderTestOut(BaseModel):
+    status: Literal["success"] = "success"
+    model: str
+    latency_ms: int
+    tested_at: datetime
 
 
 class UserOut(ORMModel):
@@ -41,11 +81,7 @@ class LoginRequest(BaseModel):
     @classmethod
     def normalize_email(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if (
-            normalized.count("@") != 1
-            or normalized.startswith("@")
-            or normalized.endswith("@")
-        ):
+        if normalized.count("@") != 1 or normalized.startswith("@") or normalized.endswith("@"):
             raise ValueError("invalid email")
         return normalized
 
@@ -185,6 +221,7 @@ class FileOut(ORMModel):
     sha256: str
     encryption_key_version: str
     status: str
+    metadata_json: dict[str, Any]
     created_at: datetime
     deleted_at: datetime | None
 
@@ -268,11 +305,7 @@ class UserCreate(BaseModel):
     @classmethod
     def normalize_email(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if (
-            normalized.count("@") != 1
-            or normalized.startswith("@")
-            or normalized.endswith("@")
-        ):
+        if normalized.count("@") != 1 or normalized.startswith("@") or normalized.endswith("@"):
             raise ValueError("invalid email")
         return normalized
 
@@ -329,3 +362,146 @@ class RuntimeStatus(BaseModel):
     database: str
     storage: str
     demo_data_enabled: bool
+
+
+class DataDomainStatusOut(ORMModel):
+    domain: str
+    status: str
+    source_data_as_of: datetime | None
+    last_success_at: datetime | None
+    record_count: int
+    dataset_version: str | None
+    source_type: str
+    source_display_name: str
+    last_error_code: str | None
+    last_error_message: str | None
+
+
+class DataCapabilitiesOut(BaseModel):
+    source_kind: str
+    source_label: str
+    organization_unit_ids: list[uuid.UUID]
+    capabilities: dict[str, bool]
+    domains: list[DataDomainStatusOut]
+    overall_status: str
+    generated_at: datetime
+
+
+class DataSourceOut(ORMModel):
+    id: uuid.UUID
+    key: str
+    display_name: str
+    source_type: str
+    schema_version: str
+    is_enabled: bool
+    configuration_json: dict[str, Any]
+    last_tested_at: datetime | None
+    last_test_status: str | None
+    last_test_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DataSourceUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
+    is_enabled: bool | None = None
+    configuration_json: dict[str, Any] | None = None
+
+
+class DataSourceTestOut(BaseModel):
+    ok: bool
+    schema_version: str
+    database_version: str
+    current_user: str
+    read_only: bool
+    tls_active: bool
+    latest_batch_id: str
+    source_data_as_of: datetime
+    duration_ms: int
+
+
+class DataSyncRunOut(ORMModel):
+    id: uuid.UUID
+    data_source_id: uuid.UUID
+    job_id: uuid.UUID | None
+    trigger_type: str
+    status: str
+    dataset_version: str | None
+    source_schema_version: str | None
+    source_batch_id: str | None
+    source_data_as_of: datetime | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    records_read: int
+    records_written: int
+    records_rejected: int
+    domain_results_json: dict[str, Any]
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+
+
+class ScheduledTaskOut(ORMModel):
+    id: uuid.UUID
+    data_source_id: uuid.UUID | None
+    key: str
+    task_type: str
+    cron_expression: str
+    timezone: str
+    is_enabled: bool
+    next_run_at: datetime | None
+    last_enqueued_at: datetime | None
+    configuration_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class ManualRunOut(BaseModel):
+    job_id: uuid.UUID
+    status: str = "queued"
+
+
+class FileExtractionOut(ORMModel):
+    file_id: uuid.UUID
+    status: str
+    parser_name: str | None
+    parser_version: str | None
+    page_count: int | None
+    chunk_count: int
+    error_code: str | None
+    error_message: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ClarificationResolve(BaseModel):
+    value: str = Field(min_length=1, max_length=500)
+
+
+class ClarificationOut(ORMModel):
+    id: uuid.UUID
+    conversation_id: uuid.UUID
+    message_id: uuid.UUID
+    question: str
+    options_json: list[dict[str, Any]]
+    status: str
+    selected_value: str | None
+    resolved_at: datetime | None
+
+
+class MessageEvidenceOut(ORMModel):
+    id: uuid.UUID
+    evidence_key: str
+    domain: str
+    title: str
+    value_json: dict[str, Any]
+    source_type: str
+    source_display_name: str
+    source_data_as_of: datetime
+    dataset_version: str | None
+    scope_json: dict[str, Any]
+    query_json: dict[str, Any]
+    row_references_json: list[dict[str, Any]]
+    created_at: datetime

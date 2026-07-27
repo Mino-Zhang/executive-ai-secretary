@@ -7,6 +7,7 @@ import stat
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import parse_qs, urlsplit
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -29,13 +30,55 @@ class Settings(BaseSettings):
         "development"
     )
     app_mode: Literal["demo", "production"] = "production"
-    service_role: Literal["api", "worker", "migration", "bootstrap", "seed"] = "api"
+    service_role: Literal[
+        "api",
+        "worker",
+        "assistant_worker",
+        "ingestion_worker",
+        "file_worker",
+        "scheduler",
+        "mcp",
+        "migration",
+        "bootstrap",
+        "seed",
+    ] = "api"
     debug: bool = False
     api_prefix: str = "/api/v1"
 
     database_url: str = "postgresql+psycopg://executive_ai:executive_ai@localhost:5432/executive_ai"
     database_pool_size: int = Field(default=10, ge=1, le=100)
     database_max_overflow: int = Field(default=20, ge=0, le=100)
+    source_database_url: SecretStr | None = None
+    source_writer_database_url: SecretStr | None = None
+    source_schema: str = "executive_source"
+    source_schema_version: str = "2.0"
+    source_connection_mode: Literal["internal", "external"] = "external"
+    source_query_page_size: int = Field(default=1000, ge=100, le=10_000)
+
+    capability_hmac_key: SecretStr = SecretStr("development-only-capability-key-change-me")
+    capability_token_ttl_seconds: int = Field(default=90, ge=15, le=600)
+    mcp_hub_url: str = "http://mcp-hub:8010"
+    hermes_runtime_url: str = "http://hermes-runtime:8020"
+    hermes_timeout_seconds: float = Field(default=120, ge=5, le=600)
+    hermes_runtime_hmac_key: SecretStr = SecretStr("development-only-hermes-runtime-key-change-me")
+    integration_encryption_key: SecretStr = SecretStr("")
+    integration_encryption_key_version: str = "v1"
+    integration_encryption_key_ring: SecretStr = SecretStr("")
+    integration_encryption_key_ring_file: Path | None = None
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_dimension: int = Field(default=512, ge=64, le=4096)
+    embedding_cache_dir: Path = Path("/opt/models")
+
+    sync_cron: str = "0 2 * * *"
+    sync_timezone: str = "Asia/Shanghai"
+    scheduler_poll_seconds: float = Field(default=15, ge=1, le=300)
+    demo_reference_date: str = "2026-07-26"
+    demo_dataset_version: str = "phase2-demo-v1"
+    feishu_app_id: str | None = None
+    feishu_app_secret: SecretStr | None = None
+    feishu_runtime_secret: SecretStr | None = None
+    feishu_bitable_app_token: str | None = None
+    feishu_bitable_table_id: str | None = None
 
     session_secret: SecretStr = Field(
         default=SecretStr("development-only-change-me-32-characters"),
@@ -91,8 +134,9 @@ class Settings(BaseSettings):
     worker_job_max_attempts: int = Field(default=3, ge=1, le=20)
     worker_retry_base_seconds: float = Field(default=2.0, ge=0.1, le=3600)
     worker_retry_max_seconds: float = Field(default=60.0, ge=0.1, le=86_400)
+    worker_job_types: Annotated[list[str], NoDecode] = ["*"]
 
-    @field_validator("allowed_origins", "trusted_hosts", mode="before")
+    @field_validator("allowed_origins", "trusted_hosts", "worker_job_types", mode="before")
     @classmethod
     def split_csv(cls, value: object) -> object:
         if isinstance(value, str):
@@ -103,6 +147,7 @@ class Settings(BaseSettings):
         "audit_hmac_key_version",
         "audit_hmac_legacy_key_version",
         "file_encryption_key_version",
+        "integration_encryption_key_version",
     )
     @classmethod
     def validate_key_version(cls, value: str) -> str:
@@ -123,12 +168,15 @@ class Settings(BaseSettings):
             )
         if protected and self.debug:
             raise ValueError("Debug mode is forbidden in protected environments")
+        if protected and self.source_connection_mode == "external" and self.source_database_url:
+            source_url = self.source_database_url.get_secret_value()
+            ssl_mode = parse_qs(urlsplit(source_url).query).get("sslmode", [])
+            if ssl_mode != ["verify-full"]:
+                raise ValueError("External SOURCE_DATABASE_URL must use sslmode=verify-full")
         if self.worker_heartbeat_seconds >= self.worker_lease_seconds:
             raise ValueError("WORKER_HEARTBEAT_SECONDS must be shorter than WORKER_LEASE_SECONDS")
         if self.worker_retry_base_seconds > self.worker_retry_max_seconds:
-            raise ValueError(
-                "WORKER_RETRY_BASE_SECONDS must not exceed WORKER_RETRY_MAX_SECONDS"
-            )
+            raise ValueError("WORKER_RETRY_BASE_SECONDS must not exceed WORKER_RETRY_MAX_SECONDS")
         if (
             self.service_role == "api"
             and self.session_cookie_samesite == "none"
@@ -163,7 +211,15 @@ class Settings(BaseSettings):
                 password = self.bootstrap_admin_password.get_secret_value().lower()
                 if password in insecure_values or "demo" in password:
                     raise ValueError("Demo or unsafe bootstrap passwords are forbidden")
-            if self.service_role in {"api", "worker", "bootstrap", "seed"}:
+            if self.service_role in {
+                "api",
+                "worker",
+                "assistant_worker",
+                "ingestion_worker",
+                "file_worker",
+                "bootstrap",
+                "seed",
+            }:
                 if (
                     len(self.audit_hmac_key.get_secret_value()) < 32
                     or self.audit_hmac_key.get_secret_value().lower() in insecure_values
@@ -189,11 +245,17 @@ class Settings(BaseSettings):
                     raise ValueError(
                         "SESSION_SECRET, CSRF_SECRET and AUDIT_HMAC_KEY must be distinct"
                     )
-            if self.service_role in {"api", "worker"}:
+            if self.service_role in {"api", "worker", "file_worker"}:
                 try:
                     self.file_encryption_keys()
                 except RuntimeError as exc:
                     raise ValueError(str(exc)) from exc
+            if self.service_role in {"worker", "assistant_worker", "mcp"}:
+                capability_key = self.capability_hmac_key.get_secret_value()
+                if len(capability_key) < 32 or capability_key.lower() in insecure_values:
+                    raise ValueError(
+                        "CAPABILITY_HMAC_KEY must be a non-default value of at least 32 characters"
+                    )
         return self
 
     def _load_key_ring(
@@ -247,6 +309,20 @@ class Settings(BaseSettings):
             raise RuntimeError("FILE_ENCRYPTION_KEY must decode to exactly 32 bytes")
         return value
 
+    def decoded_integration_encryption_key(self) -> bytes:
+        raw = self.integration_encryption_key.get_secret_value()
+        if not raw:
+            if self.app_env == "test":
+                return b"I" * 32
+            raise RuntimeError("INTEGRATION_ENCRYPTION_KEY is required")
+        try:
+            value = base64.urlsafe_b64decode(raw.encode("ascii"))
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError("INTEGRATION_ENCRYPTION_KEY must be URL-safe base64") from exc
+        if len(value) != 32:
+            raise RuntimeError("INTEGRATION_ENCRYPTION_KEY must decode to exactly 32 bytes")
+        return value
+
     def file_encryption_keys(self) -> dict[str, bytes]:
         encoded_ring = self._load_key_ring(
             self.file_encryption_key_ring,
@@ -271,6 +347,35 @@ class Settings(BaseSettings):
         if existing is not None and existing != current:
             raise RuntimeError("current file key conflicts with the same version in the key ring")
         decoded[self.file_encryption_key_version] = current
+        return decoded
+
+    def integration_encryption_keys(self) -> dict[str, bytes]:
+        encoded_ring = self._load_key_ring(
+            self.integration_encryption_key_ring,
+            self.integration_encryption_key_ring_file,
+            "INTEGRATION_ENCRYPTION_KEY_RING",
+        )
+        decoded: dict[str, bytes] = {}
+        for version, encoded in encoded_ring.items():
+            try:
+                value = base64.urlsafe_b64decode(encoded.encode("ascii"))
+            except (ValueError, UnicodeError) as exc:
+                raise RuntimeError(
+                    f"INTEGRATION_ENCRYPTION_KEY_RING key {version!r} must be URL-safe base64"
+                ) from exc
+            if len(value) != 32:
+                raise RuntimeError(
+                    f"INTEGRATION_ENCRYPTION_KEY_RING key {version!r} "
+                    "must decode to exactly 32 bytes"
+                )
+            decoded[version] = value
+        current = self.decoded_integration_encryption_key()
+        existing = decoded.get(self.integration_encryption_key_version)
+        if existing is not None and existing != current:
+            raise RuntimeError(
+                "current integration key conflicts with the same version in the key ring"
+            )
+        decoded[self.integration_encryption_key_version] = current
         return decoded
 
     def audit_hmac_keys(self) -> dict[str, str]:

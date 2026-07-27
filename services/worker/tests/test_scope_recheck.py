@@ -23,13 +23,99 @@ from executive_ai_api.models import (
     Job,
     JobAttempt,
     Message,
+    MessageEvidence,
+    MessageRun,
     OrganizationUnit,
     User,
 )
 from executive_ai_api.security import utc_now
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
+from executive_ai_worker.assistant_orchestrator import _save_answer_with_evidence
 from executive_ai_worker.main import authorization_is_current, process, worker_id
+
+
+def test_answer_and_evidence_save_is_atomic_and_idempotent() -> None:
+    Base.metadata.create_all(engine)
+    try:
+        with SessionLocal.begin() as db:
+            enterprise = Enterprise(name="证据测试企业", slug="evidence-transaction-test")
+            db.add(enterprise)
+            db.flush()
+            user = User(
+                enterprise_id=enterprise.id,
+                email="evidence@example.com",
+                display_name="Evidence User",
+                role="executive",
+                password_change_required=False,
+            )
+            db.add(user)
+            db.flush()
+            conversation = Conversation(
+                enterprise_id=enterprise.id,
+                owner_user_id=user.id,
+                title="证据事务",
+            )
+            db.add(conversation)
+            db.flush()
+            assistant = Message(
+                conversation_id=conversation.id,
+                role="assistant",
+                content="",
+                sequence=1,
+                status="queued",
+            )
+            db.add(assistant)
+            db.flush()
+            assistant_id = assistant.id
+
+        tool_result = {
+            "data": {"collected_amount": 100.0},
+            "scope": {"organization_unit_ids": []},
+            "evidence": [{"record_id": "COL-001"}],
+            "freshness": [
+                {
+                    "domain": "collection",
+                    "source_type": "simulated_generator",
+                    "source_display_name": "演示模拟数据",
+                    "source_data_as_of": utc_now().isoformat(),
+                    "dataset_version": "test-v1",
+                }
+            ],
+        }
+        for _ in range(2):
+            count = _save_answer_with_evidence(
+                assistant_message_id=assistant_id,
+                content="回款已核对。",
+                response={
+                    "provider": "anspire",
+                    "model": "glm-5.2",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+                content_json={"freshness": tool_result["freshness"]},
+                tool="get_collection_aging",
+                tool_result=tool_result,
+            )
+            assert count == 1
+
+        with SessionLocal() as db:
+            assistant = db.get(Message, assistant_id)
+            evidence_count = db.scalar(
+                select(func.count())
+                .select_from(MessageEvidence)
+                .where(MessageEvidence.message_id == assistant_id)
+            )
+            run_count = db.scalar(
+                select(func.count())
+                .select_from(MessageRun)
+                .where(MessageRun.message_id == assistant_id)
+            )
+            assert assistant.status == "completed"
+            assert assistant.content_json["evidence_count"] == 1
+            assert evidence_count == 1
+            assert run_count == 1
+    finally:
+        Base.metadata.drop_all(engine)
 
 
 def test_worker_rechecks_scope_snapshot_before_processing() -> None:
@@ -92,7 +178,7 @@ def test_worker_rechecks_scope_snapshot_before_processing() -> None:
         Base.metadata.drop_all(engine)
 
 
-def test_worker_closes_assistant_placeholder_when_handler_is_not_configured() -> None:
+def test_worker_closes_assistant_placeholder_when_job_identifiers_are_invalid() -> None:
     Base.metadata.create_all(engine)
     try:
         with SessionLocal.begin() as db:
@@ -181,9 +267,9 @@ def test_worker_closes_assistant_placeholder_when_handler_is_not_configured() ->
             placeholder = db.get(Message, placeholder_id)
             attempt = db.scalar(select(JobAttempt).where(JobAttempt.job_id == job_id))
             assert job.status == "failed"
-            assert job.error_code == "integration_not_configured"
+            assert job.error_code == "invalid_assistant_job"
             assert placeholder.status == "failed"
-            assert placeholder.content == "未配置真实处理器"
+            assert placeholder.content == "请求无法处理"
             assert attempt.status == "failed"
             assert attempt.completed_at is not None
     finally:

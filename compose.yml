@@ -15,6 +15,12 @@ x-backend-environment: &backend-environment
   POSTGRES_HOST: postgres
   POSTGRES_PORT: "5432"
   POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
+  POSTGRES_API_USER: ${POSTGRES_API_USER:-executive_ai_api}
+  POSTGRES_ASSISTANT_WORKER_USER: ${POSTGRES_ASSISTANT_WORKER_USER:-executive_ai_assistant_worker}
+  POSTGRES_FILE_WORKER_USER: ${POSTGRES_FILE_WORKER_USER:-executive_ai_file_worker}
+  POSTGRES_INGESTION_USER: ${POSTGRES_INGESTION_USER:-executive_ai_ingestion}
+  POSTGRES_SCHEDULER_USER: ${POSTGRES_SCHEDULER_USER:-executive_ai_scheduler}
+  POSTGRES_MCP_USER: ${POSTGRES_MCP_USER:-executive_ai_mcp}
   POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
   STORAGE_ROOT: /data/files
   FILE_STORAGE_ROOT: /data/files
@@ -27,6 +33,8 @@ x-backend-environment: &backend-environment
   BEHIND_TRUSTED_PROXY: "true"
   FILE_ENCRYPTION_KEY_VERSION: ${FILE_ENCRYPTION_KEY_VERSION:-v1}
   FILE_ENCRYPTION_KEY_RING_FILE: /run/secrets/file_encryption_key_ring
+  INTEGRATION_ENCRYPTION_KEY_VERSION: ${INTEGRATION_ENCRYPTION_KEY_VERSION:-v1}
+  INTEGRATION_ENCRYPTION_KEY_RING_FILE: /run/secrets/integration_encryption_key_ring
   AUDIT_HMAC_KEY_VERSION: ${AUDIT_HMAC_KEY_VERSION:-v1}
   AUDIT_HMAC_LEGACY_KEY_VERSION: ${AUDIT_HMAC_LEGACY_KEY_VERSION:-v1}
   AUDIT_HMAC_KEY_RING_FILE: /run/secrets/audit_hmac_key_ring
@@ -36,10 +44,37 @@ x-backend-environment: &backend-environment
   WORKER_JOB_MAX_ATTEMPTS: ${WORKER_JOB_MAX_ATTEMPTS:-3}
   WORKER_RETRY_BASE_SECONDS: ${WORKER_RETRY_BASE_SECONDS:-2}
   WORKER_RETRY_MAX_SECONDS: ${WORKER_RETRY_MAX_SECONDS:-60}
+  CAPABILITY_TOKEN_TTL_SECONDS: ${CAPABILITY_TOKEN_TTL_SECONDS:-90}
+  MCP_HUB_URL: http://mcp-hub:8010
+  HERMES_RUNTIME_URL: http://hermes-runtime:8020
+  SYNC_CRON: ${SYNC_CRON:-0 2 * * *}
+  SYNC_TIMEZONE: ${SYNC_TIMEZONE:-Asia/Shanghai}
+  SCHEDULER_POLL_SECONDS: ${SCHEDULER_POLL_SECONDS:-15}
+  SOURCE_DB_HOST: ${SOURCE_DB_HOST:-}
+  SOURCE_DB_PORT: ${SOURCE_DB_PORT:-5432}
+  SOURCE_DB_NAME: ${SOURCE_DB_NAME:-}
+  SOURCE_DB_READER_USER: ${SOURCE_DB_READER_USER:-source_reader}
+  SOURCE_DB_WRITER_USER: ${SOURCE_DB_WRITER_USER:-source_writer}
+  SOURCE_CONNECTION_MODE: ${SOURCE_CONNECTION_MODE:-external}
+  DEMO_REFERENCE_DATE: ${DEMO_REFERENCE_DATE:-2026-07-26}
+  DEMO_DATASET_VERSION: ${DEMO_DATASET_VERSION:-phase2-demo-v1}
+  FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+  FEISHU_BITABLE_APP_TOKEN: ${FEISHU_BITABLE_APP_TOKEN:-}
+  FEISHU_BITABLE_TABLE_ID: ${FEISHU_BITABLE_TABLE_ID:-}
+
+x-embedding-runtime-environment: &embedding-runtime-environment
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+  EMBEDDING_CACHE_DIR: /opt/models
+  HOME: /opt/models/home
+  XDG_CACHE_HOME: /opt/models/cache
+  HF_HOME: /opt/models/huggingface
+  HF_HUB_CACHE: /opt/models/huggingface/hub
+  HF_XET_CACHE: /opt/models/huggingface/xet
+  HF_HUB_OFFLINE: "1"
 
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    image: ${POSTGRES_IMAGE:-docker.io/pgvector/pgvector:0.8.5-pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0}
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
@@ -64,23 +99,41 @@ services:
     logging: *json-logging
 
   db-role-init:
-    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    image: ${POSTGRES_IMAGE:-docker.io/pgvector/pgvector:0.8.5-pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0}
     restart: "no"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
       POSTGRES_MIGRATOR_USER: ${POSTGRES_MIGRATOR_USER:-executive_ai_migrator}
       POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
       POSTGRES_BACKUP_USER: ${POSTGRES_BACKUP_USER:-executive_ai_backup}
+      POSTGRES_API_USER: ${POSTGRES_API_USER:-executive_ai_api}
+      POSTGRES_ASSISTANT_WORKER_USER: ${POSTGRES_ASSISTANT_WORKER_USER:-executive_ai_assistant_worker}
+      POSTGRES_FILE_WORKER_USER: ${POSTGRES_FILE_WORKER_USER:-executive_ai_file_worker}
+      POSTGRES_INGESTION_USER: ${POSTGRES_INGESTION_USER:-executive_ai_ingestion}
+      POSTGRES_SCHEDULER_USER: ${POSTGRES_SCHEDULER_USER:-executive_ai_scheduler}
+      POSTGRES_MCP_USER: ${POSTGRES_MCP_USER:-executive_ai_mcp}
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
       POSTGRES_OWNER_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_MIGRATOR_PASSWORD_FILE: /run/secrets/postgres_migrator_password
       POSTGRES_RUNTIME_PASSWORD_FILE: /run/secrets/postgres_runtime_password
       POSTGRES_BACKUP_PASSWORD_FILE: /run/secrets/postgres_backup_password
+      POSTGRES_API_PASSWORD_FILE: /run/secrets/postgres_api_password
+      POSTGRES_ASSISTANT_WORKER_PASSWORD_FILE: /run/secrets/postgres_assistant_worker_password
+      POSTGRES_FILE_WORKER_PASSWORD_FILE: /run/secrets/postgres_file_worker_password
+      POSTGRES_INGESTION_PASSWORD_FILE: /run/secrets/postgres_ingestion_password
+      POSTGRES_SCHEDULER_PASSWORD_FILE: /run/secrets/postgres_scheduler_password
+      POSTGRES_MCP_PASSWORD_FILE: /run/secrets/postgres_mcp_password
     secrets:
       - postgres_password
       - postgres_migrator_password
       - postgres_runtime_password
       - postgres_backup_password
+      - postgres_api_password
+      - postgres_assistant_worker_password
+      - postgres_file_worker_password
+      - postgres_ingestion_password
+      - postgres_scheduler_password
+      - postgres_mcp_password
     volumes:
       - ./deploy/postgres/ensure-runtime-role.sh:/usr/local/bin/ensure-runtime-role:ro
     networks:
@@ -132,23 +185,41 @@ services:
     logging: *json-logging
 
   db-permissions:
-    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    image: ${POSTGRES_IMAGE:-docker.io/pgvector/pgvector:0.8.5-pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0}
     restart: "no"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
       POSTGRES_MIGRATOR_USER: ${POSTGRES_MIGRATOR_USER:-executive_ai_migrator}
       POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
       POSTGRES_BACKUP_USER: ${POSTGRES_BACKUP_USER:-executive_ai_backup}
+      POSTGRES_API_USER: ${POSTGRES_API_USER:-executive_ai_api}
+      POSTGRES_ASSISTANT_WORKER_USER: ${POSTGRES_ASSISTANT_WORKER_USER:-executive_ai_assistant_worker}
+      POSTGRES_FILE_WORKER_USER: ${POSTGRES_FILE_WORKER_USER:-executive_ai_file_worker}
+      POSTGRES_INGESTION_USER: ${POSTGRES_INGESTION_USER:-executive_ai_ingestion}
+      POSTGRES_SCHEDULER_USER: ${POSTGRES_SCHEDULER_USER:-executive_ai_scheduler}
+      POSTGRES_MCP_USER: ${POSTGRES_MCP_USER:-executive_ai_mcp}
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
       POSTGRES_OWNER_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_MIGRATOR_PASSWORD_FILE: /run/secrets/postgres_migrator_password
       POSTGRES_RUNTIME_PASSWORD_FILE: /run/secrets/postgres_runtime_password
       POSTGRES_BACKUP_PASSWORD_FILE: /run/secrets/postgres_backup_password
+      POSTGRES_API_PASSWORD_FILE: /run/secrets/postgres_api_password
+      POSTGRES_ASSISTANT_WORKER_PASSWORD_FILE: /run/secrets/postgres_assistant_worker_password
+      POSTGRES_FILE_WORKER_PASSWORD_FILE: /run/secrets/postgres_file_worker_password
+      POSTGRES_INGESTION_PASSWORD_FILE: /run/secrets/postgres_ingestion_password
+      POSTGRES_SCHEDULER_PASSWORD_FILE: /run/secrets/postgres_scheduler_password
+      POSTGRES_MCP_PASSWORD_FILE: /run/secrets/postgres_mcp_password
     secrets:
       - postgres_password
       - postgres_migrator_password
       - postgres_runtime_password
       - postgres_backup_password
+      - postgres_api_password
+      - postgres_assistant_worker_password
+      - postgres_file_worker_password
+      - postgres_ingestion_password
+      - postgres_scheduler_password
+      - postgres_mcp_password
     volumes:
       - ./deploy/postgres/ensure-runtime-role.sh:/usr/local/bin/ensure-runtime-role:ro
     networks:
@@ -176,13 +247,17 @@ services:
       <<: *backend-environment
       SERVICE_ROLE: api
     secrets:
-      - postgres_runtime_password
+      - postgres_api_password
       - session_secret
       - csrf_secret
       - file_encryption_key
       - file_encryption_key_ring
       - audit_hmac_key
       - audit_hmac_key_ring
+      - source_database_url
+      - integration_encryption_key
+      - integration_encryption_key_ring
+      - hermes_runtime_hmac_key
     volumes:
       - file_data:/data/files
     networks:
@@ -195,12 +270,21 @@ services:
       - /bin/sh
       - -ec
       - |
-        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
-        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        DB_PASSWORD="$$(cat /run/secrets/postgres_api_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_API_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
         export SESSION_SECRET="$$(cat /run/secrets/session_secret)"
         export CSRF_SECRET="$$(cat /run/secrets/csrf_secret)"
         export FILE_ENCRYPTION_KEY="$$(cat /run/secrets/file_encryption_key)"
         export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        export INTEGRATION_ENCRYPTION_KEY="$$(cat /run/secrets/integration_encryption_key)"
+        export HERMES_RUNTIME_HMAC_KEY="$$(cat /run/secrets/hermes_runtime_hmac_key)"
+        if [ -n "$${SOURCE_DB_HOST}" ] && [ -f /run/secrets/source_reader_password ]; then
+          SOURCE_PASSWORD="$$(cat /run/secrets/source_reader_password)"
+          export SOURCE_DATABASE_URL="postgresql+psycopg://$${SOURCE_DB_READER_USER}:$${SOURCE_PASSWORD}@$${SOURCE_DB_HOST}:$${SOURCE_DB_PORT}/$${SOURCE_DB_NAME}"
+        elif [ -f /run/secrets/source_database_url ]; then
+          SOURCE_URL="$$(cat /run/secrets/source_database_url)"
+          if [ -n "$${SOURCE_URL}" ]; then export SOURCE_DATABASE_URL="$${SOURCE_URL}"; fi
+        fi
         exec uvicorn executive_ai_api.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips="*"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
@@ -224,29 +308,40 @@ services:
     image: ${WORKER_IMAGE:-executive-ai-worker:local}
     restart: unless-stopped
     environment:
-      <<: *backend-environment
-      SERVICE_ROLE: worker
+      <<: [*backend-environment, *embedding-runtime-environment]
+      SERVICE_ROLE: assistant_worker
+      WORKER_JOB_TYPES: assistant_response
     secrets:
-      - postgres_runtime_password
-      - file_encryption_key
-      - file_encryption_key_ring
+      - postgres_assistant_worker_password
       - audit_hmac_key
       - audit_hmac_key_ring
-    volumes:
-      - file_data:/data/files
+      - capability_hmac_key
+      - integration_encryption_key
+      - integration_encryption_key_ring
+      - hermes_runtime_hmac_key
     networks:
       - backend
+    volumes:
+      - embedding_cache:/opt/models:ro
     depends_on:
       api:
         condition: service_healthy
+      mcp-hub:
+        condition: service_healthy
+      hermes-runtime:
+        condition: service_healthy
+      embedding-model-init:
+        condition: service_completed_successfully
     command:
       - /bin/sh
       - -ec
       - |
-        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
-        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
-        export FILE_ENCRYPTION_KEY="$$(cat /run/secrets/file_encryption_key)"
+        DB_PASSWORD="$$(cat /run/secrets/postgres_assistant_worker_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_ASSISTANT_WORKER_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
         export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        export CAPABILITY_HMAC_KEY="$$(cat /run/secrets/capability_hmac_key)"
+        export INTEGRATION_ENCRYPTION_KEY="$$(cat /run/secrets/integration_encryption_key)"
+        export HERMES_RUNTIME_HMAC_KEY="$$(cat /run/secrets/hermes_runtime_hmac_key)"
         exec python -m executive_ai_worker.main
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
@@ -257,6 +352,247 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    image: ${WORKER_IMAGE:-executive-ai-worker:local}
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: ingestion_worker
+      WORKER_JOB_TYPES: data.sync
+    secrets:
+      - postgres_ingestion_password
+      - audit_hmac_key
+      - audit_hmac_key_ring
+      - source_database_url
+    networks:
+      - backend
+      - ai-egress
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_ingestion_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_INGESTION_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        if [ -n "$${SOURCE_DB_HOST}" ] && [ -f /run/secrets/source_reader_password ]; then
+          SOURCE_PASSWORD="$$(cat /run/secrets/source_reader_password)"
+          export SOURCE_DATABASE_URL="postgresql+psycopg://$${SOURCE_DB_READER_USER}:$${SOURCE_PASSWORD}@$${SOURCE_DB_HOST}:$${SOURCE_DB_PORT}/$${SOURCE_DB_NAME}"
+        else
+          SOURCE_URL="$$(cat /run/secrets/source_database_url)"
+          if [ -n "$${SOURCE_URL}" ]; then export SOURCE_DATABASE_URL="$${SOURCE_URL}"; fi
+        fi
+        if [ "$${APP_ENV}" = "local-demo" ] && [ -f /run/secrets/source_writer_password ]; then
+          SOURCE_WRITER_PASSWORD="$$(cat /run/secrets/source_writer_password)"
+          export SOURCE_WRITER_DATABASE_URL="postgresql+psycopg://$${SOURCE_DB_WRITER_USER}:$${SOURCE_WRITER_PASSWORD}@$${SOURCE_DB_HOST}:$${SOURCE_DB_PORT}/$${SOURCE_DB_NAME}"
+        fi
+        if [ "$${APP_ENV}" = "local-demo" ] && [ -f /run/secrets/feishu_runtime_secret ]; then
+          export FEISHU_RUNTIME_SECRET="$$(cat /run/secrets/feishu_runtime_secret)"
+        fi
+        exec python -m executive_ai_worker.main
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  embedding-cache-init:
+    image: ${WORKER_IMAGE:-executive-ai-worker:local}
+    restart: "no"
+    # A newly-created named volume is owned by root. Repair only that volume,
+    # then hand it read-only to the permanently unprivileged runtime workers.
+    user: "0:0"
+    networks:
+      - ai-egress
+    volumes:
+      - embedding_cache:/opt/models
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        chown -R 999:999 /opt/models
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    logging: *json-logging
+
+  embedding-model-init:
+    image: ${WORKER_IMAGE:-executive-ai-worker:local}
+    restart: "no"
+    user: "999:999"
+    environment:
+      <<: *embedding-runtime-environment
+    networks:
+      - ai-egress
+    volumes:
+      - embedding_cache:/opt/models
+    depends_on:
+      embedding-cache-init:
+        condition: service_completed_successfully
+    command: ["python", "-m", "executive_ai_worker.embedding_cache"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  file-worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    image: ${WORKER_IMAGE:-executive-ai-worker:local}
+    restart: unless-stopped
+    environment:
+      <<: [*backend-environment, *embedding-runtime-environment]
+      SERVICE_ROLE: file_worker
+      WORKER_JOB_TYPES: file.extract
+    secrets:
+      - postgres_file_worker_password
+      - file_encryption_key
+      - file_encryption_key_ring
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    volumes:
+      - file_data:/data/files
+      - embedding_cache:/opt/models:ro
+    networks:
+      - backend
+    depends_on:
+      api:
+        condition: service_healthy
+      embedding-model-init:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_file_worker_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_FILE_WORKER_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export FILE_ENCRYPTION_KEY="$$(cat /run/secrets/file_encryption_key)"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        exec python -m executive_ai_worker.main
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  scheduler:
+    image: ${WORKER_IMAGE:-executive-ai-worker:local}
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: scheduler
+    secrets:
+      - postgres_scheduler_password
+    networks:
+      - backend
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_scheduler_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_SCHEDULER_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        exec python -m executive_ai_worker.scheduler
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  mcp-hub:
+    image: ${API_IMAGE:-executive-ai-api:local}
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: mcp
+    secrets:
+      - postgres_mcp_password
+      - capability_hmac_key
+    networks:
+      - backend
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_mcp_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_MCP_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export CAPABILITY_HMAC_KEY="$$(cat /run/secrets/capability_hmac_key)"
+        exec uvicorn executive_ai_api.mcp_app:app --host 0.0.0.0 --port 8010
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  hermes-runtime:
+    build:
+      context: ./services/hermes-runtime
+      dockerfile: Dockerfile
+    image: ${HERMES_IMAGE:-executive-ai-hermes:local}
+    restart: unless-stopped
+    secrets:
+      - hermes_runtime_hmac_key
+    networks:
+      - backend
+      - ai-egress
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        export HERMES_RUNTIME_HMAC_KEY="$$(cat /run/secrets/hermes_runtime_hmac_key)"
+        exec uvicorn executive_ai_hermes.main:app --host 0.0.0.0 --port 8020
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -480,6 +816,101 @@ services:
       - ALL
     logging: *json-logging
 
+  configure-data-source:
+    profiles: ["source-admin"]
+    image: ${API_IMAGE:-executive-ai-api:local}
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: bootstrap
+      SOURCE_ENTERPRISE_SLUG: ${SOURCE_ENTERPRISE_SLUG:-}
+      SOURCE_DISPLAY_NAME: ${SOURCE_DISPLAY_NAME:-}
+    secrets:
+      - postgres_runtime_password
+      - audit_hmac_key
+      - audit_hmac_key_ring
+      - source_database_url
+      - source_reader_password
+    networks:
+      - backend
+      - ai-egress
+    depends_on:
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        if [ -n "$${SOURCE_DB_HOST}" ] && [ -s /run/secrets/source_reader_password ]; then
+          SOURCE_PASSWORD="$$(cat /run/secrets/source_reader_password)"
+          export SOURCE_DATABASE_URL="postgresql+psycopg://$${SOURCE_DB_READER_USER}:$${SOURCE_PASSWORD}@$${SOURCE_DB_HOST}:$${SOURCE_DB_PORT}/$${SOURCE_DB_NAME}"
+        else
+          SOURCE_URL="$$(cat /run/secrets/source_database_url)"
+          if [ -z "$${SOURCE_URL}" ]; then
+            echo "source database connection is not configured" >&2
+            exit 64
+          fi
+          export SOURCE_DATABASE_URL="$${SOURCE_URL}"
+        fi
+        if [ -z "$${SOURCE_ENTERPRISE_SLUG}" ] || [ -z "$${SOURCE_DISPLAY_NAME}" ]; then
+          echo "source enterprise slug and display name are required" >&2
+          exit 64
+        fi
+        exec python -m executive_ai_api.cli configure-source \
+          --enterprise-slug "$${SOURCE_ENTERPRISE_SLUG}" \
+          --display-name "$${SOURCE_DISPLAY_NAME}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  run-data-sync:
+    profiles: ["source-admin"]
+    image: ${API_IMAGE:-executive-ai-api:local}
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: bootstrap
+      SOURCE_ENTERPRISE_SLUG: ${SOURCE_ENTERPRISE_SLUG:-}
+      SOURCE_KEY: ${SOURCE_KEY:-}
+    secrets:
+      - postgres_runtime_password
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    networks:
+      - backend
+    depends_on:
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        if [ -z "$${SOURCE_ENTERPRISE_SLUG}" ]; then
+          echo "source enterprise slug is required" >&2
+          exit 64
+        fi
+        set -- python -m executive_ai_api.cli trigger-sync \
+          --enterprise-slug "$${SOURCE_ENTERPRISE_SLUG}"
+        if [ -n "$${SOURCE_KEY}" ]; then set -- "$$@" --source-key "$${SOURCE_KEY}"; fi
+        exec "$$@"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
   file-tool:
     profiles: ["tools"]
     image: ${FILE_TOOL_IMAGE:-alpine:3.20}
@@ -524,10 +955,12 @@ networks:
   frontend:
   backend:
     internal: true
+  ai-egress:
 
 volumes:
   postgres_data:
   file_data:
+  embedding_cache:
 
 secrets:
   postgres_password:
@@ -538,6 +971,18 @@ secrets:
     file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_runtime_password
   postgres_backup_password:
     file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_backup_password
+  postgres_api_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_api_password
+  postgres_assistant_worker_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_assistant_worker_password
+  postgres_file_worker_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_file_worker_password
+  postgres_ingestion_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_ingestion_password
+  postgres_scheduler_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_scheduler_password
+  postgres_mcp_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_mcp_password
   session_secret:
     file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/session_secret
   csrf_secret:
@@ -550,3 +995,15 @@ secrets:
     file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/audit_hmac_key
   audit_hmac_key_ring:
     file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/audit_hmac_key_ring
+  capability_hmac_key:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/capability_hmac_key
+  source_database_url:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_database_url
+  source_reader_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/source_reader_password
+  integration_encryption_key:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/integration_encryption_key
+  integration_encryption_key_ring:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/integration_encryption_key_ring
+  hermes_runtime_hmac_key:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/hermes_runtime_hmac_key

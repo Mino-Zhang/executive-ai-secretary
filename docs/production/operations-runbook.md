@@ -7,6 +7,7 @@ git status --short --branch
 ./scripts/start.sh local-demo
 ./scripts/status.sh local-demo
 ./scripts/smoke-test.sh local-demo
+./scripts/sync-now.sh local-demo demo-enterprise
 ./scripts/backup.sh local-demo pre-demo
 ```
 
@@ -67,6 +68,66 @@ Worker 领取任务时在一个短事务内完成 `queued -> running`、尝试�
 过期任务会关闭当前尝试，并按 `WORKER_RETRY_BASE_SECONDS * 2^(attempt-1)` 重新排队，上限为 `WORKER_RETRY_MAX_SECONDS`。每个任务在创建时快照 `WORKER_JOB_MAX_ATTEMPTS`；耗尽后统一进入 `failed`，并写入 `dead_lettered_at`、关闭助手占位消息和审计事件。授权撤销、取消和明确的永久错误不重试。
 
 租约提供的是数据库写回 fencing，不等于外部系统副作用的 exactly-once。后续真实处理器必须使用稳定 `job.id` 作为下游幂等键或通过 transactional outbox 交付，不得使用每次变化的 lease token 作为业务幂等键。
+
+## 数据同步
+
+Scheduler 使用 `Asia/Shanghai` 的 `0 2 * * *` 默认计划，并通过 PostgreSQL advisory lock 与窗口幂等键避免重复创建任务。Scheduler 只排队；`ingestion-worker` 执行读取、校验、暂存和按域激活。
+
+```bash
+# 一次性注册或重新验证数据源
+./scripts/configure-source.sh local-demo demo-enterprise "演示模拟数据"
+
+# FDE 人工立即同步
+./scripts/sync-now.sh local-demo demo-enterprise
+
+# 查看同步、调度和模型服务日志
+./scripts/logs.sh local-demo ingestion-worker
+./scripts/logs.sh local-demo scheduler
+./scripts/logs.sh local-demo hermes-runtime
+```
+
+商机、交付、回款和目标分别保留当前版本与最近成功时间。单域失败不会替换该域的上一成功版本；界面和回答必须展示该域的旧数据状态，不能把混合截止时间合并称为“最新”。
+
+本机 Source PostgreSQL 是确定性演示源，可由 `rebuild-demo-source.sh` 重建；产品数据库与文件仍按正式备份链保护。客户外部脱敏源库的访问控制与备份由客户负责，产品备份不替代客户源库备份。
+
+## Anspire 模型服务
+
+Anspire 是产品唯一生成模型通道。企业管理员或 FDE 在管理端完成“保存配置 → 测试连接 → 启用”；不要把 API Key 写入 `.env`、Compose、命令行、工单、截图或日志。
+
+演示前检查：
+
+1. 管理端状态为“已启用”。
+2. 最近一次连接测试成功，且选择的是版本内白名单模型。
+3. 发起一条低风险测试问数，确认回答含数据时间、来源与证据下钻。
+4. 日志中只有请求 ID、模型 ID、状态和时延，不含 API Key、提示词全文或模型原始响应。
+
+常见状态：
+
+- “未配置”：尚未保存企业凭证。
+- “等待测试”：凭证或模型刚发生变化，必须重新测试。
+- “测试失败”：凭证、模型权限、账户额度、网络出口或 Anspire 网关异常；系统保持停用。
+- “待启用”：连接已通过，但尚未授权真实问答使用。
+- “已启用”：真实问数与文件回答可以调用 Anspire。
+
+凭证轮换采用先保存新 Key、再测试、最后启用的顺序。保存新 Key 后旧配置立即失效，系统不会同时保留两份可用明文凭证。若连接测试失败，先在管理端查看经过脱敏的错误，再检查 `api` 与 `hermes-runtime` 日志；禁止通过打印环境变量或数据库密文排障。
+
+```bash
+./scripts/logs.sh local-demo api
+./scripts/logs.sh local-demo hermes-runtime
+```
+
+Hermes Runtime 只接收单次请求所需的短生命周期解密结果，不挂载持久模型密钥；API 与 Hermes 之间使用带时效与防重放请求标识的内部 HMAC 签名。出口策略只需放行 `open-gateway.anspire.ai:443`。
+
+## 中文嵌入模型
+
+首次启动会把固定版本的 `BAAI/bge-small-zh-v1.5` 安装到独立 Docker 卷，并校验发布时固定的 SHA-256。`file-worker` 只以离线模式读取该卷，不在解析文件时临时联网下载模型。
+
+如果 `embedding-model-init` 失败：
+
+1. 查看一次性初始化容器日志，不要绕过校验直接启动 `file-worker`。
+2. 检查宿主机磁盘空间和到固定模型制品地址的 HTTPS 访问。
+3. 重新执行 `./scripts/start.sh local-demo`；成功制品会复用，下载中断可续传。
+4. 只有 `embedding-model-init` 成功退出且 smoke test 验证模型文件后，文件问答才算可用。
 
 ## 事故最低记录
 

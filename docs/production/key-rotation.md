@@ -1,4 +1,4 @@
-# 文件加密与审计密钥轮换 Runbook
+# 文件、集成凭证与审计密钥轮换 Runbook
 
 本流程只面向受控维护窗口。密钥正文只允许来自进程环境或权限为 `0600` 的 JSON 文件；数据库仅保存不可逆推出密钥的版本标识。任何密钥、ring 文件或完整文件内容都不得写入 Git、日志、审计 metadata 或数据库。
 
@@ -8,9 +8,10 @@
 - 既有 `EAIF1` 文件按数据库版本读取，首次轮换后升级到 `EAIF2`。
 - `FILE_ENCRYPTION_KEY_VERSION` 指向当前写入版本；`FILE_ENCRYPTION_KEY` 是该版本的 32 字节 URL-safe Base64 密钥。
 - `FILE_ENCRYPTION_KEY_RING` 或 `FILE_ENCRYPTION_KEY_RING_FILE` 提供历史版本，格式为 `{"v1":"base64..."}`。二者不能同时设置。
+- Anspire 集成凭证对应使用 `INTEGRATION_ENCRYPTION_KEY_VERSION`、`INTEGRATION_ENCRYPTION_KEY` 与 `INTEGRATION_ENCRYPTION_KEY_RING[_FILE]`。数据库中的 `model_provider_configs.encryption_key_version` 决定解密时必须选择的版本；系统不会用当前密钥猜测解密历史凭证。
 - 审计对应使用 `AUDIT_HMAC_KEY_VERSION`、`AUDIT_HMAC_KEY`、`AUDIT_HMAC_KEY_RING[_FILE]`。`AUDIT_HMAC_LEGACY_KEY_VERSION` 指定升级前无版本字段事件所使用的版本，默认 `v1`。
 
-文件 ring 与审计 ring 必须分开，当前密钥可以同时出现在 ring 中，但相同版本的值必须完全一致。单个 ring 最多 32 个版本。
+文件、集成凭证与审计 ring 必须分开，当前密钥可以同时出现在对应 ring 中，但相同版本的值必须完全一致。单个 ring 最多 32 个版本。
 
 ## 文件密钥轮换
 
@@ -83,6 +84,56 @@ python -m executive_ai_api.rotate_file_keys \
 4. 旧密钥在以下条件全部满足前不得删除：数据库无旧版本活动文件、所有保留期内备份均已过期或完成重加密、至少一次恢复演练成功、变更单获得批准。
 
 失败时不要手工修改 `files.encryption_key_version`。停止服务，保留 ring，重跑 CLI；若无法恢复，则使用轮换前备份按正式恢复流程整体回退。
+
+## Anspire 集成凭证密钥轮换
+
+集成凭证完全存放于数据库，因此轮换以单条企业配置为原子单位。每条记录执行“按数据库版本从历史 ring 解密 → 使用当前版本重新加密 → 更新密文、随机 nonce 与版本 → 写审计事件 → 提交”。中断后重跑时只选择仍处于旧版本的记录，已经完成的记录不会再次改写。
+
+### 1. 维护窗口与预检
+
+1. 创建签名一致性备份，并记录脚本输出的绝对目录：
+
+   ```bash
+   ./scripts/backup.sh local-demo integration-key-rotation-v2
+   ```
+
+2. 停止 API 与 assistant worker 的凭证写入和读取，保持 PostgreSQL 运行。
+3. 生成新的 32 字节 URL-safe Base64 当前密钥；创建权限为 `0600` 的 ring JSON，并至少保留旧版本。密钥正文不得出现在命令历史、日志或审计 metadata。
+4. 在挂载新当前密钥和历史 ring 的受控 API 容器内先执行：
+
+   ```bash
+   python -m executive_ai_api.rotate_integration_keys \
+     --from-version v1 \
+     --to-version v2 \
+     --dry-run
+   ```
+
+预检会逐条按旧版本完成 AES-GCM 完整性校验，但不修改数据库。任何旧版本缺失、AAD 不匹配或密文损坏都会失败关闭。
+
+### 2. 执行、续跑与验证
+
+使用同一组密钥挂载，并把备份目录与 `backup_signing_public_key` 只读挂载到维护容器：
+
+```bash
+python -m executive_ai_api.rotate_integration_keys \
+  --from-version v1 \
+  --to-version v2 \
+  --backup-dir /backup \
+  --backup-public-key /run/rotation/backup-signing-public-key \
+  --batch-size 25 \
+  --confirm 'ROTATE INTEGRATION KEYS v1 TO v2'
+```
+
+CLI 会验证备份的 Ed25519 签名、环境、时间、Alembic revision 与备份工件摘要；确认短语或备份证据缺失时拒绝写入。PostgreSQL advisory lock 拒绝并行轮换。可用 `--max-configs N` 分批执行；反复执行同一命令是幂等的，最终 `remaining` 必须为零。
+
+完成后执行：
+
+```bash
+python -m executive_ai_api.rotate_integration_keys \
+  --from-version v1 --to-version v2 --verify-only
+```
+
+验证通过后，以新 `integration_encryption_key`、`INTEGRATION_ENCRYPTION_KEY_VERSION=v2` 和仍含旧版本的只读 ring 启动 API/assistant worker，再通过管理端测试一次 Anspire 连接。旧密钥只有在数据库不存在该版本、所有相关备份均退出保留期且恢复演练通过后才可销毁。失败时禁止手工改写版本列；保留 ring 重跑，或按已验证备份整体恢复。
 
 ## 审计 HMAC 密钥轮换
 

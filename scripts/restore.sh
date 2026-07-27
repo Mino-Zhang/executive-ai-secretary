@@ -53,7 +53,7 @@ database_file="${backup_dir}/$(manifest_value database_file)"
 files_file="${backup_dir}/$(manifest_value files_file)"
 backup_key="$(runtime_dir_for "${environment}")/secrets/backup_encryption_key"
 
-compose "${environment}" stop api worker
+compose "${environment}" stop api worker ingestion-worker file-worker scheduler
 
 info "Restoring PostgreSQL for ${environment}..."
 openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
@@ -91,7 +91,8 @@ openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
   | compose "${environment}" --profile tools run --rm -T file-tool \
       tar -C /data/files -xf -
 
-compose "${environment}" up --detach --no-deps api worker nginx
+compose "${environment}" up --detach --wait --no-deps --no-build \
+  api mcp-hub hermes-runtime worker ingestion-worker file-worker scheduler web nginx
 "${SCRIPT_DIR}/smoke-test.sh" "${environment}"
 
 restore_log="$(runtime_dir_for "${environment}")/restore.log"

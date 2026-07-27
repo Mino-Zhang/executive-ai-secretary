@@ -51,9 +51,7 @@ def supported_upgrade_head(
     try:
         script = ScriptDirectory.from_config(config)
     except CommandError as exc:
-        raise IncompatibleMigrationError(
-            "release migration graph could not be loaded"
-        ) from exc
+        raise IncompatibleMigrationError("release migration graph could not be loaded") from exc
     heads = script.get_heads()
     if len(heads) != 1:
         raise IncompatibleMigrationError(

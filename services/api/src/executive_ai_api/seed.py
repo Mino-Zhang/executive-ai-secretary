@@ -11,6 +11,7 @@ from .models import (
     AppConfig,
     AuditEvent,
     Conversation,
+    DataSource,
     Enterprise,
     Message,
     OrganizationUnit,
@@ -21,7 +22,8 @@ from .models import (
     User,
 )
 
-DEMO_SEED_VERSION = "phase1-v1"
+DEMO_SEED_VERSION = "phase2-v1"
+SOURCE_DATABASE_CONFIG_REFERENCE = "SOURCE_DATABASE_URL"
 
 
 def seed(enterprise_slug: str) -> None:
@@ -40,8 +42,36 @@ def seed(enterprise_slug: str) -> None:
                 AppConfig.key == "demo.seed",
             )
         )
+        data_source = db.scalar(
+            select(DataSource).where(
+                DataSource.enterprise_id == enterprise.id,
+                DataSource.key == "demo-sanitized-source",
+            )
+        )
+        if data_source is None:
+            db.add(
+                DataSource(
+                    enterprise_id=enterprise.id,
+                    key="demo-sanitized-source",
+                    display_name="演示模拟数据",
+                    source_type="simulated_generator",
+                    schema_version="2.0",
+                    is_enabled=True,
+                    configuration_json={
+                        "database": "source-postgres",
+                        "schema": "executive_source",
+                        "classification": "synthetic",
+                    },
+                    secret_reference_key=SOURCE_DATABASE_CONFIG_REFERENCE,
+                )
+            )
         if marker:
-            print(f"Demo seed {marker.value_json.get('version', 'unknown')} already exists")
+            marker.value_json = {
+                "version": DEMO_SEED_VERSION,
+                "classification": "synthetic",
+                "phase2_data_source": True,
+            }
+            print(f"Demo seed {DEMO_SEED_VERSION} already exists; phase-2 source enabled")
             return
         executive = db.scalar(
             select(User)

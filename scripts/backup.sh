@@ -20,28 +20,29 @@ compose "${environment}" ps --services --filter status=running | grep -qx postgr
   || die "postgres is not running for ${environment}"
 
 running_services="$(compose "${environment}" ps --services --filter status=running)"
-api_was_running=false
-worker_was_running=false
-printf '%s\n' "${running_services}" | grep -qx api && api_was_running=true
-printf '%s\n' "${running_services}" | grep -qx worker && worker_was_running=true
+mutation_services=(api worker ingestion-worker file-worker scheduler)
+running_mutation_services=()
+for service in "${mutation_services[@]}"; do
+  if printf '%s\n' "${running_services}" | grep -qx "${service}"; then
+    running_mutation_services+=("${service}")
+  fi
+done
 services_quiesced=false
 
 resume_application() {
   if [ "${services_quiesced}" = true ]; then
-    restart=()
-    [ "${api_was_running}" = true ] && restart+=(api)
-    [ "${worker_was_running}" = true ] && restart+=(worker)
-    if [ "${#restart[@]}" -gt 0 ]; then
-      compose "${environment}" up --detach "${restart[@]}" >/dev/null
+    if [ "${#running_mutation_services[@]}" -gt 0 ]; then
+      compose "${environment}" up --detach --no-deps --no-build \
+        "${running_mutation_services[@]}" >/dev/null
     fi
     services_quiesced=false
   fi
 }
 trap resume_application EXIT INT TERM
 
-if [ "${api_was_running}" = true ] || [ "${worker_was_running}" = true ]; then
-  info "Quiescing API and Worker so database and private files share one consistency point..."
-  compose "${environment}" stop api worker >/dev/null
+if [ "${#running_mutation_services[@]}" -gt 0 ]; then
+  info "Quiescing API, job workers and scheduler so database and private files share one consistency point..."
+  compose "${environment}" stop "${running_mutation_services[@]}" >/dev/null
   services_quiesced=true
 fi
 
