@@ -766,7 +766,6 @@ export function ProductionWorkspace({
         <div className="sidebar-scroll-region">
           <button className="new-conversation-button" type="button" onClick={() => newConversation()}><span aria-hidden="true">＋</span><strong className="sidebar-label">{c.newConversation}</strong><kbd className="sidebar-label">⌘ K</kbd></button>
           <nav className="workspace-navigation" aria-label="经营工作台功能">
-            <button type="button" className={!activeConversationId && !activePanel ? "active" : ""} onClick={() => newConversation()}><span aria-hidden="true">问</span><strong className="sidebar-label">经营问数</strong></button>
             <button type="button" className={activePanel === "daily" ? "active" : ""} onClick={() => void openReport("daily")}><span aria-hidden="true">今</span><strong className="sidebar-label">{c.daily}</strong></button>
             <button type="button" className={activePanel === "weekly" ? "active" : ""} onClick={() => void openReport("weekly")}><span aria-hidden="true">周</span><strong className="sidebar-label">{c.weekly}</strong></button>
             <button type="button" className={activePanel === "history" ? "active" : ""} onClick={() => setActivePanel("history")}><span aria-hidden="true">历</span><strong className="sidebar-label">{c.history}</strong></button>
