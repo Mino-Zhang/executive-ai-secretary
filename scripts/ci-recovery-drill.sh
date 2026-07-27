@@ -55,19 +55,21 @@ executive_new_password="Final-E2!$(openssl rand -hex 18)"
 # Docker Compose implements local file-backed secrets as bind mounts on Linux,
 # preserving the host UID and mode. This drill is hard-restricted above to a
 # fresh, single-tenant GitHub-hosted runner and uses only one-time random keys.
-# Give each container identity access only to the ephemeral files it consumes.
-# Database role-management containers run as PostgreSQL uid/gid 70, while the
-# application and migration containers run as uid/gid 999. Shared database
-# credentials are group-readable by PostgreSQL; application key rings remain
-# 0400 to satisfy their stricter guard. Real environments retain 0600 ownership.
-for postgres_secret in postgres_password postgres_backup_password; do
-  sudo chown 70:70 "${runtime_dir}/secrets/${postgres_secret}"
-  sudo chmod 0400 "${runtime_dir}/secrets/${postgres_secret}"
+# Database role-management containers intentionally drop every Linux
+# capability, so their root process cannot bypass bind-mounted host ownership.
+# These four one-time CI passwords must therefore be read-only for each of the
+# PostgreSQL and application identities that consume them. The runner is fresh,
+# single-tenant and destroyed after this job.
+for database_secret in \
+  postgres_password \
+  postgres_migrator_password \
+  postgres_runtime_password \
+  postgres_backup_password; do
+  sudo chmod 0444 "${runtime_dir}/secrets/${database_secret}"
 done
-for shared_secret in postgres_migrator_password postgres_runtime_password; do
-  sudo chown 999:70 "${runtime_dir}/secrets/${shared_secret}"
-  sudo chmod 0440 "${runtime_dir}/secrets/${shared_secret}"
-done
+# Application-only secrets stay private to uid/gid 999. In particular, the key
+# rings remain 0400 to satisfy the runtime permission guard. Real local and
+# customer environments retain their original 0600 ownership throughout.
 for app_secret in \
   session_secret \
   csrf_secret \
