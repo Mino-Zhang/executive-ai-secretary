@@ -27,6 +27,7 @@ from ..schemas import (
     OrganizationUnitOut,
     SessionOut,
     UserOut,
+    UserPreferenceUpdate,
 )
 from ..security import (
     as_utc,
@@ -221,6 +222,29 @@ def me(
         app_env=settings.app_env,
         app_mode=settings.app_mode,
     )
+
+
+@router.patch("/preferences", response_model=UserOut)
+def update_preferences(
+    payload: UserPreferenceUpdate,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> UserOut:
+    principal.user.memory_enabled = payload.memory_enabled
+    record_audit(
+        db,
+        request,
+        "auth.preferences_updated",
+        actor=principal.user,
+        session=principal.session,
+        target_type="user",
+        target_id=principal.user.id,
+        metadata={"memory_enabled": payload.memory_enabled},
+    )
+    db.commit()
+    db.refresh(principal.user)
+    return UserOut.model_validate(principal.user)
 
 
 @router.post("/change-password", response_model=LoginResponse)

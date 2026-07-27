@@ -301,7 +301,7 @@ def test_legacy_v1_audit_signature_remains_verifiable() -> None:
     assert verify_audit_event(event)
 
 
-def test_unscoped_means_current_authorized_set_and_requires_a_grant(client, seeded) -> None:
+def test_unscoped_conversation_allows_general_qa_without_a_data_grant(client, seeded) -> None:
     auth = login_and_change_password(client)
     with SessionLocal.begin() as db:
         for grant in db.scalars(
@@ -310,13 +310,26 @@ def test_unscoped_means_current_authorized_set_and_requires_a_grant(client, seed
             )
         ).all():
             db.delete(grant)
-    denied = client.post(
+    created = client.post(
         "/api/v1/conversations",
         headers={"X-CSRF-Token": auth["csrf_token"]},
         json={"title": "无范围会话"},
     )
-    assert denied.status_code == 403
-    assert denied.json()["error"]["code"] == "data_scope_forbidden"
+    assert created.status_code == 201, created.text
+    sent = client.post(
+        f"/api/v1/conversations/{created.json()['id']}/messages",
+        headers={"X-CSRF-Token": auth["csrf_token"]},
+        json={"content": "请解释什么是现金转换周期", "file_ids": []},
+    )
+    assert sent.status_code == 202, sent.text
+    with SessionLocal() as db:
+        job = db.scalar(select(Job).order_by(Job.created_at.desc()))
+        assert job is not None
+        assert job.scope_snapshot_json == {
+            "enterprise_wide": False,
+            "organization_unit_ids": [],
+            "general_only": True,
+        }
 
 
 def test_disconnected_and_disabled_units_are_rejected_even_when_granted(client, seeded) -> None:
@@ -491,6 +504,46 @@ def test_cancel_running_job_closes_attempt_and_placeholder(client, seeded) -> No
         assert attempt.completed_at is not None
         assert placeholder.status == "failed"
         assert placeholder.content == "请求已取消"
+
+
+def test_failed_assistant_job_retries_as_a_new_auditable_attempt(client, seeded) -> None:
+    auth = login_and_change_password(client)
+    headers = {"X-CSRF-Token": auth["csrf_token"]}
+    conversation = client.post(
+        "/api/v1/conversations",
+        headers=headers,
+        json={"title": "重试闭环"},
+    )
+    assert conversation.status_code == 201, conversation.text
+    sent = client.post(
+        f"/api/v1/conversations/{conversation.json()['id']}/messages",
+        headers=headers,
+        json={"content": "本月回款情况", "file_ids": []},
+    )
+    assert sent.status_code == 202, sent.text
+    with SessionLocal.begin() as db:
+        previous = db.scalar(select(Job).order_by(Job.created_at.desc()))
+        assert previous is not None
+        previous.status = "failed"
+        previous.error_code = "processing_error"
+        previous_assistant_id = uuid.UUID(previous.payload_json["assistant_message_id"])
+        previous_assistant = db.get(Message, previous_assistant_id)
+        assert previous_assistant is not None
+        previous_assistant.status = "failed"
+        previous_job_id = previous.id
+
+    retried = client.post(f"/api/v1/jobs/{previous_job_id}/retry", headers=headers)
+    assert retried.status_code == 202, retried.text
+    body = retried.json()
+    assert body["id"] != str(previous_job_id)
+    assert body["status"] == "queued"
+    assert body["payload_json"]["retry_of_job_id"] == str(previous_job_id)
+    assert body["payload_json"]["assistant_message_id"] != str(previous_assistant_id)
+    with SessionLocal() as db:
+        replacement = db.get(Message, uuid.UUID(body["payload_json"]["assistant_message_id"]))
+        assert replacement is not None
+        assert replacement.status == "queued"
+        assert replacement.content_json["retry_of_job_id"] == str(previous_job_id)
 
 
 def test_cursor_pagination_does_not_skip_conversations_or_projects(client, seeded) -> None:

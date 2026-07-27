@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  ChangeEvent,
   FormEvent,
   KeyboardEvent,
   ReactNode,
@@ -18,7 +17,7 @@ import type {
   Conversation,
   ConversationMessage,
   DataCapabilities,
-  FileMetadata,
+  Job,
   Memory,
   OrganizationUnit,
   ProductionBootstrap,
@@ -71,9 +70,8 @@ const copy = {
     profile: "个人资料",
     appearance: "外观",
     scope: "全部事业部",
-    file: "文件",
     greetingQuestion: "今天需要我先看什么？",
-    placeholder: "向 AI 秘书提问经营数据，或上传当前会话文件",
+    placeholder: "向 AI 秘书提问经营数据，或讨论需要分析的问题",
     disclaimer: "AI 可能出错。关键经营数字请结合来源与数据时间核对。",
     noProject: "尚未创建项目",
     noConversation: "尚无历史会话",
@@ -97,9 +95,8 @@ const copy = {
     profile: "個人資料",
     appearance: "外觀",
     scope: "全部事業部",
-    file: "檔案",
     greetingQuestion: "今天需要我先看什麼？",
-    placeholder: "向 AI 秘書提問經營資料，或上傳目前會話檔案",
+    placeholder: "向 AI 秘書提問經營資料，或討論需要分析的問題",
     disclaimer: "AI 可能出錯。關鍵經營數字請結合來源與資料時間核對。",
     noProject: "尚未建立項目",
     noConversation: "尚無歷史會話",
@@ -123,9 +120,8 @@ const copy = {
     profile: "Profile",
     appearance: "Appearance",
     scope: "All business units",
-    file: "File",
     greetingQuestion: "What should I look into first?",
-    placeholder: "Ask about the business or upload a file for this conversation",
+    placeholder: "Ask about the business or discuss a question that needs analysis",
     disclaimer: "AI can make mistakes. Verify critical figures against sources and data timestamps.",
     noProject: "No projects yet",
     noConversation: "No conversations yet",
@@ -254,8 +250,6 @@ export function ProductionWorkspace({
       ? ALL_SCOPE_ID
       : initialBootstrap.organizationUnits[0]?.id ?? ALL_SCOPE_ID,
   );
-  const [uploadedFiles, setUploadedFiles] = useState<FileMetadata[]>([]);
-  const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [toast, setToast] = useState("");
@@ -309,11 +303,7 @@ export function ProductionWorkspace({
       return { salutation: "董事长", amountUnit: "万元" };
     }
   });
-  const [memoryEnabled, setMemoryEnabled] = useState(() => {
-    if (typeof window === "undefined") return true;
-    return window.localStorage.getItem("executive-workbench-memory-enabled") !== "false";
-  });
-  const fileRef = useRef<HTMLInputElement>(null);
+  const [memoryEnabled, setMemoryEnabled] = useState(initialBootstrap.me.user.memory_enabled);
   const accountRef = useRef<HTMLDivElement>(null);
   const sidebarMenuRef = useRef<HTMLDivElement>(null);
   const deepLinkHandled = useRef(false);
@@ -375,34 +365,6 @@ export function ProductionWorkspace({
   }, [activeConversationId]);
 
   useEffect(() => {
-    const pending = uploadedFiles.filter(
-      (file) => file.metadata_json?.extractable
-        && (file.extraction_status === "queued" || file.extraction_status === "processing"),
-    );
-    if (!pending.length) return;
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      const updates = await Promise.all(pending.map(async (file) => {
-        try {
-          const extraction = await productionServices.files.extraction(file.id);
-          return { id: file.id, status: extraction.status };
-        } catch {
-          return { id: file.id, status: "failed" as const };
-        }
-      }));
-      if (cancelled) return;
-      setUploadedFiles((current) => current.map((file) => {
-        const update = updates.find((item) => item.id === file.id);
-        return update ? { ...file, extraction_status: update.status } : file;
-      }));
-    }, 1200);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [uploadedFiles]);
-
-  useEffect(() => {
     document.documentElement.dataset.theme = themePreference;
     document.documentElement.style.colorScheme = themePreference === "system" ? "light dark" : themePreference;
     window.localStorage.setItem("executive-workbench-theme", themePreference);
@@ -416,10 +378,6 @@ export function ProductionWorkspace({
   useEffect(() => {
     window.localStorage.setItem("executive-workbench-profile-preferences", JSON.stringify(profilePreferences));
   }, [profilePreferences]);
-
-  useEffect(() => {
-    window.localStorage.setItem("executive-workbench-memory-enabled", String(memoryEnabled));
-  }, [memoryEnabled]);
 
   useEffect(() => {
     if (!toast) return;
@@ -518,7 +476,6 @@ export function ProductionWorkspace({
     setMessages([]);
     setMessagesError("");
     setDraft("");
-    setUploadedFiles([]);
     setSidebarOpen(false);
     setActivePanel(null);
     const project = bootstrap.projects.find((item) => item.id === projectId);
@@ -526,42 +483,10 @@ export function ProductionWorkspace({
     window.history.replaceState(null, "", window.location.pathname);
   }
 
-  async function uploadFiles(event: ChangeEvent<HTMLInputElement>) {
-    const incoming = Array.from(event.target.files ?? []);
-    event.target.value = "";
-    if (!incoming.length) return;
-    setUploading(true);
-    const results = await runRequest(async () => {
-      const uploaded: FileMetadata[] = [];
-      for (const file of incoming.slice(0, 10)) {
-        if (file.size > 50 * 1024 * 1024) throw new Error(`${file.name} 超过 50 MB 限制。`);
-        const item = await productionServices.files.upload(file, activeConversationId ?? undefined);
-        if (item.metadata_json?.extractable) {
-          const extraction = await productionServices.files.extraction(item.id);
-          item.extraction_status = extraction.status;
-        } else {
-          item.extraction_status = "unsupported";
-        }
-        uploaded.push(item);
-      }
-      return uploaded;
-    });
-    if (results) setUploadedFiles((current) => [...current, ...results]);
-    setUploading(false);
-  }
-
-  async function removeUploadedFile(file: FileMetadata) {
-    const removed = await runRequest(async () => {
-      await productionServices.files.remove(file.id);
-      return true;
-    });
-    if (removed) setUploadedFiles((current) => current.filter((item) => item.id !== file.id));
-  }
-
   async function submit(event: FormEvent) {
     event.preventDefault();
     const content = draft.trim();
-    if (!content || sending || !businessDataReady) return;
+    if (!content || sending) return;
     setSending(true);
     await runRequest(async () => {
       let conversationId = activeConversationId;
@@ -584,22 +509,66 @@ export function ProductionWorkspace({
           }));
         }
       }
-      const message = await productionServices.conversations.sendMessage(
-        conversationId,
-        content,
-        uploadedFiles
-          .filter((file) => file.extraction_status === "completed")
-          .map((file) => file.id),
-      );
+      const message = await productionServices.conversations.sendMessage(conversationId, content);
       setMessages((current) => [...current, message]);
       setDraft("");
-      setUploadedFiles([]);
       window.history.replaceState(null, "", `${window.location.pathname}?conversation=${encodeURIComponent(conversationId)}`);
       const refreshed = await productionServices.conversations.messages(conversationId);
       setMessages(refreshed.items);
       await refreshWorkspace();
     });
     setSending(false);
+  }
+
+  function answerJob(messageId: string) {
+    return bootstrap.jobs.find(
+      (job) => String(job.payload_json.assistant_message_id || "") === messageId,
+    );
+  }
+
+  async function cancelAnswer(messageId: string) {
+    const job = answerJob(messageId);
+    if (!job) return;
+    const updated = await runRequest(() => productionServices.jobs.cancel(job.id));
+    if (!updated) return;
+    setBootstrap((current) => ({
+      ...current,
+      jobs: current.jobs.map((item) => (item.id === updated.id ? updated : item)),
+    }));
+    setMessages((current) => current.map((message) => (
+      message.id === messageId
+        ? { ...message, status: "failed", content: "请求已取消" }
+        : message
+    )));
+    setToast("已停止本次处理");
+  }
+
+  async function retryAnswer(messageId: string) {
+    const job = answerJob(messageId);
+    if (!job || !activeConversationId) return;
+    const retried = await runRequest(() => productionServices.jobs.retry(job.id));
+    if (!retried) return;
+    setBootstrap((current) => ({ ...current, jobs: [retried, ...current.jobs] }));
+    const refreshed = await runRequest(
+      () => productionServices.conversations.messages(activeConversationId),
+    );
+    if (refreshed) setMessages(refreshed.items);
+    setToast("已重新进入受控处理流程");
+  }
+
+  async function changeMemoryEnabled(value: boolean) {
+    const previous = memoryEnabled;
+    setMemoryEnabled(value);
+    const updated = await runRequest(() => productionServices.auth.updatePreferences(value));
+    if (!updated) {
+      setMemoryEnabled(previous);
+      return;
+    }
+    setBootstrap((current) => ({
+      ...current,
+      me: { ...current.me, user: updated },
+    }));
+    setToast(value ? "长期记忆已开启" : "长期记忆已关闭");
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -967,11 +936,6 @@ export function ProductionWorkspace({
               draft={draft}
               setDraft={setDraft}
               sending={sending}
-              uploadedFiles={uploadedFiles}
-              uploading={uploading}
-              fileRef={fileRef}
-              onFiles={uploadFiles}
-              onRemoveFile={removeUploadedFile}
               onKeyDown={handleComposerKeyDown}
               onSubmit={submit}
               organizationUnits={organizationUnits}
@@ -979,6 +943,9 @@ export function ProductionWorkspace({
               setSelectedOrganizationId={setSelectedOrganizationId}
               language={languagePreference}
               disclaimer={c.disclaimer}
+              jobs={bootstrap.jobs}
+              onCancelAnswer={(messageId) => void cancelAnswer(messageId)}
+              onRetryAnswer={(messageId) => void retryAnswer(messageId)}
             />
           ) : (
             <ProductionHome
@@ -994,11 +961,6 @@ export function ProductionWorkspace({
               draft={draft}
               setDraft={setDraft}
               sending={sending}
-              uploadedFiles={uploadedFiles}
-              uploading={uploading}
-              fileRef={fileRef}
-              onFiles={uploadFiles}
-              onRemoveFile={removeUploadedFile}
               onKeyDown={handleComposerKeyDown}
               onSubmit={submit}
               activeProjectName={activeProjectId ? bootstrap.projects.find((item) => item.id === activeProjectId)?.name ?? null : null}
@@ -1019,7 +981,7 @@ export function ProductionWorkspace({
         dataCapabilities={dataCapabilities}
         language={languagePreference}
         memoryEnabled={memoryEnabled}
-        setMemoryEnabled={setMemoryEnabled}
+        setMemoryEnabled={(value) => void changeMemoryEnabled(value)}
         onSelectReport={(report) => void openReport(report.kind === "weekly" ? "weekly" : "daily", report.id)}
         onOpenConversation={(conversation) => void openConversation(conversation)}
         onNewConversation={() => newConversation()}
@@ -1052,7 +1014,7 @@ export function ProductionWorkspace({
         profilePreferences={profilePreferences}
         setProfilePreferences={setProfilePreferences}
         memoryEnabled={memoryEnabled}
-        setMemoryEnabled={setMemoryEnabled}
+        setMemoryEnabled={(value) => void changeMemoryEnabled(value)}
         memories={bootstrap.memories}
         onCreateMemory={async (title, content, kind, organizationUnitId) => {
           const created = await runRequest(() => productionServices.memories.create({ title, content, kind, organization_unit_id: organizationUnitId || undefined }));
@@ -1134,11 +1096,6 @@ function ProductionHome({
   draft,
   setDraft,
   sending,
-  uploadedFiles,
-  uploading,
-  fileRef,
-  onFiles,
-  onRemoveFile,
   onKeyDown,
   onSubmit,
   activeProjectName,
@@ -1155,11 +1112,6 @@ function ProductionHome({
   draft: string;
   setDraft: (value: string) => void;
   sending: boolean;
-  uploadedFiles: FileMetadata[];
-  uploading: boolean;
-  fileRef: React.RefObject<HTMLInputElement | null>;
-  onFiles: (event: ChangeEvent<HTMLInputElement>) => void;
-  onRemoveFile: (file: FileMetadata) => void;
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmit: (event: FormEvent) => void;
   activeProjectName: string | null;
@@ -1167,10 +1119,10 @@ function ProductionHome({
   const c = copy[language];
   const hasScope = organizationUnits.length > 0;
   const suggestions = language === "en"
-    ? ["Summarize this month's operating changes", "Show items that need my confirmation", "Extract executive points from an uploaded file"]
+    ? ["Summarize this month's operating changes", "Show items that need my confirmation", "Draft a three-minute executive update"]
     : language === "zh-TW"
-      ? ["整理本月經營變化", "查看需要我確認的事項", "從上傳檔案提取管理層要點"]
-      : ["整理本月经营变化", "查看需要我确认的事项", "从上传文件提取管理层要点"];
+      ? ["整理本月經營變化", "查看需要我確認的事項", "起草三分鐘經營會匯報"]
+      : ["整理本月经营变化", "查看需要我确认的事项", "起草三分钟经营会汇报"];
 
   return (
     <div className="workspace-home">
@@ -1189,7 +1141,8 @@ function ProductionHome({
           <section className="workspace-greeting" aria-labelledby="production-greeting-title">
             <p>{localizedDate(language, me.user.timezone)}</p>
             <div className="greeting-title-line"><span className="service-mark" aria-hidden="true" /><h1 id="production-greeting-title">{greetingForCurrentHour(me.user.timezone, language)}，{salutation}</h1></div>
-            <span>{hasScope ? c.greetingQuestion : "企业管理员尚未为您配置可分析的事业部。"}</span>
+            <span>{c.greetingQuestion}</span>
+            {!hasScope && <small className="active-project-context">经营数据尚未配置，仍可进行泛化问答。</small>}
             {activeProjectName && <small className="active-project-context">当前会话将归入项目：{activeProjectName}</small>}
           </section>
 
@@ -1199,20 +1152,15 @@ function ProductionHome({
             draft={draft}
             setDraft={setDraft}
             sending={sending}
-            disabled={!hasScope}
+            disabled={false}
             organizationUnits={organizationUnits}
             selectedOrganizationId={selectedOrganizationId}
             setSelectedOrganizationId={setSelectedOrganizationId}
-            uploadedFiles={uploadedFiles}
-            uploading={uploading}
-            fileRef={fileRef}
-            onFiles={onFiles}
-            onRemoveFile={onRemoveFile}
             onKeyDown={onKeyDown}
             onSubmit={onSubmit}
           />
 
-          {hasScope && <section className="prompt-suggestions production-prompt-suggestions" aria-label="从一个问题开始"><h2>{language === "en" ? "Start with a question" : "从一个问题开始"}</h2><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>}
+          <section className="prompt-suggestions production-prompt-suggestions" aria-label="从一个问题开始"><h2>{language === "en" ? "Start with a question" : "从一个问题开始"}</h2><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>
           <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? `数据来源：${dataCapabilities.source_label}。` : "当前尚未激活经营数据。"}{c.disclaimer}</p>
         </div>
       </div>
@@ -1228,11 +1176,6 @@ function ProductionConversation({
   draft,
   setDraft,
   sending,
-  uploadedFiles,
-  uploading,
-  fileRef,
-  onFiles,
-  onRemoveFile,
   onKeyDown,
   onSubmit,
   organizationUnits,
@@ -1240,6 +1183,9 @@ function ProductionConversation({
   setSelectedOrganizationId,
   language,
   disclaimer,
+  jobs,
+  onCancelAnswer,
+  onRetryAnswer,
 }: {
   conversation: Conversation | null;
   messages: ConversationMessage[];
@@ -1248,11 +1194,6 @@ function ProductionConversation({
   draft: string;
   setDraft: (value: string) => void;
   sending: boolean;
-  uploadedFiles: FileMetadata[];
-  uploading: boolean;
-  fileRef: React.RefObject<HTMLInputElement | null>;
-  onFiles: (event: ChangeEvent<HTMLInputElement>) => void;
-  onRemoveFile: (file: FileMetadata) => void;
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmit: (event: FormEvent) => void;
   organizationUnits: OrganizationUnit[];
@@ -1260,6 +1201,9 @@ function ProductionConversation({
   setSelectedOrganizationId: (value: string) => void;
   language: UiLanguage;
   disclaimer: string;
+  jobs: Job[];
+  onCancelAnswer: (messageId: string) => void;
+  onRetryAnswer: (messageId: string) => void;
 }) {
   return (
     <div className="chat-page production-chat-page">
@@ -1275,6 +1219,12 @@ function ProductionConversation({
             <section className="answer-conclusion"><p>{message.content || "正在等待真实处理结果…"}</p></section>
             <MessageDetails conversationId={conversation?.id ?? message.conversation_id} message={message} />
             {message.status && message.status !== "completed" && <small className={`message-status ${message.status}`}>状态：{messageStatusLabel(message.status)}</small>}
+            <MessageJobActions
+              message={message}
+              job={jobs.find((item) => String(item.payload_json.assistant_message_id || "") === message.id)}
+              onCancel={() => onCancelAnswer(message.id)}
+              onRetry={() => onRetryAnswer(message.id)}
+            />
           </article>
         ))}
         {sending && <section className="processing-card" aria-live="polite"><p className="eyebrow">正在提交</p><h3>问题已进入受控处理流程</h3><p>系统不会在尚未收到真实结果时生成占位结论。</p></section>}
@@ -1286,15 +1236,10 @@ function ProductionConversation({
           draft={draft}
           setDraft={setDraft}
           sending={sending}
-          disabled={!organizationUnits.length}
+          disabled={false}
           organizationUnits={organizationUnits}
           selectedOrganizationId={selectedOrganizationId}
           setSelectedOrganizationId={setSelectedOrganizationId}
-          uploadedFiles={uploadedFiles}
-          uploading={uploading}
-          fileRef={fileRef}
-          onFiles={onFiles}
-          onRemoveFile={onRemoveFile}
           onKeyDown={onKeyDown}
           onSubmit={onSubmit}
         />
@@ -1302,6 +1247,30 @@ function ProductionConversation({
       </div>
     </div>
   );
+}
+
+function MessageJobActions({
+  message,
+  job,
+  onCancel,
+  onRetry,
+}: {
+  message: ConversationMessage;
+  job?: Job;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  if (!job) return null;
+  if (
+    (message.status === "queued" || message.status === "running")
+    && (job.status === "queued" || job.status === "running")
+  ) {
+    return <div className="message-job-actions"><button type="button" onClick={onCancel}>停止处理</button></div>;
+  }
+  if (message.status === "failed" && (job.status === "failed" || job.status === "canceled")) {
+    return <div className="message-job-actions"><button type="button" onClick={onRetry}>重新尝试</button></div>;
+  }
+  return null;
 }
 
 function MessageSkeleton() {
@@ -1325,17 +1294,88 @@ function humanizeMetricKey(key: string) {
     contract_amount: "合同金额",
     gross_profit_amount: "毛利金额",
     gross_margin_rate: "毛利率",
+    name: "名称",
+    stage: "阶段",
+    bucket: "账龄",
+    organization_name: "事业部",
+    customer_alias: "客户",
+    status: "状态",
+    risk_level: "风险等级",
+    milestone: "当前里程碑",
+    delay_days: "延期天数",
+    count: "数量",
+    probability: "赢单概率",
+    progress_rate: "完成进度",
+    target_value: "目标值",
+    actual_value: "实际值",
+    completion_rate: "完成率",
   };
   return labels[key] ?? key.replaceAll("_", " ");
 }
 
 function formatStructuredValue(key: string, value: unknown) {
-  if (typeof value !== "number") return String(value ?? "—");
-  if (key.endsWith("_rate")) return `${(value * 100).toFixed(1)}%`;
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value !== "number") {
+    if (typeof value !== "string") return "—";
+    const valueLabels: Record<string, string> = {
+      active: "推进中", stalled: "停滞", won: "已赢单", lost: "已输单", paused: "已暂停",
+      normal: "正常", attention: "需关注", delayed: "已延期", critical: "严重风险", high: "高风险",
+      completed: "已完成", pending: "待处理", in_progress: "进行中",
+    };
+    return valueLabels[value] ?? value;
+  }
+  if (key.endsWith("_rate") || key === "probability") return `${(value * (value <= 1 ? 100 : 1)).toFixed(1)}%`;
+  if (key === "delay_days") return `${value.toLocaleString("zh-CN")} 天`;
   if (key.includes("amount") || key.includes("forecast")) {
     return `${(value / 10000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })} 万`;
   }
   return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+const structuredRowKeys = [
+  "organizations",
+  "organization_units",
+  "metrics",
+  "stages",
+  "customers",
+  "projects",
+  "aging",
+  "snapshots",
+  "rows",
+  "items",
+];
+
+function findStructuredRows(value: unknown, depth = 0): unknown[] | null {
+  if (!value || depth > 4) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = findStructuredRows(item, depth + 1);
+      if (nested) return nested;
+    }
+    return null;
+  }
+  if (typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  for (const key of structuredRowKeys) {
+    const candidate = record[key];
+    if (Array.isArray(candidate) && candidate.length > 0) return candidate;
+  }
+  for (const candidate of Object.values(record)) {
+    const nested = findStructuredRows(candidate, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function visibleStructuredEntries(record: Record<string, unknown>) {
+  return Object.entries(record)
+    .filter(([key, value]) => (
+      !key.includes("source_record_id")
+      && !key.endsWith("_id")
+      && (typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+    ))
+    .slice(0, 4);
 }
 
 type StructuredChartDatum = {
@@ -1405,10 +1445,9 @@ function MessageDetails({
   const structuredMetrics = Object.entries(structuredData)
     .filter(([, value]) => typeof value === "number" || typeof value === "string")
     .slice(0, 6);
-  const structuredRows = Object.entries(structuredData).find(([, value]) => Array.isArray(value))?.[1];
+  const structuredRows = findStructuredRows(structuredData);
   const structuredChart = Array.isArray(structuredRows) ? buildStructuredChart(structuredRows) : null;
   const freshness = Array.isArray(content.freshness) ? content.freshness.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
-  const fileCitations = Array.isArray(content.file_citations) ? content.file_citations.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
   const citations = message.citations ?? (Array.isArray(content.citations) ? content.citations.filter((item): item is { label: string; source: string; as_of?: string | null } => Boolean(item && typeof item === "object" && "label" in item && "source" in item)) : []);
   const clarificationId = typeof content.clarification_id === "string" ? content.clarification_id : null;
   const clarificationOptions = Array.isArray(content.options) ? content.options.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
@@ -1442,17 +1481,17 @@ function MessageDetails({
     }
   }
 
-  if (!metrics.length && !sections.length && !structuredMetrics.length && !Array.isArray(structuredRows) && !citations.length && !fileCitations.length && !freshness.length && !clarificationId && !message.source_data_as_of && !message.model_name) return null;
+  if (!metrics.length && !sections.length && !structuredMetrics.length && !Array.isArray(structuredRows) && !citations.length && !freshness.length && !clarificationId && !message.source_data_as_of && !message.model_name) return null;
   return (
     <div className="production-message-details">
       {metrics.length > 0 && <dl className="answer-metric-grid">{metrics.slice(0, 6).map((metric, index) => <div key={`${String(metric.label)}-${index}`}><dt>{String(metric.label ?? "指标")}</dt><dd>{String(metric.value ?? "—")}</dd>{metric.note ? <small>{String(metric.note)}</small> : null}</div>)}</dl>}
       {structuredMetrics.length > 0 && <dl className="answer-metric-grid">{structuredMetrics.map(([key, value]) => <div key={key}><dt>{humanizeMetricKey(key)}</dt><dd>{formatStructuredValue(key, value)}</dd></div>)}</dl>}
       {structuredChart && <StructuredBarChart metricKey={structuredChart.metricKey} items={structuredChart.items} />}
-      {Array.isArray(structuredRows) && structuredRows.length > 0 && <div className="answer-structured-table">{structuredRows.slice(0, 12).map((row, index) => { const record: Record<string, unknown> = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : { value: row }; return <article key={`${index}-${String(record.source_record_id ?? record.name ?? record.stage ?? record.bucket ?? "row")}`}><span>{String(index + 1).padStart(2, "0")}</span><div>{Object.entries(record).filter(([key]) => !key.includes("source_record_id") && !key.endsWith("_id")).slice(0, 4).map(([key, value]) => <p key={key}><small>{humanizeMetricKey(key)}</small><strong>{formatStructuredValue(key, value)}</strong></p>)}</div></article>; })}</div>}
+      {Array.isArray(structuredRows) && structuredRows.length > 0 && <div className="answer-structured-table">{structuredRows.slice(0, 12).map((row, index) => { const record: Record<string, unknown> = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : { value: row }; return <article key={`${index}-${String(record.source_record_id ?? record.name ?? record.stage ?? record.bucket ?? record.organization_name ?? "row")}`}><span>{String(index + 1).padStart(2, "0")}</span><div>{visibleStructuredEntries(record).map(([key, value]) => <p key={key}><small>{humanizeMetricKey(key)}</small><strong>{formatStructuredValue(key, value)}</strong></p>)}</div></article>; })}</div>}
       {sections.length > 0 && <div className="answer-section-list">{sections.slice(0, 8).map((section, index) => <section key={`${String(section.title)}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{String(section.title ?? "分析")}</strong>{section.content || section.detail ? <p>{String(section.content ?? section.detail)}</p> : null}</div></section>)}</div>}
       {clarificationId && !clarificationResolved && <section className="clarification-options"><small>请确认后继续</small><div>{clarificationOptions.map((option, index) => { const label = String(option.label ?? option.value ?? `选项 ${index + 1}`); const value = String(option.value ?? option.label ?? ""); return <button type="button" key={`${value}-${index}`} disabled={!value || clarificationLoading} onClick={() => void resolveClarification(value)}>{label}<span aria-hidden="true">›</span></button>; })}</div>{!clarificationOptions.length && <p>请在输入框中补充需要查询的事业部范围。</p>}</section>}
       {clarificationResolved && <p className="clarification-resolved">已确认范围，正在继续处理。</p>}
-      {(freshness.length > 0 || citations.length > 0 || fileCitations.length > 0 || message.source_data_as_of || message.model_name) && <details className="answer-evidence"><summary>来源与数据时间</summary><dl>{message.source_data_as_of && <div><dt>数据截至</dt><dd>{formatTimestamp(message.source_data_as_of)}</dd></div>}{freshness.map((item, index) => <div key={`${String(item.domain)}-${index}`}><dt>{domainLabels[String(item.domain)] ?? String(item.domain ?? "数据")}</dt><dd>{String(item.source_display_name ?? "未知来源")} · {formatTimestamp(typeof item.source_data_as_of === "string" ? item.source_data_as_of : null)} · {item.status === "fresh" ? "最新" : String(item.status ?? "")}</dd></div>)}{fileCitations.map((citation, index) => <div key={`${String(citation.file_id)}-${index}`}><dt>文件</dt><dd>{String(citation.file_name ?? "文件")} · {JSON.stringify(citation.locator ?? {})}</dd></div>)}{citations.map((citation, index) => <div key={`${citation.source}-${index}`}><dt>{citation.label}</dt><dd>{citation.source}{citation.as_of ? ` · ${citation.as_of}` : ""}</dd></div>)}{message.model_name && <div><dt>处理模型</dt><dd>{message.model_name}</dd></div>}</dl></details>}
+      {(freshness.length > 0 || citations.length > 0 || message.source_data_as_of || message.model_name) && <details className="answer-evidence"><summary>来源与数据时间</summary><dl>{message.source_data_as_of && <div><dt>数据截至</dt><dd>{formatTimestamp(message.source_data_as_of)}</dd></div>}{freshness.map((item, index) => <div key={`${String(item.domain)}-${index}`}><dt>{domainLabels[String(item.domain)] ?? String(item.domain ?? "数据")}</dt><dd>{String(item.source_display_name ?? "未知来源")} · {formatTimestamp(typeof item.source_data_as_of === "string" ? item.source_data_as_of : null)} · {item.status === "fresh" ? "最新" : String(item.status ?? "")}</dd></div>)}{citations.map((citation, index) => <div key={`${citation.source}-${index}`}><dt>{citation.label}</dt><dd>{citation.source}{citation.as_of ? ` · ${citation.as_of}` : ""}</dd></div>)}{message.model_name && <div><dt>处理模型</dt><dd>{message.model_name}</dd></div>}</dl></details>}
       {evidenceCount > 0 && <section className="numeric-evidence"><button type="button" onClick={() => void toggleEvidence()}><span>{evidenceOpen ? "收起数字依据" : `查看数字依据（${evidenceCount}）`}</span><i aria-hidden="true">{evidenceOpen ? "⌃" : "⌄"}</i></button>{evidenceOpen && <div>{evidenceLoading ? <small>正在读取受控证据…</small> : evidenceRows.map((evidence) => <article key={evidence.id}><header><strong>{domainLabels[evidence.domain] ?? evidence.domain}</strong><span>{evidence.source_display_name}</span></header><p>数据截至 {formatTimestamp(evidence.source_data_as_of)}{evidence.dataset_version ? ` · ${evidence.dataset_version}` : ""}</p><small>{evidence.row_references_json.length ? `${evidence.row_references_json.length} 条源记录引用` : "聚合结果来自当前激活数据版本"}</small></article>)}</div>}</section>}
     </div>
   );
@@ -1468,11 +1507,6 @@ function ProductionComposer({
   organizationUnits,
   selectedOrganizationId,
   setSelectedOrganizationId,
-  uploadedFiles,
-  uploading,
-  fileRef,
-  onFiles,
-  onRemoveFile,
   onKeyDown,
   onSubmit,
 }: {
@@ -1485,33 +1519,21 @@ function ProductionComposer({
   organizationUnits: OrganizationUnit[];
   selectedOrganizationId: string;
   setSelectedOrganizationId: (value: string) => void;
-  uploadedFiles: FileMetadata[];
-  uploading: boolean;
-  fileRef: React.RefObject<HTMLInputElement | null>;
-  onFiles: (event: ChangeEvent<HTMLInputElement>) => void;
-  onRemoveFile: (file: FileMetadata) => void;
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmit: (event: FormEvent) => void;
 }) {
   const c = copy[language];
-  const filesReady = uploadedFiles.every(
-    (file) => !file.metadata_json?.extractable || file.extraction_status === "completed",
-  );
   return (
     <form className="composer workbench-composer home-primary-composer production-composer" onSubmit={onSubmit}>
       <label className="sr-only" htmlFor={id}>输入经营问题</label>
-      <textarea id={id} rows={2} maxLength={COMPOSER_MAX_LENGTH} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} placeholder={disabled ? "尚未配置可分析事业部" : c.placeholder} disabled={disabled} />
-      {uploadedFiles.length > 0 && <div className="composer-file-list" aria-label="待发送文件">{uploadedFiles.map((file) => <span key={file.id}><UiIcon name="file" /><strong>{file.original_name}</strong><small>{file.extraction_status === "completed" ? "解析完成" : file.extraction_status === "failed" ? "解析失败" : file.extraction_status === "unsupported" ? "不可解析" : "正在解析"}</small><button type="button" aria-label={`移除 ${file.original_name}`} onClick={() => onRemoveFile(file)}>×</button></span>)}</div>}
+      <textarea id={id} rows={2} maxLength={COMPOSER_MAX_LENGTH} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} placeholder={c.placeholder} disabled={disabled} />
       <div className="composer-footer">
         <div className="composer-tools">
-          <input ref={fileRef} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx" onChange={onFiles} />
-          <button type="button" className="composer-tool-button" onClick={() => fileRef.current?.click()} disabled={disabled || uploading}><span aria-hidden="true">＋</span><span>{uploading ? "上传中…" : c.file}</span></button>
-          <OrganizationPicker language={language} units={organizationUnits} value={selectedOrganizationId} onChange={setSelectedOrganizationId} disabled={disabled} />
+          <OrganizationPicker language={language} units={organizationUnits} value={selectedOrganizationId} onChange={setSelectedOrganizationId} disabled={!organizationUnits.length} />
         </div>
         <div className="composer-send">
           {draft.length >= COMPOSER_HINT_THRESHOLD && <span className="composer-character-count">{language === "en" ? `${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString("en")} characters remaining` : `还可输入 ${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString(language)} 字`}</span>}
-          {!filesReady && <span className="composer-file-progress">文件解析完成后可发送</span>}
-          <button className="composer-submit-button" type="submit" disabled={disabled || sending || !draft.trim() || !filesReady} aria-label="发送问题">↑</button>
+          <button className="composer-submit-button" type="submit" disabled={disabled || sending || !draft.trim()} aria-label="发送问题">↑</button>
         </div>
       </div>
     </form>
@@ -2051,7 +2073,7 @@ function Toast({ message }: { message: string }) {
   return <div className="toast" role="status" aria-live="polite"><span className="status-dot positive" aria-hidden="true" />{message}</div>;
 }
 
-type UiIconName = "settings" | "language" | "logout" | "chevron" | "search" | "profile" | "appearance" | "memory" | "system" | "light" | "dark" | "edit" | "shield" | "pin" | "archive" | "remove" | "folder" | "organization" | "file";
+type UiIconName = "settings" | "language" | "logout" | "chevron" | "search" | "profile" | "appearance" | "memory" | "system" | "light" | "dark" | "edit" | "shield" | "pin" | "archive" | "remove" | "folder" | "organization";
 
 function UiIcon({ name }: { name: UiIconName }) {
   const paths: Record<UiIconName, ReactNode> = {
@@ -2073,7 +2095,6 @@ function UiIcon({ name }: { name: UiIconName }) {
     remove: <><path d="M5 5l14 14M19 5 5 19" /></>,
     folder: <><path d="M3.5 7.5h6l2-2h8a1.5 1.5 0 0 1 1.5 1.5v10.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a1.5 1.5 0 0 1 .5-1.5Z" /><path d="M3.5 9h17.5" /></>,
     organization: <><path d="M5 20V9l4-3v14M9 20h10V4l-6 3v13M3 20h18" /><path d="M12 10h2M12 14h2M16 8h1M16 12h1" /></>,
-    file: <><path d="M7 3.5h7l4 4V20H7Z" /><path d="M14 3.5V8h4M10 12h5M10 15h5" /></>,
   };
   return <svg className="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }

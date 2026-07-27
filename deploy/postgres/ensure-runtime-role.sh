@@ -321,6 +321,7 @@ WITH grants(role_name, table_name) AS (
   VALUES
     (:'mcp_user', 'organization_units'),
     (:'mcp_user', 'data_domain_status'),
+    (:'mcp_user', 'mcp_tool_configs'),
     (:'mcp_user', 'dim_customer'),
     (:'mcp_user', 'fact_opportunity'),
     (:'mcp_user', 'fact_delivery'),
@@ -350,6 +351,8 @@ WITH grants(role_name, table_name) AS (
     (:'assistant_worker_user', 'job_attempts'),
     (:'assistant_worker_user', 'schedule_runs'),
     (:'assistant_worker_user', 'model_provider_configs'),
+    (:'assistant_worker_user', 'mcp_tool_configs'),
+    (:'assistant_worker_user', 'memories'),
     (:'assistant_worker_user', 'message_routes'),
     (:'assistant_worker_user', 'clarifications'),
     (:'assistant_worker_user', 'message_evidence'),

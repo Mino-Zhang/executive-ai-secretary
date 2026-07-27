@@ -25,6 +25,7 @@ from .middleware import RequestContextMiddleware
 from .routers import (
     admin,
     admin_data,
+    admin_mcp,
     admin_models,
     auth,
     conversations,
@@ -93,6 +94,7 @@ for api_router in (
     jobs.router,
     admin.router,
     admin_data.router,
+    admin_mcp.router,
     admin_models.router,
     data.router,
 ):

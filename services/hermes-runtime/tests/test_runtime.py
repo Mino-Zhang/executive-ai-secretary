@@ -11,7 +11,12 @@ import httpx
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from executive_ai_hermes.main import ANSPIRE_ENDPOINT_URL, app, settings
+from executive_ai_hermes.main import (
+    ANSPIRE_ENDPOINT_URL,
+    _runtime_config_for_model,
+    app,
+    settings,
+)
 
 INTERNAL_KEY = "hermes-test-internal-key-with-at-least-32-characters"
 PROVIDER_CONFIG = {
@@ -134,6 +139,9 @@ def test_runtime_invokes_hermes_019_with_ephemeral_anspire_credential(monkeypatc
     async def fake_run(command, *, environment):
         observed["command"] = command
         observed["environment"] = environment
+        observed["runtime_config"] = Path(
+            environment["HERMES_HOME"], "config.yaml"
+        ).read_text(encoding="utf-8")
         usage_path = Path(command[command.index("--usage-file") + 1])
         usage_path.write_text(
             json.dumps({"input_tokens": 10, "output_tokens": 5}),
@@ -165,8 +173,38 @@ def test_runtime_invokes_hermes_019_with_ephemeral_anspire_credential(monkeypatc
     assert PROVIDER_CONFIG["api_key"] not in command
     assert observed["environment"]["ANSPIRE_API_KEY"] == PROVIDER_CONFIG["api_key"]
     assert observed["environment"]["CUSTOM_BASE_URL"] == ANSPIRE_ENDPOINT_URL
+    assert observed["environment"]["HERMES_MAX_TOKENS"] == "700"
+    assert observed["runtime_config"] == "agent:\n  reasoning_effort: none\n"
     assert "OPENAI_API_KEY" not in observed["environment"]
     assert "OPENAI_BASE_URL" not in observed["environment"]
+
+
+def test_runtime_applies_profile_specific_output_budget(monkeypatch) -> None:
+    observed: dict[str, str] = {}
+
+    async def fake_run(_command, *, environment):
+        observed["max_tokens"] = environment["HERMES_MAX_TOKENS"]
+        return 0, "简洁回答", ""
+
+    monkeypatch.setattr(settings, "hermes_runtime_hmac_key", SecretStr(INTERNAL_KEY))
+    monkeypatch.setattr("executive_ai_hermes.main._run_hermes_process", fake_run)
+    payload = {
+        "profile": "data",
+        "payload": {"question": "本月回款风险"},
+        "request_id": "data-budget",
+        "provider_config": PROVIDER_CONFIG,
+    }
+    body, headers = _signed_request(payload)
+    with TestClient(app) as client:
+        response = client.post("/v1/runs", content=body, headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert observed["max_tokens"] == "1600"
+
+
+def test_glm_reasoning_control_is_not_applied_to_other_catalog_models() -> None:
+    assert _runtime_config_for_model("glm-5.2") == "agent:\n  reasoning_effort: none\n"
+    assert _runtime_config_for_model("gpt-5.4") == "agent: {}\n"
 
 
 def test_runtime_rejects_replayed_signed_request(monkeypatch) -> None:

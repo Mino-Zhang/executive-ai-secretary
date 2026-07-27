@@ -71,6 +71,7 @@ class Settings(BaseSettings):
 
     sync_cron: str = "0 2 * * *"
     sync_timezone: str = "Asia/Shanghai"
+    data_stale_after_hours: int = Field(default=30, ge=1, le=24 * 30)
     scheduler_poll_seconds: float = Field(default=15, ge=1, le=300)
     demo_reference_date: str = "2026-07-26"
     demo_dataset_version: str = "phase2-demo-v1"

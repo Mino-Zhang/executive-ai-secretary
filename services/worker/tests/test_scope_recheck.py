@@ -93,8 +93,13 @@ def test_answer_and_evidence_save_is_atomic_and_idempotent() -> None:
                     "usage": {"input_tokens": 10, "output_tokens": 5},
                 },
                 content_json={"freshness": tool_result["freshness"]},
-                tool="get_collection_aging",
-                tool_result=tool_result,
+                tool_results=[
+                    {
+                        "tool": "get_collection_aging",
+                        "arguments": {"organization_unit_ids": []},
+                        "result": tool_result,
+                    }
+                ],
             )
             assert count == 1
 
@@ -114,6 +119,114 @@ def test_answer_and_evidence_save_is_atomic_and_idempotent() -> None:
             assert assistant.content_json["evidence_count"] == 1
             assert evidence_count == 1
             assert run_count == 1
+    finally:
+        Base.metadata.drop_all(engine)
+
+
+def test_canceled_job_cannot_write_a_late_answer() -> None:
+    Base.metadata.create_all(engine)
+    try:
+        with SessionLocal.begin() as db:
+            enterprise = Enterprise(name="取消围栏企业", slug="canceled-write-fence")
+            db.add(enterprise)
+            db.flush()
+            user = User(
+                enterprise_id=enterprise.id,
+                email="fence@example.com",
+                display_name="Fence User",
+                role="executive",
+                password_change_required=False,
+            )
+            db.add(user)
+            db.flush()
+            conversation = Conversation(
+                enterprise_id=enterprise.id,
+                owner_user_id=user.id,
+                title="取消围栏",
+            )
+            db.add(conversation)
+            db.flush()
+            assistant = Message(
+                conversation_id=conversation.id,
+                role="assistant",
+                content="请求已取消",
+                sequence=1,
+                status="failed",
+            )
+            db.add(assistant)
+            db.flush()
+            job = Job(
+                enterprise_id=enterprise.id,
+                created_by_user_id=user.id,
+                job_type="assistant_response",
+                status="canceled",
+                lease_token=None,
+                scope_snapshot_json={
+                    "enterprise_wide": False,
+                    "organization_unit_ids": [],
+                    "general_only": True,
+                },
+            )
+            db.add(job)
+            db.flush()
+            job_id = job.id
+            assistant_id = assistant.id
+
+        stale_lease_token = uuid.uuid4().hex
+        try:
+            _save_answer_with_evidence(
+                job_id=job_id,
+                lease_token=stale_lease_token,
+                assistant_message_id=assistant_id,
+                content="这条迟到答案不应保存",
+                response={"provider": "anspire", "model": "glm-5.2", "usage": {}},
+                content_json={},
+                tool_results=[],
+            )
+        except RuntimeError as exc:
+            assert "write lease" in str(exc)
+        else:  # pragma: no cover - cancellation must fence every late writer.
+            raise AssertionError("canceled job overwrote its placeholder")
+        with SessionLocal() as db:
+            assistant = db.get(Message, assistant_id)
+            assert assistant is not None
+            assert assistant.content == "请求已取消"
+            assert assistant.status == "failed"
+    finally:
+        Base.metadata.drop_all(engine)
+
+
+def test_general_only_snapshot_remains_authorized_without_data_grants() -> None:
+    Base.metadata.create_all(engine)
+    try:
+        with SessionLocal.begin() as db:
+            enterprise = Enterprise(name="泛化问答企业", slug="general-only-worker")
+            db.add(enterprise)
+            db.flush()
+            user = User(
+                enterprise_id=enterprise.id,
+                email="general@example.com",
+                display_name="General User",
+                role="executive",
+                password_change_required=False,
+            )
+            db.add(user)
+            db.flush()
+            job = Job(
+                enterprise_id=enterprise.id,
+                created_by_user_id=user.id,
+                job_type="assistant_response",
+                scope_snapshot_json={
+                    "enterprise_wide": False,
+                    "organization_unit_ids": [],
+                    "general_only": True,
+                },
+            )
+            db.add(job)
+            db.flush()
+            job_id = job.id
+        with SessionLocal() as db:
+            assert authorization_is_current(db, db.get(Job, job_id)) is True
     finally:
         Base.metadata.drop_all(engine)
 

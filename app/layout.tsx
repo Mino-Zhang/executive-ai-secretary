@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 
 const title = "董事长 AI 秘书 | 经营决策工作台";
 const description =
-  "面向企业最高经营决策者的可信 AI 工作入口，提供经营变化、结构化分析、文档问答和个人记忆管理。";
+  "面向企业最高经营决策者的可信 AI 工作入口，提供经营变化、结构化分析、泛化问答和个人记忆管理。";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();

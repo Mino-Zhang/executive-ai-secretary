@@ -1,52 +1,33 @@
 from __future__ import annotations
 
-import re
 import uuid
-from datetime import datetime
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from executive_ai_api.anspire import AnspireConfigurationError, runtime_provider_config
 from executive_ai_api.capabilities import issue_capability_token
 from executive_ai_api.config import Settings
 from executive_ai_api.database import SessionLocal
-from executive_ai_api.hermes_client import (
-    HermesRuntimeError,
-    parse_json_response,
-    run_hermes,
-)
+from executive_ai_api.hermes_client import HermesRuntimeError, parse_json_response, run_hermes
+from executive_ai_api.mcp_registry import MCP_TOOL_SPECS, planner_catalog
 from executive_ai_api.models import (
     Clarification,
     Conversation,
-    ConversationFile,
-    FileAsset,
-    FileChunk,
-    FileExtraction,
     Job,
+    Memory,
     Message,
     MessageEvidence,
     MessageRoute,
     MessageRun,
     ModelProviderConfig,
+    OrganizationUnit,
+    User,
 )
 from executive_ai_api.security import utc_now
-from sqlalchemy import case, literal, or_, select
-
-from .file_extraction import embed_texts
-
-ALL_TOOLS = {
-    "list_query_scopes",
-    "get_overall_business",
-    "get_target_completion",
-    "get_opportunity_funnel",
-    "get_sales_forecast",
-    "get_customer_status",
-    "get_delivery_status",
-    "get_finance_margin",
-    "get_collection_aging",
-    "get_organization_performance",
-    "get_daily_changes",
-}
+from sqlalchemy import or_, select
 
 TOOL_HINTS = {
     "get_target_completion": ("目标", "完成率", "达成"),
@@ -59,6 +40,72 @@ TOOL_HINTS = {
     "get_organization_performance": ("事业部", "部门", "组织", "对比"),
     "get_daily_changes": ("今日", "今天", "变化", "昨日"),
 }
+BUSINESS_HINTS = tuple(
+    dict.fromkeys(
+        hint
+        for hints in TOOL_HINTS.values()
+        for hint in hints
+    )
+) + ("经营", "收入", "现金流", "业绩", "销售")
+WIDE_SCOPE_HINTS = ("整体", "全部", "所有", "各事业部", "事业部对比", "横向对比")
+
+
+def _deterministic_tools(question: str, allowed_tools: set[str]) -> list[str]:
+    """Resolve only explicit, high-confidence intents; ambiguous wording stays model-routed."""
+
+    candidates: list[str] = []
+    if (
+        any(hint in question for hint in ("事业部", "部门", "组织"))
+        and any(hint in question for hint in ("比较", "对比", "排名", "差距", "表现"))
+    ):
+        candidates.append("get_organization_performance")
+    elif any(hint in question for hint in ("逾期", "账龄")) or (
+        "回款" in question and any(hint in question for hint in ("风险", "催收", "应收"))
+    ):
+        candidates.append("get_collection_aging")
+    elif any(hint in question for hint in ("延期项目", "交付风险", "里程碑")):
+        candidates.append("get_delivery_status")
+    elif any(hint in question for hint in ("目标完成率", "目标达成", "达成率")):
+        candidates.append("get_target_completion")
+    elif any(hint in question for hint in ("商机漏斗", "阶段分布")):
+        candidates.append("get_opportunity_funnel")
+    elif any(hint in question for hint in ("销售预测", "加权预测", "签约预测")):
+        candidates.append("get_sales_forecast")
+    elif any(hint in question for hint in ("客户排名", "重点客户", "哪些客户")):
+        candidates.append("get_customer_status")
+    elif any(hint in question for hint in ("毛利率", "毛利额", "收入与毛利")):
+        candidates.append("get_finance_margin")
+    elif any(hint in question for hint in ("今日变化", "今天变化", "昨日变化")):
+        candidates.append("get_daily_changes")
+    elif any(hint in question for hint in ("整体经营", "经营概览", "经营全貌")):
+        candidates.append("get_overall_business")
+    return [tool for tool in candidates if tool in allowed_tools]
+
+
+def _deterministic_period_arguments(
+    question: str,
+    timezone_name: str,
+    *,
+    today: date | None = None,
+) -> dict[str, str]:
+    current = today or datetime.now(ZoneInfo(timezone_name)).date()
+    if "上月" in question:
+        period_end = current.replace(day=1) - timedelta(days=1)
+        period_start = period_end.replace(day=1)
+    elif "本季度" in question:
+        quarter_month = ((current.month - 1) // 3) * 3 + 1
+        period_start = current.replace(month=quarter_month, day=1)
+        end_month = quarter_month + 2
+        period_end = current.replace(
+            month=end_month,
+            day=monthrange(current.year, end_month)[1],
+        )
+    elif "本月" in question:
+        period_start = current.replace(day=1)
+        period_end = current.replace(day=monthrange(current.year, current.month)[1])
+    else:
+        return {}
+    return {"period_start": period_start.isoformat(), "period_end": period_end.isoformat()}
 
 
 class OrchestrationPermanentError(RuntimeError):
@@ -83,7 +130,7 @@ def _ids(job: Job) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
 
 def _organization_ids(job: Job) -> set[uuid.UUID]:
     try:
-        values = {
+        return {
             uuid.UUID(str(value))
             for value in job.scope_snapshot_json.get("organization_unit_ids", [])
         }
@@ -91,79 +138,183 @@ def _organization_ids(job: Job) -> set[uuid.UUID]:
         raise OrchestrationPermanentError(
             "invalid_scope_snapshot", "任务权限快照无效", "当前查询范围无效"
         ) from exc
-    if not values:
-        raise OrchestrationPermanentError(
-            "empty_scope_snapshot", "任务没有事业部权限", "当前账号没有可查询的数据范围"
-        )
-    return values
 
 
-def _fallback_tool(question: str) -> str:
+def _fallback_tool(question: str, allowed_tools: set[str]) -> str | None:
     for tool, hints in TOOL_HINTS.items():
-        if any(hint in question for hint in hints):
+        if tool in allowed_tools and any(hint in question for hint in hints):
             return tool
-    return "get_overall_business"
+    if "get_overall_business" in allowed_tools:
+        return "get_overall_business"
+    return next(iter(sorted(allowed_tools)), None)
 
 
-def _conversation_files(
+def _fallback_route(question: str) -> str:
+    return "data" if any(hint in question for hint in BUSINESS_HINTS) else "general"
+
+
+def _conversation_context(
     conversation_id: uuid.UUID,
+    current_message_id: uuid.UUID,
+) -> list[dict[str, str]]:
+    with SessionLocal() as db:
+        rows = db.scalars(
+            select(Message)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.id != current_message_id,
+                Message.status == "completed",
+                Message.role.in_(["user", "assistant"]),
+            )
+            .order_by(Message.sequence.desc())
+            .limit(16)
+        ).all()
+    return _bounded_conversation_context(
+        [(row.role, row.content) for row in reversed(rows)],
+    )
+
+
+def _bounded_conversation_context(
+    rows: list[tuple[str, str]],
+    *,
+    total_characters: int = 6000,
+) -> list[dict[str, str]]:
+    """Keep recent intent without replaying complete historical reports."""
+
+    remaining = total_characters
+    selected: list[dict[str, str]] = []
+    for role, raw_content in reversed(rows):
+        content = raw_content.strip()
+        if not content or remaining <= 0:
+            continue
+        per_message_limit = 1200 if role == "assistant" else 1000
+        clipped = content[: min(per_message_limit, remaining)]
+        selected.append({"role": role, "content": clipped})
+        remaining -= len(clipped)
+    return list(reversed(selected))
+
+
+def _active_memories(
     enterprise_id: uuid.UUID,
     user_id: uuid.UUID,
-) -> list[dict[str, Any]]:
+    organization_ids: set[uuid.UUID],
+) -> tuple[bool, list[dict[str, str]]]:
     with SessionLocal() as db:
-        rows = db.execute(
-            select(FileAsset, FileExtraction)
-            .join(ConversationFile, ConversationFile.file_id == FileAsset.id)
-            .outerjoin(FileExtraction, FileExtraction.file_id == FileAsset.id)
-            .where(
-                ConversationFile.conversation_id == conversation_id,
-                FileAsset.enterprise_id == enterprise_id,
-                FileAsset.uploaded_by_user_id == user_id,
-                FileAsset.deleted_at.is_(None),
+        user = db.get(User, user_id)
+        if user is None or not user.memory_enabled:
+            return False, []
+        scope_filter = Memory.organization_unit_id.is_(None)
+        if organization_ids:
+            scope_filter = or_(
+                scope_filter,
+                Memory.organization_unit_id.in_(organization_ids),
             )
+        rows = db.scalars(
+            select(Memory)
+            .where(
+                Memory.enterprise_id == enterprise_id,
+                Memory.user_id == user_id,
+                Memory.status == "active",
+                scope_filter,
+            )
+            .order_by(Memory.updated_at.desc())
+            .limit(20)
         ).all()
-        return [
-            {
-                "id": str(file_asset.id),
-                "name": file_asset.original_name,
-                "extraction_status": extraction.status if extraction else "unsupported",
-            }
-            for file_asset, extraction in rows
-        ]
+    remaining = 4000
+    memories: list[dict[str, str]] = []
+    for row in rows:
+        content = row.content[:remaining]
+        if not content:
+            break
+        memories.append({"kind": row.kind, "title": row.title, "content": content})
+        remaining -= len(content)
+    return True, memories
+
+
+def _authorized_organizations(
+    enterprise_id: uuid.UUID,
+    organization_ids: set[uuid.UUID],
+) -> list[dict[str, str]]:
+    if not organization_ids:
+        return []
+    with SessionLocal() as db:
+        rows = db.scalars(
+            select(OrganizationUnit)
+            .where(
+                OrganizationUnit.enterprise_id == enterprise_id,
+                OrganizationUnit.id.in_(organization_ids),
+                OrganizationUnit.is_active.is_(True),
+            )
+            .order_by(OrganizationUnit.sort_order, OrganizationUnit.name)
+        ).all()
+    return [{"id": str(row.id), "code": row.code, "name": row.name} for row in rows]
+
+
+def _execution_scope(
+    question: str,
+    organizations: list[dict[str, str]],
+) -> set[uuid.UUID]:
+    full_scope = {uuid.UUID(item["id"]) for item in organizations}
+    if any(hint in question for hint in WIDE_SCOPE_HINTS):
+        return full_scope
+    matched = {
+        uuid.UUID(item["id"])
+        for item in organizations
+        if item["name"] in question or item["code"].lower() in question.lower()
+    }
+    return matched or full_scope
 
 
 def _route(
     job: Job,
     settings: Settings,
     question: str,
-    files: list[dict[str, Any]],
-    organization_ids: set[uuid.UUID],
+    context: list[dict[str, str]],
+    memories: list[dict[str, str]],
+    organizations: list[dict[str, str]],
+    available_tools: list[dict[str, Any]],
     provider_config: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    deterministic = _deterministic_tools(
+        question,
+        {str(item["tool_name"]) for item in available_tools},
+    )
+    if deterministic:
+        return (
+            {
+                "route": "data",
+                "rewritten_query": question[:12000],
+                "reason": "explicit registered business intent",
+                "confidence": 0.99,
+            },
+            {"model": "deterministic-intent-v1", "usage": {}},
+        )
     response = run_hermes(
         settings,
         profile="route",
-        request_id=str(job.id),
+        request_id=f"{job.id}:route",
         payload={
             "question": question,
-            "allowed_tools": sorted(ALL_TOOLS),
-            "current_conversation_files": files,
-            "organization_unit_ids": sorted(str(value) for value in organization_ids),
+            "conversation_context": context,
+            "active_memories": memories,
+            "authorized_organizations": organizations,
+            "available_tool_names": [item["tool_name"] for item in available_tools],
         },
         provider_config=provider_config,
     )
-    route = parse_json_response(response["text"])
-    route_name = str(route.get("route", "data"))
-    if route_name not in {"data", "document", "mixed", "clarification"}:
-        route_name = "data"
-    tool = route.get("tool")
-    if tool not in ALL_TOOLS:
-        tool = _fallback_tool(question)
+    try:
+        route = parse_json_response(response["text"])
+    except HermesRuntimeError:
+        route = {"route": _fallback_route(question), "confidence": 0, "reason": "fallback"}
+    route_name = str(route.get("route") or _fallback_route(question))
+    if route_name not in {"data", "general", "clarification"}:
+        route_name = _fallback_route(question)
+    if route_name == "clarification" and len(organizations) <= 1:
+        route_name = _fallback_route(question)
     route.update(
         {
             "route": route_name,
-            "tool": tool,
-            "rewritten_query": str(route.get("rewritten_query") or question),
+            "rewritten_query": str(route.get("rewritten_query") or question)[:12000],
         }
     )
     return route, response
@@ -177,6 +328,10 @@ def _save_route(
 ) -> None:
     with SessionLocal.begin() as db:
         existing = db.scalar(select(MessageRoute).where(MessageRoute.message_id == message_id))
+        scope_status = {
+            "clarification": "clarification_required",
+            "general": "not_required",
+        }.get(route["route"], "authorized")
         if existing is None:
             existing = MessageRoute(
                 message_id=message_id,
@@ -184,11 +339,9 @@ def _save_route(
                 route=route["route"],
                 profile="route",
                 rewritten_query=route["rewritten_query"],
-                scope_status=(
-                    "clarification_required" if route["route"] == "clarification" else "authorized"
-                ),
-                rationale=str(route.get("reason") or ""),
-                confidence=float(route.get("confidence") or 0),
+                scope_status=scope_status,
+                rationale=str(route.get("reason") or "")[:4000],
+                confidence=max(0.0, min(float(route.get("confidence") or 0), 1.0)),
                 model_name=hermes_response.get("model"),
                 completed_at=utc_now(),
             )
@@ -196,49 +349,217 @@ def _save_route(
         else:
             existing.route = route["route"]
             existing.rewritten_query = route["rewritten_query"]
-            existing.scope_status = (
-                "clarification_required" if route["route"] == "clarification" else "authorized"
-            )
-            existing.rationale = str(route.get("reason") or "")
-            existing.confidence = float(route.get("confidence") or 0)
+            existing.scope_status = scope_status
+            existing.rationale = str(route.get("reason") or "")[:4000]
+            existing.confidence = max(0.0, min(float(route.get("confidence") or 0), 1.0))
             existing.model_name = hermes_response.get("model")
             existing.completed_at = utc_now()
 
 
-def _create_clarification(
+def _create_scope_clarification(
     *,
+    job_id: uuid.UUID,
+    lease_token: str,
     conversation_id: uuid.UUID,
     message_id: uuid.UUID,
     assistant_message_id: uuid.UUID,
     route: dict[str, Any],
+    organizations: list[dict[str, str]],
 ) -> dict[str, Any]:
-    question = str(route.get("clarification_question") or "请确认需要查询的事业部范围。")
-    options = route.get("clarification_options")
-    if not isinstance(options, list):
-        options = []
-    normalized = [
-        option if isinstance(option, dict) else {"label": str(option), "value": str(option)}
-        for option in options[:20]
+    question = str(
+        route.get("clarification_question") or "请确认这次需要查询哪个事业部。"
+    )[:2000]
+    options = [
+        {"label": item["name"], "value": item["id"], "code": item["code"]}
+        for item in organizations[:20]
     ]
     with SessionLocal.begin() as db:
+        _assert_job_write_fence(db, job_id, lease_token)
         clarification = Clarification(
             conversation_id=conversation_id,
             message_id=message_id,
             question=question,
-            options_json=normalized,
+            options_json=options,
             status="pending",
         )
         db.add(clarification)
+        db.flush()
         assistant = db.get(Message, assistant_message_id)
         if assistant:
             assistant.content = question
             assistant.content_json = {
                 "route": "clarification",
                 "clarification_id": str(clarification.id),
-                "options": normalized,
+                "options": options,
             }
             assistant.status = "completed"
     return {"content": question, "route": "clarification"}
+
+
+def _assert_job_write_fence(db, job_id: uuid.UUID, lease_token: str) -> None:
+    active = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
+    if (
+        active is None
+        or active.status != "running"
+        or not lease_token
+        or active.lease_token != lease_token
+    ):
+        raise RuntimeError("assistant job no longer owns its write lease")
+
+
+def _normalize_argument(value: Any, schema: dict[str, Any]) -> Any:
+    kind = schema.get("type")
+    if kind == "integer":
+        parsed = int(value)
+        return min(
+            max(parsed, int(schema.get("minimum", parsed))),
+            int(schema.get("maximum", parsed)),
+        )
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return value
+        if str(value).lower() in {"true", "1", "yes"}:
+            return True
+        if str(value).lower() in {"false", "0", "no"}:
+            return False
+        raise ValueError("invalid boolean")
+    if kind == "array":
+        if not isinstance(value, list):
+            raise ValueError("invalid array")
+        item_schema = schema.get("items", {})
+        values: list[Any] = []
+        for item in value[:20]:
+            try:
+                values.append(_normalize_argument(item, item_schema))
+            except (TypeError, ValueError):
+                continue
+        return values
+    text = str(value).strip()
+    if schema.get("format") == "date":
+        date.fromisoformat(text)
+    allowed = schema.get("enum")
+    if allowed and text not in allowed:
+        raise ValueError("value is outside enum")
+    return text[: int(schema.get("maxLength", 500))]
+
+
+def _normalize_calls(
+    raw_calls: Any,
+    question: str,
+    available_tools: list[dict[str, Any]],
+    organization_ids: set[uuid.UUID],
+) -> list[dict[str, Any]]:
+    by_name = {item["tool_name"]: item for item in available_tools}
+    calls: list[dict[str, Any]] = []
+    if isinstance(raw_calls, list):
+        for item in raw_calls[:4]:
+            if not isinstance(item, dict) or item.get("tool") not in by_name:
+                continue
+            tool_name = str(item["tool"])
+            spec = MCP_TOOL_SPECS[tool_name]
+            raw_arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            arguments: dict[str, Any] = {}
+            for key, value in raw_arguments.items():
+                if key not in spec.parameters:
+                    continue
+                try:
+                    arguments[key] = _normalize_argument(value, spec.parameters[key])
+                except (TypeError, ValueError):
+                    continue
+            if "limit" in arguments:
+                arguments["limit"] = min(arguments["limit"], int(by_name[tool_name]["max_rows"]))
+            arguments["organization_unit_ids"] = sorted(str(value) for value in organization_ids)
+            calls.append(
+                {
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "reason": str(item.get("reason") or "")[:500],
+                    "timeout_seconds": int(by_name[tool_name]["timeout_seconds"]),
+                }
+            )
+    if not calls:
+        fallback = _fallback_tool(question, set(by_name))
+        if fallback:
+            calls.append(
+                {
+                    "tool": fallback,
+                    "arguments": {
+                        "organization_unit_ids": sorted(str(value) for value in organization_ids)
+                    },
+                    "reason": "deterministic fallback",
+                    "timeout_seconds": int(by_name[fallback]["timeout_seconds"]),
+                }
+            )
+    return calls
+
+
+def _plan(
+    job: Job,
+    settings: Settings,
+    question: str,
+    rewritten_query: str,
+    context: list[dict[str, str]],
+    available_tools: list[dict[str, Any]],
+    organization_ids: set[uuid.UUID],
+    provider_config: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deterministic = _deterministic_tools(
+        rewritten_query,
+        {str(item["tool_name"]) for item in available_tools},
+    )
+    if deterministic:
+        period_arguments = _deterministic_period_arguments(
+            rewritten_query,
+            settings.sync_timezone,
+        )
+        period_arguments["limit"] = 12
+        calls = _normalize_calls(
+            [
+                {
+                    "tool": tool,
+                    "arguments": period_arguments,
+                    "reason": "explicit registered business intent",
+                }
+                for tool in deterministic
+            ],
+            rewritten_query,
+            available_tools,
+            organization_ids,
+        )
+        return (
+            {"analysis_mode": "deterministic", "calls": calls},
+            {"model": "deterministic-planner-v1", "usage": {}},
+        )
+    response = run_hermes(
+        settings,
+        profile="plan",
+        request_id=f"{job.id}:plan",
+        payload={
+            "question": question,
+            "rewritten_query": rewritten_query,
+            "conversation_context": context,
+            "available_tools": [
+                {
+                    "tool_name": item["tool_name"],
+                    "description": item["description"],
+                    "parameters": item["parameters"],
+                }
+                for item in available_tools
+            ],
+        },
+        provider_config=provider_config,
+    )
+    try:
+        parsed = parse_json_response(response["text"])
+    except HermesRuntimeError:
+        parsed = {}
+    calls = _normalize_calls(
+        parsed.get("calls"),
+        rewritten_query,
+        available_tools,
+        organization_ids,
+    )
+    return {"analysis_mode": str(parsed.get("analysis_mode") or "direct"), "calls": calls}, response
 
 
 def _call_tool(
@@ -246,19 +567,15 @@ def _call_tool(
     settings: Settings,
     token: str,
     tool: str,
-    organization_ids: set[uuid.UUID],
+    arguments: dict[str, Any],
+    timeout_seconds: int,
 ) -> dict[str, Any]:
     try:
         response = httpx.post(
             f"{settings.mcp_hub_url.rstrip('/')}/v1/tools/call",
             headers={"Authorization": f"Bearer {token}"},
-            json={
-                "tool": tool,
-                "arguments": {
-                    "organization_unit_ids": sorted(str(value) for value in organization_ids)
-                },
-            },
-            timeout=30,
+            json={"tool": tool, "arguments": arguments},
+            timeout=max(3, min(timeout_seconds, 60)),
         )
     except httpx.HTTPError as exc:
         raise RuntimeError(f"MCP Hub unavailable: {exc}") from exc
@@ -267,134 +584,33 @@ def _call_tool(
     return response.json()
 
 
-def _document_chunks(
-    *,
-    conversation_id: uuid.UUID,
-    enterprise_id: uuid.UUID,
-    user_id: uuid.UUID,
-    query: str,
-    settings: Settings,
-) -> list[dict[str, Any]]:
-    query_embedding = embed_texts([query], settings)[0]
-    with SessionLocal() as db:
-        statement = (
-            select(FileChunk, FileAsset)
-            .join(FileAsset, FileAsset.id == FileChunk.file_id)
-            .join(ConversationFile, ConversationFile.file_id == FileChunk.file_id)
-            .join(FileExtraction, FileExtraction.id == FileChunk.extraction_id)
-            .where(
-                ConversationFile.conversation_id == conversation_id,
-                FileAsset.enterprise_id == enterprise_id,
-                FileAsset.uploaded_by_user_id == user_id,
-                FileAsset.deleted_at.is_(None),
-                FileExtraction.status == "completed",
-            )
-        )
-        if db.get_bind().dialect.name == "postgresql":
-            vector_rows = db.execute(
-                statement.where(FileChunk.embedding.is_not(None))
-                .order_by(FileChunk.embedding.cosine_distance(query_embedding))
-                .limit(32)
-            ).all()
-            terms = _query_terms(query)
-            keyword_rows: list[Any] = []
-            if terms:
-                predicates = [FileChunk.content.contains(term, autoescape=True) for term in terms]
-                keyword_score = literal(0)
-                for predicate in predicates:
-                    keyword_score += case((predicate, 1), else_=0)
-                keyword_rows = db.execute(
-                    statement.where(or_(*predicates))
-                    .order_by(keyword_score.desc(), FileChunk.chunk_index)
-                    .limit(32)
-                ).all()
-            rows = _reciprocal_rank_fusion(vector_rows, keyword_rows, limit=16)
-        else:
-            rows = db.execute(statement.limit(500)).all()
-            terms = set(_query_terms(query))
-            rows = sorted(
-                rows,
-                key=lambda row: sum(term in row[0].content for term in terms),
-                reverse=True,
-            )[:16]
-        return [
-            {
-                "file_id": str(chunk.file_id),
-                "file_name": file_asset.original_name,
-                "locator": chunk.locator_json,
-                "content": chunk.content,
-            }
-            for chunk, file_asset in rows
-        ]
-
-
-def _query_terms(query: str) -> list[str]:
-    terms: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: str) -> None:
-        normalized = value.strip().lower()
-        if len(normalized) < 2 or normalized in seen:
-            return
-        seen.add(normalized)
-        terms.append(normalized)
-
-    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._:/-]{1,63}", query):
-        add(token)
-    sequences = re.findall(r"[\u3400-\u9fff]{2,}", query)
-    for sequence in sequences:
-        add(sequence)
-    # Preserve exact identifiers and both short Chinese keywords (for example
-    # “回款”) and longer entity phrases (for example “华东事业部”) before the
-    # bounded term budget is exhausted.
-    for size in (2, 6, 5, 4, 3):
-        for sequence in sequences:
-            for index in range(max(len(sequence) - size + 1, 0)):
-                add(sequence[index : index + size])
-                if len(terms) >= 32:
-                    return terms
-    return terms[:32]
-
-
-def _reciprocal_rank_fusion(
-    vector_rows: list[Any],
-    keyword_rows: list[Any],
-    *,
-    limit: int,
-) -> list[Any]:
-    scores: dict[uuid.UUID, float] = {}
-    rows_by_id: dict[uuid.UUID, Any] = {}
-    for weight, rows in ((0.7, vector_rows), (0.3, keyword_rows)):
-        for rank, row in enumerate(rows, start=1):
-            chunk_id = row[0].id
-            rows_by_id[chunk_id] = row
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (60 + rank)
-    ranked_ids = sorted(scores, key=lambda chunk_id: (-scores[chunk_id], str(chunk_id)))
-    return [rows_by_id[chunk_id] for chunk_id in ranked_ids[:limit]]
-
-
 def _save_answer_with_evidence(
     *,
+    job_id: uuid.UUID | None = None,
+    lease_token: str | None = None,
     assistant_message_id: uuid.UUID,
     content: str,
     response: dict[str, Any],
     content_json: dict[str, Any],
-    tool: str | None,
-    tool_result: dict[str, Any] | None,
+    tool_results: list[dict[str, Any]],
 ) -> int:
     with SessionLocal.begin() as db:
+        if job_id is not None:
+            _assert_job_write_fence(db, job_id, lease_token or "")
         assistant = db.get(Message, assistant_message_id)
         if assistant is None:
             raise OrchestrationPermanentError(
                 "assistant_message_missing", "回答占位消息不存在", "请求无法保存"
             )
         evidence_count = 0
-        if tool and tool_result:
-            for index, freshness_row in enumerate(tool_result.get("freshness", [])):
+        for call_index, item in enumerate(tool_results):
+            tool = item["tool"]
+            result = item["result"]
+            for domain_index, freshness_row in enumerate(result.get("freshness", [])):
                 source_data_as_of = freshness_row.get("source_data_as_of")
                 if not source_data_as_of:
                     continue
-                evidence_key = f"{tool}:{freshness_row['domain']}:{index}"
+                evidence_key = f"{call_index}:{tool}:{freshness_row['domain']}:{domain_index}"
                 evidence = db.scalar(
                     select(MessageEvidence).where(
                         MessageEvidence.message_id == assistant_message_id,
@@ -418,25 +634,26 @@ def _save_answer_with_evidence(
                     db.add(evidence)
                 evidence.domain = freshness_row["domain"]
                 evidence.title = f"{tool} 数据依据"
-                evidence.value_json = tool_result.get("data", {})
+                evidence.value_json = result.get("data", {})
                 evidence.source_type = freshness_row.get("source_type", "unknown")
                 evidence.source_display_name = freshness_row.get(
                     "source_display_name", "未知数据源"
                 )
                 evidence.source_data_as_of = datetime.fromisoformat(source_data_as_of)
                 evidence.dataset_version = freshness_row.get("dataset_version")
-                evidence.scope_json = tool_result.get("scope", {})
-                evidence.query_json = {"tool": tool}
-                evidence.row_references_json = tool_result.get("evidence", [])
+                evidence.scope_json = result.get("scope", {})
+                evidence.query_json = {"tool": tool, "arguments": item["arguments"]}
+                evidence.row_references_json = result.get("evidence", [])
                 evidence_count += 1
         content_json["evidence_count"] = evidence_count
         assistant.content = content
         assistant.content_json = content_json
         assistant.status = "completed"
         assistant.model_name = response.get("model")
-        freshness = content_json.get("freshness") or []
         timestamps = [
-            row.get("source_data_as_of") for row in freshness if row.get("source_data_as_of")
+            row.get("source_data_as_of")
+            for row in content_json.get("freshness", [])
+            if row.get("source_data_as_of")
         ]
         if timestamps:
             assistant.source_data_as_of = min(datetime.fromisoformat(value) for value in timestamps)
@@ -446,9 +663,7 @@ def _save_answer_with_evidence(
             .order_by(MessageRun.created_at.desc())
         )
         if message_run is None:
-            message_run = MessageRun(
-                message_id=assistant.id,
-            )
+            message_run = MessageRun(message_id=assistant.id)
             db.add(message_run)
         message_run.status = "completed"
         message_run.provider = response.get("provider")
@@ -462,7 +677,7 @@ def _save_answer_with_evidence(
 
 def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
     conversation_id, message_id, assistant_message_id = _ids(job)
-    organization_ids = _organization_ids(job)
+    authorized_scope = _organization_ids(job)
     if job.created_by_user_id is None:
         raise OrchestrationPermanentError(
             "assistant_user_missing", "回答任务没有用户", "请求无法验证"
@@ -488,132 +703,165 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
         question = message.content
         if model_config is None:
             raise OrchestrationPermanentError(
-                "anspire_not_configured",
-                "企业尚未配置 Anspire 模型",
-                "Anspire 模型尚未配置",
+                "anspire_not_configured", "企业尚未配置 Anspire 模型", "Anspire 模型尚未配置"
             )
         try:
             provider_config = runtime_provider_config(model_config, settings)
         except AnspireConfigurationError as exc:
             raise OrchestrationPermanentError(
-                exc.code,
-                str(exc),
-                "Anspire 模型尚未配置或启用",
+                exc.code, str(exc), "Anspire 模型尚未配置或启用"
             ) from exc
-    files = _conversation_files(
-        conversation_id,
+        available_tools = planner_catalog(db, job.enterprise_id)
+
+    context = _conversation_context(conversation_id, message_id)
+    memory_enabled, memories = _active_memories(
         job.enterprise_id,
         job.created_by_user_id,
+        authorized_scope,
     )
+    organizations = _authorized_organizations(job.enterprise_id, authorized_scope)
+    execution_scope = _execution_scope(question, organizations)
     try:
         route, route_response = _route(
             job,
             settings,
             question,
-            files,
-            organization_ids,
+            context,
+            memories,
+            organizations,
+            available_tools,
             provider_config,
         )
     except HermesRuntimeError as exc:
         if exc.permanent:
-            raise OrchestrationPermanentError(
-                exc.code,
-                str(exc),
-                "Anspire 模型尚未配置",
-            ) from exc
+            raise OrchestrationPermanentError(exc.code, str(exc), "无法连接已配置模型") from exc
         raise
     _save_route(message_id, conversation_id, route, route_response)
     if route["route"] == "clarification":
-        return _create_clarification(
+        return _create_scope_clarification(
+            job_id=job.id,
+            lease_token=job.lease_token or "",
             conversation_id=conversation_id,
             message_id=message_id,
             assistant_message_id=assistant_message_id,
             route=route,
+            organizations=organizations,
         )
-    tool_result: dict[str, Any] | None = None
-    chunks: list[dict[str, Any]] = []
-    if route["route"] in {"data", "mixed"}:
+
+    tool_results: list[dict[str, Any]] = []
+    tool_errors: list[dict[str, str]] = []
+    plan: dict[str, Any] | None = None
+    if route["route"] == "data":
+        if not execution_scope:
+            raise OrchestrationPermanentError(
+                "empty_scope_snapshot", "任务没有事业部权限", "当前账号没有可查询的数据范围"
+            )
+        if not available_tools:
+            raise OrchestrationPermanentError(
+                "no_mcp_tools_available", "没有可用于规划的 MCP 工具", "经营查询工具暂不可用"
+            )
+        plan, _ = _plan(
+            job,
+            settings,
+            question,
+            route["rewritten_query"],
+            context,
+            available_tools,
+            execution_scope,
+            provider_config,
+        )
+        tool_names = {item["tool"] for item in plan["calls"]}
         token = issue_capability_token(
             settings=settings,
             enterprise_id=job.enterprise_id,
             user_id=job.created_by_user_id,
-            organization_unit_ids=organization_ids,
-            tools={route["tool"]},
+            organization_unit_ids=execution_scope,
+            tools=tool_names,
             message_id=message_id,
         )
-        tool_result = _call_tool(
-            settings=settings,
-            token=token,
-            tool=route["tool"],
-            organization_ids=organization_ids,
-        )
-    if route["route"] in {"document", "mixed"}:
-        if not files:
-            return _create_clarification(
-                conversation_id=conversation_id,
-                message_id=message_id,
-                assistant_message_id=assistant_message_id,
-                route={
-                    "clarification_question": "请先上传需要分析的 PDF、DOCX、XLSX 或 PPTX 文件。",
-                    "clarification_options": [],
-                },
-            )
-        if not any(item["extraction_status"] == "completed" for item in files):
-            raise OrchestrationPermanentError(
-                "file_not_ready", "当前会话文件尚未解析完成", "文件正在解析，完成后即可提问"
-            )
-        chunks = _document_chunks(
-            conversation_id=conversation_id,
-            enterprise_id=job.enterprise_id,
-            user_id=job.created_by_user_id,
-            query=route["rewritten_query"],
-            settings=settings,
-        )
-    profile = "document" if route["route"] == "document" else "data"
+        for call in plan["calls"]:
+            try:
+                result = _call_tool(
+                    settings=settings,
+                    token=token,
+                    tool=call["tool"],
+                    arguments=call["arguments"],
+                    timeout_seconds=call["timeout_seconds"],
+                )
+                tool_results.append(
+                    {
+                        "tool": call["tool"],
+                        "arguments": call["arguments"],
+                        "reason": call["reason"],
+                        "result": result,
+                    }
+                )
+            except RuntimeError as exc:
+                tool_errors.append({"tool": call["tool"], "error": str(exc)[:1000]})
+        if not tool_results:
+            raise RuntimeError("all planned MCP tool calls failed")
+
+    profile = "data" if route["route"] == "data" else "general"
     answer_payload = {
         "question": question,
         "rewritten_query": route["rewritten_query"],
-        "authorized_result": tool_result,
-        "current_conversation_chunks": chunks,
+        "conversation_context": context,
+        "memory_enabled": memory_enabled,
+        "active_memories": memories,
+        "authorized_results": tool_results,
+        "tool_errors": tool_errors,
+        "execution_plan": plan,
     }
     try:
         answer_response = run_hermes(
             settings,
             profile=profile,
             payload=answer_payload,
-            request_id=str(job.id),
+            request_id=f"{job.id}:answer",
             provider_config=provider_config,
         )
     except HermesRuntimeError as exc:
         if exc.permanent:
             raise OrchestrationPermanentError(exc.code, str(exc), "无法连接已配置模型") from exc
         raise
+
+    freshness = [
+        row
+        for item in tool_results
+        for row in item["result"].get("freshness", [])
+    ]
+    structured_data: dict[str, Any]
+    if len(tool_results) == 1:
+        structured_data = tool_results[0]["result"].get("data", {})
+    else:
+        structured_data = {
+            "results": [
+                {"tool": item["tool"], "data": item["result"].get("data", {})}
+                for item in tool_results
+            ]
+        }
     content_json = {
         "route": route["route"],
-        "tool": route["tool"] if tool_result else None,
-        "structured_data": tool_result.get("data", {}) if tool_result else {},
-        "freshness": tool_result.get("freshness", []) if tool_result else [],
-        "scope": tool_result.get("scope", {}) if tool_result else {},
-        "file_citations": [
-            {
-                "file_id": chunk["file_id"],
-                "file_name": chunk["file_name"],
-                "locator": chunk["locator"],
-            }
-            for chunk in chunks
-        ],
+        "tools": [item["tool"] for item in tool_results],
+        "execution_plan": plan,
+        "structured_data": structured_data,
+        "freshness": freshness,
+        "scope": {"organization_unit_ids": sorted(str(value) for value in execution_scope)},
+        "tool_errors": tool_errors,
+        "memory_used": bool(memory_enabled and memories),
     }
     evidence_count = _save_answer_with_evidence(
+        job_id=job.id,
+        lease_token=job.lease_token,
         assistant_message_id=assistant_message_id,
         content=answer_response["text"],
         response=answer_response,
         content_json=content_json,
-        tool=route["tool"] if tool_result else None,
-        tool_result=tool_result,
+        tool_results=tool_results,
     )
     return {
         "content": answer_response["text"],
         "route": route["route"],
-        "tool": route["tool"] if tool_result else None,
+        "tools": content_json["tools"],
         "evidence_count": evidence_count,
     }

@@ -34,7 +34,7 @@ test("server-renders the configured executive assistant entry", async () => {
   if (/data-app-mode="production"/.test(html)) {
     assert.match(html, /本机生产环境/);
     assert.match(html, /可信经营服务正在准备/);
-    assert.match(html, /生产模式只读取已授权的企业数据/);
+    assert.match(html, /只读取已授权的企业数据/);
     assert.match(html, /正在验证安全会话/);
     assert.doesNotMatch(html, /当前原型全部经营数据均为演示样本/);
   } else {

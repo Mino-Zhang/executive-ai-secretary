@@ -9,6 +9,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .capabilities import CapabilityClaims, CapabilityError
+from .config import get_settings
+from .data_freshness import effective_domain_status
+from .mcp_registry import effective_tool
 from .models import (
     DailySnapshot,
     DataDomainStatus,
@@ -26,6 +29,29 @@ def _number(value: Any) -> float:
 
 
 _REVENUE_TARGET_CODES = {"revenue", "signed_revenue", "quarterly_revenue"}
+
+
+def _period_filters(arguments: dict[str, Any], column: Any) -> list[Any]:
+    filters: list[Any] = []
+    for key, operator in (("period_start", "start"), ("period_end", "end")):
+        raw = arguments.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = date.fromisoformat(str(raw))
+        except ValueError as exc:
+            raise CapabilityError(f"{key} is malformed") from exc
+        filters.append(column >= value if operator == "start" else column <= value)
+    return filters
+
+
+def _list_argument(arguments: dict[str, Any], key: str) -> list[str]:
+    value = arguments.get(key)
+    if value is None or value == "":
+        return []
+    if not isinstance(value, list):
+        raise CapabilityError(f"{key} is malformed")
+    return [str(item).strip() for item in value[:20] if str(item).strip()]
 
 
 def _target_actual(
@@ -141,7 +167,9 @@ def _freshness(db: Session, claims: CapabilityClaims, domains: set[str]) -> list
     return [
         {
             "domain": row.domain,
-            "status": row.status,
+            "status": effective_domain_status(
+                row, get_settings().data_stale_after_hours
+            ),
             "source_type": row.source_type,
             "source_display_name": row.source_display_name,
             "source_data_as_of": (
@@ -205,6 +233,9 @@ def get_overall_business(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    opportunity_filters = _period_filters(arguments, FactOpportunity.expected_close_date)
+    delivery_filters = _period_filters(arguments, FactDelivery.planned_end_date)
+    collection_filters = _period_filters(arguments, FactFinanceCollection.planned_collection_date)
     opportunity = db.execute(
         select(
             func.count(FactOpportunity.id),
@@ -214,6 +245,7 @@ def get_overall_business(
             FactOpportunity.enterprise_id == claims.enterprise_id,
             FactOpportunity.organization_unit_id.in_(organization_ids),
             FactOpportunity.is_current.is_(True),
+            *opportunity_filters,
         )
     ).one()
     delivery = db.execute(
@@ -224,6 +256,7 @@ def get_overall_business(
             FactDelivery.enterprise_id == claims.enterprise_id,
             FactDelivery.organization_unit_id.in_(organization_ids),
             FactDelivery.is_current.is_(True),
+            *delivery_filters,
         )
     ).one()
     collection = db.execute(
@@ -238,6 +271,7 @@ def get_overall_business(
             FactFinanceCollection.enterprise_id == claims.enterprise_id,
             FactFinanceCollection.organization_unit_id.in_(organization_ids),
             FactFinanceCollection.is_current.is_(True),
+            *collection_filters,
         )
     ).one()
     return _result(
@@ -417,6 +451,10 @@ def get_opportunity_funnel(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    filters = _period_filters(arguments, FactOpportunity.expected_close_date)
+    statuses = _list_argument(arguments, "statuses")
+    if statuses:
+        filters.append(FactOpportunity.status.in_(statuses))
     rows = db.execute(
         select(
             FactOpportunity.stage,
@@ -428,6 +466,7 @@ def get_opportunity_funnel(
             FactOpportunity.enterprise_id == claims.enterprise_id,
             FactOpportunity.organization_unit_id.in_(organization_ids),
             FactOpportunity.is_current.is_(True),
+            *filters,
         )
         .group_by(FactOpportunity.stage)
         .order_by(func.sum(FactOpportunity.expected_amount).desc())
@@ -462,6 +501,17 @@ def get_sales_forecast(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    statuses = _list_argument(arguments, "statuses") or ["active", "stalled"]
+    try:
+        minimum_probability = min(max(int(arguments.get("min_probability", 0)), 0), 100)
+    except (TypeError, ValueError) as exc:
+        raise CapabilityError("min_probability is malformed") from exc
+    filters = [
+        FactOpportunity.status.in_(statuses),
+        FactOpportunity.probability >= minimum_probability,
+        *_period_filters(arguments, FactOpportunity.expected_close_date),
+    ]
+    limit = min(max(int(arguments.get("limit", 50)), 1), 100)
     weighted_forecast = _number(
         db.scalar(
             select(
@@ -470,7 +520,7 @@ def get_sales_forecast(
                 FactOpportunity.enterprise_id == claims.enterprise_id,
                 FactOpportunity.organization_unit_id.in_(organization_ids),
                 FactOpportunity.is_current.is_(True),
-                FactOpportunity.status.in_(["active", "stalled"]),
+                *filters,
             )
         )
     )
@@ -480,10 +530,10 @@ def get_sales_forecast(
             FactOpportunity.enterprise_id == claims.enterprise_id,
             FactOpportunity.organization_unit_id.in_(organization_ids),
             FactOpportunity.is_current.is_(True),
-            FactOpportunity.status.in_(["active", "stalled"]),
+            *filters,
         )
         .order_by((FactOpportunity.expected_amount * FactOpportunity.probability).desc())
-        .limit(50)
+        .limit(limit)
     ).all()
     items = [
         {
@@ -531,6 +581,12 @@ def get_customer_status(
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
     limit = min(max(int(arguments.get("limit", 20)), 1), 100)
+    filters: list[Any] = []
+    customer_query = str(arguments.get("customer_query") or "").strip()
+    if customer_query:
+        filters.append(DimCustomer.display_name.ilike(f"%{customer_query[:120]}%"))
+    if arguments.get("only_overdue") is True:
+        filters.append(FactFinanceCollection.overdue_days > 0)
     rows = db.execute(
         select(
             DimCustomer.source_record_id,
@@ -546,6 +602,7 @@ def get_customer_status(
             FactFinanceCollection.enterprise_id == claims.enterprise_id,
             FactFinanceCollection.organization_unit_id.in_(organization_ids),
             FactFinanceCollection.is_current.is_(True),
+            *filters,
         )
         .group_by(DimCustomer.id)
         .order_by(func.sum(FactFinanceCollection.outstanding_amount).desc())
@@ -577,6 +634,17 @@ def get_delivery_status(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    filters = _period_filters(arguments, FactDelivery.planned_end_date)
+    project_query = str(arguments.get("project_query") or "").strip()
+    if project_query:
+        filters.append(FactDelivery.project_name.ilike(f"%{project_query[:120]}%"))
+    statuses = _list_argument(arguments, "statuses")
+    if statuses:
+        filters.append(FactDelivery.status.in_(statuses))
+    risk_levels = _list_argument(arguments, "risk_levels")
+    if risk_levels:
+        filters.append(FactDelivery.risk_level.in_(risk_levels))
+    limit = min(max(int(arguments.get("limit", 50)), 1), 100)
     delivery_totals = db.execute(
         select(
             func.count(FactDelivery.id),
@@ -585,6 +653,7 @@ def get_delivery_status(
             FactDelivery.enterprise_id == claims.enterprise_id,
             FactDelivery.organization_unit_id.in_(organization_ids),
             FactDelivery.is_current.is_(True),
+            *filters,
         )
     ).one()
     rows = db.scalars(
@@ -593,9 +662,10 @@ def get_delivery_status(
             FactDelivery.enterprise_id == claims.enterprise_id,
             FactDelivery.organization_unit_id.in_(organization_ids),
             FactDelivery.is_current.is_(True),
+            *filters,
         )
         .order_by(FactDelivery.delay_days.desc(), FactDelivery.contract_amount.desc())
-        .limit(100)
+        .limit(limit)
     ).all()
     projects = [
         {
@@ -642,6 +712,7 @@ def get_finance_margin(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    filters = _period_filters(arguments, FactDelivery.planned_end_date)
     contract, gross_profit = db.execute(
         select(
             func.sum(FactDelivery.contract_amount),
@@ -650,6 +721,7 @@ def get_finance_margin(
             FactDelivery.enterprise_id == claims.enterprise_id,
             FactDelivery.organization_unit_id.in_(organization_ids),
             FactDelivery.is_current.is_(True),
+            *filters,
         )
     ).one()
     contract_amount = _number(contract)
@@ -681,16 +753,37 @@ def get_collection_aging(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
-    rows = db.execute(
-        select(
-            FactFinanceCollection.aging_bucket,
-            func.count(FactFinanceCollection.id),
-            func.sum(FactFinanceCollection.outstanding_amount),
+    filters: list[Any] = []
+    aging_buckets = _list_argument(arguments, "aging_buckets")
+    if aging_buckets:
+        filters.append(FactFinanceCollection.aging_bucket.in_(aging_buckets))
+    minimum_overdue_days = arguments.get("minimum_overdue_days")
+    if minimum_overdue_days is not None:
+        try:
+            filters.append(
+                FactFinanceCollection.overdue_days
+                >= min(max(int(minimum_overdue_days), 0), 3650)
+            )
+        except (TypeError, ValueError) as exc:
+            raise CapabilityError("minimum_overdue_days is malformed") from exc
+    customer_query = str(arguments.get("customer_query") or "").strip()
+    statement = select(
+        FactFinanceCollection.aging_bucket,
+        func.count(FactFinanceCollection.id),
+        func.sum(FactFinanceCollection.outstanding_amount),
+    )
+    if customer_query:
+        statement = statement.join(
+            DimCustomer, DimCustomer.id == FactFinanceCollection.customer_id
         )
+        filters.append(DimCustomer.display_name.ilike(f"%{customer_query[:120]}%"))
+    rows = db.execute(
+        statement
         .where(
             FactFinanceCollection.enterprise_id == claims.enterprise_id,
             FactFinanceCollection.organization_unit_id.in_(organization_ids),
             FactFinanceCollection.is_current.is_(True),
+            *filters,
         )
         .group_by(FactFinanceCollection.aging_bucket)
     ).all()
@@ -719,6 +812,7 @@ def get_organization_performance(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    filters = _period_filters(arguments, FactFinanceCollection.planned_collection_date)
     rows = db.execute(
         select(
             OrganizationUnit.id,
@@ -734,6 +828,7 @@ def get_organization_performance(
             OrganizationUnit.enterprise_id == claims.enterprise_id,
             OrganizationUnit.id.in_(organization_ids),
             FactFinanceCollection.is_current.is_(True),
+            *filters,
         )
         .group_by(OrganizationUnit.id)
         .order_by(func.sum(FactFinanceCollection.collected_amount).desc())
@@ -768,6 +863,10 @@ def get_daily_changes(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    try:
+        days = min(max(int(arguments.get("days", 2)), 1), 31)
+    except (TypeError, ValueError) as exc:
+        raise CapabilityError("days is malformed") from exc
     rows = db.scalars(
         select(DailySnapshot)
         .where(
@@ -775,7 +874,7 @@ def get_daily_changes(
             DailySnapshot.organization_unit_id.in_(organization_ids),
         )
         .order_by(DailySnapshot.snapshot_date.desc())
-        .limit(len(organization_ids) * 2)
+        .limit(len(organization_ids) * days)
     ).all()
     snapshots = [
         {
@@ -834,4 +933,16 @@ def execute_business_tool(
     handler = TOOLS.get(tool_name)
     if handler is None:
         raise CapabilityError("unknown tool")
-    return handler(db, claims, arguments)
+    configuration = effective_tool(db, claims.enterprise_id, tool_name)
+    if configuration is None or not configuration["is_enabled"]:
+        raise CapabilityError("tool is disabled by enterprise configuration")
+    bounded_arguments = dict(arguments)
+    if "limit" in bounded_arguments:
+        try:
+            bounded_arguments["limit"] = min(
+                max(int(bounded_arguments["limit"]), 1),
+                int(configuration["max_rows"]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise CapabilityError("tool limit is malformed") from exc
+    return handler(db, claims, bounded_arguments)

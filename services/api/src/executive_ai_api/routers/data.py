@@ -11,6 +11,8 @@ from ..authz import (
     accessible_organization_unit_ids,
     get_executive_principal,
 )
+from ..config import Settings, get_settings
+from ..data_freshness import effective_domain_status
 from ..database import get_db
 from ..models import DataDomainStatus
 from ..schemas import DataCapabilitiesOut, DataDomainStatusOut
@@ -30,6 +32,7 @@ DOMAIN_CAPABILITIES = {
 def get_data_capabilities(
     principal: Annotated[Principal, Depends(get_executive_principal)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> DataCapabilitiesOut:
     rows = db.scalars(
         select(DataDomainStatus)
@@ -39,19 +42,23 @@ def get_data_capabilities(
     capabilities: dict[str, bool] = {
         name: False for names in DOMAIN_CAPABILITIES.values() for name in names
     }
+    effective_statuses = {
+        row.id: effective_domain_status(row, settings.data_stale_after_hours) for row in rows
+    }
     for row in rows:
-        if row.status in {"fresh", "stale", "partial"} and row.active_sync_run_id:
+        if effective_statuses[row.id] in {"fresh", "stale", "partial"} and row.active_sync_run_id:
             for name in DOMAIN_CAPABILITIES.get(row.domain, []):
                 capabilities[name] = True
     source_types = {row.source_type for row in rows}
     source_labels = {row.source_display_name for row in rows}
     overall_status = "unavailable"
     if rows:
-        if any(row.status == "failed" for row in rows):
+        statuses = [effective_statuses[row.id] for row in rows]
+        if any(value == "failed" for value in statuses):
             overall_status = "partial" if any(capabilities.values()) else "failed"
-        elif any(row.status == "stale" for row in rows):
+        elif any(value == "stale" for value in statuses):
             overall_status = "stale"
-        elif all(row.status == "fresh" for row in rows):
+        elif all(value == "fresh" for value in statuses):
             overall_status = "fresh"
         else:
             overall_status = "partial"
@@ -60,7 +67,12 @@ def get_data_capabilities(
         source_label=" / ".join(sorted(source_labels)) or "尚未配置数据源",
         organization_unit_ids=sorted(accessible_organization_unit_ids(db, principal), key=str),
         capabilities=capabilities,
-        domains=[DataDomainStatusOut.model_validate(row) for row in rows],
+        domains=[
+            DataDomainStatusOut.model_validate(row).model_copy(
+                update={"status": effective_statuses[row.id]}
+            )
+            for row in rows
+        ],
         overall_status=overall_status,
         generated_at=utc_now(),
     )

@@ -5,12 +5,13 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..audit import record_audit
 from ..authz import (
     Principal,
+    build_assistant_scope_snapshot,
     build_scope_snapshot,
     get_executive_principal,
     scope_snapshot_is_current_for_user,
@@ -19,7 +20,7 @@ from ..config import get_settings
 from ..database import get_db
 from ..errors import AppError
 from ..job_state import close_assistant_placeholder
-from ..models import FileAsset, Job, JobAttempt, Report
+from ..models import Conversation, FileAsset, Job, JobAttempt, Message, Report
 from ..schemas import JobCreate, JobOut, Page
 from ..security import utc_now
 
@@ -185,3 +186,87 @@ def cancel_job(
     db.commit()
     db.refresh(item)
     return JobOut.model_validate(item)
+
+
+@router.post("/{job_id}/retry", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+def retry_job(
+    job_id: uuid.UUID,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> JobOut:
+    previous = visible_job(db, principal, job_id, lock=True)
+    if previous.job_type != "assistant_response":
+        raise AppError(409, "job_not_retryable", "仅支持重试问答任务")
+    if previous.status not in {"failed", "canceled"}:
+        raise AppError(409, "job_not_retryable", "当前任务状态不能重试")
+    try:
+        conversation_id = uuid.UUID(str(previous.payload_json["conversation_id"]))
+        message_id = uuid.UUID(str(previous.payload_json["message_id"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AppError(409, "job_not_retryable", "原任务缺少可重试的会话信息") from exc
+    conversation = db.scalar(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.enterprise_id == principal.enterprise_id,
+            Conversation.owner_user_id == principal.user.id,
+            Conversation.archived_at.is_(None),
+        )
+    )
+    source_message = db.scalar(
+        select(Message).where(
+            Message.id == message_id,
+            Message.conversation_id == conversation_id,
+            Message.role == "user",
+        )
+    )
+    if conversation is None or source_message is None:
+        raise AppError(409, "job_not_retryable", "原会话已不可继续")
+    sequence = (
+        db.scalar(
+            select(func.coalesce(func.max(Message.sequence), 0)).where(
+                Message.conversation_id == conversation.id
+            )
+        )
+        or 0
+    ) + 1
+    assistant_message = Message(
+        conversation_id=conversation.id,
+        role="assistant",
+        content="",
+        content_json={"retry_of_job_id": str(previous.id)},
+        sequence=sequence,
+        status="queued",
+    )
+    db.add(assistant_message)
+    db.flush()
+    payload = dict(previous.payload_json)
+    payload["assistant_message_id"] = str(assistant_message.id)
+    payload["retry_of_job_id"] = str(previous.id)
+    retried = Job(
+        enterprise_id=principal.enterprise_id,
+        created_by_user_id=principal.user.id,
+        job_type="assistant_response",
+        payload_json=payload,
+        scope_snapshot_json=build_assistant_scope_snapshot(
+            db, principal, conversation.organization_unit_id
+        ),
+        status="queued",
+        max_attempts=get_settings().worker_job_max_attempts,
+    )
+    db.add(retried)
+    conversation.last_message_at = utc_now()
+    db.flush()
+    record_audit(
+        db,
+        request,
+        "job.retried",
+        actor=principal.user,
+        session=principal.session,
+        target_type="job",
+        target_id=retried.id,
+        metadata={"retry_of_job_id": str(previous.id)},
+    )
+    db.commit()
+    db.refresh(retried)
+    return JobOut.model_validate(retried)

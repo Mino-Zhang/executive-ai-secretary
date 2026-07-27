@@ -15,6 +15,7 @@ export type ApiUser = {
   role: AppRole;
   locale: string;
   timezone: string;
+  memory_enabled: boolean;
   password_change_required: boolean;
 };
 
@@ -88,34 +89,6 @@ export type Project = {
   archived_at?: string | null;
 };
 
-export type FileMetadata = {
-  id: string;
-  original_name: string;
-  media_type: string;
-  size_bytes: number;
-  sha256: string;
-  status: "uploaded" | "processing" | "ready" | "partial" | "failed";
-  metadata_json: { extractable?: boolean };
-  extraction_status?: "queued" | "processing" | "completed" | "failed" | "unsupported";
-  created_at: string;
-  deleted_at: string | null;
-};
-
-export type FileExtraction = {
-  file_id: string;
-  status: "queued" | "processing" | "completed" | "failed";
-  parser_name: string | null;
-  parser_version: string | null;
-  page_count: number | null;
-  chunk_count: number;
-  error_code: string | null;
-  error_message: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
 export type DataDomainStatus = {
   domain: "opportunity" | "delivery" | "collection" | "target" | string;
   status: "fresh" | "stale" | "partial" | "failed" | "unavailable" | string;
@@ -169,6 +142,31 @@ export type ModelProviderTest = {
   model: string;
   latency_ms: number;
   tested_at: string;
+};
+
+export type McpTool = {
+  tool_name: string;
+  display_name: string;
+  description: string;
+  category: string;
+  domains: string[];
+  parameters: Record<string, Record<string, unknown>>;
+  is_enabled: boolean;
+  planner_enabled: boolean;
+  timeout_seconds: number;
+  max_rows: number;
+  operator_note: string | null;
+  configured: boolean;
+  readiness: "ready" | "disabled" | "data_unavailable";
+  readiness_issues: string[];
+  updated_at: string | null;
+};
+
+export type McpToolCatalog = {
+  tools: McpTool[];
+  enabled_count: number;
+  planner_count: number;
+  generated_at: string;
 };
 
 export type MessageEvidence = {

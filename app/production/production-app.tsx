@@ -196,7 +196,7 @@ function ProductionLogin({
         <div className="login-statement">
           <p className="eyebrow">私有化经营工作入口</p>
           <h1 id="production-product-title">先确认身份，再进入经营现场。</h1>
-          <p>会话、文件与经营范围均受企业权限控制，并记录必要的安全审计。</p>
+          <p>会话、经营范围与工具调用均受企业权限控制，并记录必要的安全审计。</p>
         </div>
         <dl className="login-principles">
           <div><dt>01</dt><dd><strong>独立身份</strong><span>企业预建账号与受控会话</span></dd></div>

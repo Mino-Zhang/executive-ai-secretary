@@ -1,40 +1,32 @@
 from __future__ import annotations
 
-import re
 import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Form, Request, UploadFile, status
-from fastapi import File as UploadBody
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import Response
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..audit import record_audit
-from ..authz import Principal, build_scope_snapshot, get_executive_principal
+from ..authz import Principal, get_executive_principal
 from ..config import Settings, get_settings
 from ..database import get_db
 from ..errors import AppError
 from ..models import (
-    Conversation,
-    ConversationFile,
     FileAsset,
     FileChunk,
     FileEvent,
     FileExtraction,
-    Job,
 )
 from ..schemas import FileExtractionOut, FileOut, Page
 from ..security import utc_now
 from ..storage import LocalEncryptedStorage
 
 router = APIRouter(prefix="/files", tags=["files"])
-ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".txt"}
-EXTRACTABLE_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx"}
-SAFE_FILENAME = re.compile(r"[^\w.\-()\u4e00-\u9fff ]", re.UNICODE)
 
 
 @lru_cache
@@ -92,94 +84,28 @@ def list_files(
     return Page(items=[FileOut.model_validate(item) for item in rows])
 
 
-@router.post("", response_model=FileOut, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=FileOut, status_code=status.HTTP_410_GONE)
 def upload_file(
     request: Request,
     principal: Annotated[Principal, Depends(get_executive_principal)],
     db: Annotated[Session, Depends(get_db)],
-    settings: Annotated[Settings, Depends(get_settings)],
-    storage: Annotated[LocalEncryptedStorage, Depends(get_storage)],
-    file: Annotated[UploadFile, UploadBody(...)],
-    conversation_id: Annotated[uuid.UUID | None, Form()] = None,
 ) -> FileOut:
-    raw_name = Path(file.filename or "file").name
-    safe_name = SAFE_FILENAME.sub("_", raw_name).strip()[:500] or "file"
-    extension = Path(safe_name).suffix.lower()
-    if extension not in ALLOWED_EXTENSIONS:
-        raise AppError(415, "unsupported_file_type", "仅支持 PDF、Word、Excel、PPT、CSV 和文本文件")
-    stored = storage.put(file.file, settings.max_upload_bytes)
-    item = FileAsset(
-        enterprise_id=principal.enterprise_id,
-        uploaded_by_user_id=principal.user.id,
-        storage_key=stored.storage_key,
-        original_name=safe_name,
-        media_type=(file.content_type or "application/octet-stream")[:255],
-        size_bytes=stored.size_bytes,
-        sha256=stored.sha256,
-        encryption_key_version=stored.encryption_key_version,
-        status="ready",
-        metadata_json={"extractable": extension in EXTRACTABLE_EXTENSIONS},
+    record_audit(
+        db,
+        request,
+        "file.upload_rejected",
+        actor=principal.user,
+        session=principal.session,
+        target_type="file",
+        outcome="failure",
+        failure_reason_code="file_upload_disabled",
     )
-    try:
-        db.add(item)
-        db.flush()
-        conversation = None
-        if conversation_id is not None:
-            conversation = db.scalar(
-                select(Conversation).where(
-                    Conversation.id == conversation_id,
-                    Conversation.enterprise_id == principal.enterprise_id,
-                    Conversation.owner_user_id == principal.user.id,
-                    Conversation.archived_at.is_(None),
-                )
-            )
-            if conversation is None:
-                raise AppError(404, "conversation_not_found", "会话不存在")
-            db.add(ConversationFile(conversation_id=conversation.id, file_id=item.id))
-        if extension in EXTRACTABLE_EXTENSIONS:
-            extraction = FileExtraction(file_id=item.id, status="queued")
-            db.add(extraction)
-            db.flush()
-            db.add(
-                Job(
-                    enterprise_id=principal.enterprise_id,
-                    created_by_user_id=principal.user.id,
-                    job_type="file.extract",
-                    payload_json={
-                        "file_id": str(item.id),
-                        "extraction_id": str(extraction.id),
-                        "conversation_id": str(conversation.id) if conversation else None,
-                    },
-                    scope_snapshot_json=build_scope_snapshot(
-                        db,
-                        principal,
-                        conversation.organization_unit_id if conversation else None,
-                    ),
-                    status="queued",
-                    max_attempts=settings.worker_job_max_attempts,
-                )
-            )
-        db.add(FileEvent(file_id=item.id, actor_user_id=principal.user.id, event_type="uploaded"))
-        record_audit(
-            db,
-            request,
-            "file.uploaded",
-            actor=principal.user,
-            session=principal.session,
-            target_type="file",
-            target_id=item.id,
-            metadata={
-                "size_bytes": item.size_bytes,
-                "media_type": item.media_type,
-                "sha256_prefix": item.sha256[:12],
-            },
-        )
-        db.commit()
-    except Exception:
-        db.rollback()
-        storage.delete(stored.storage_key)
-        raise
-    return FileOut.model_validate(item)
+    db.commit()
+    raise AppError(
+        410,
+        "file_upload_disabled",
+        "当前阶段已关闭文件上传，请直接使用智能问数与泛化问答",
+    )
 
 
 @router.get("/{file_id}/extraction", response_model=FileExtractionOut)

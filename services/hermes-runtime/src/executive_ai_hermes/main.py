@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
@@ -79,29 +80,61 @@ _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{16,200}$")
 PROFILE_INSTRUCTIONS = {
     "route": """
 你是企业经营工作台的强制路由器。只输出一个 JSON 对象，不要解释。
-route 只能是 data、document、mixed 或 clarification。
-tool 只能是输入中 allowed_tools 之一，或 null。
-数字、经营、商机、项目、回款、目标问题走 data；当前会话文件走 document；两者都明确需要走 mixed。
-仅在确实缺少不可推断的事业部范围时走 clarification。
-必须返回 route, tool, rewritten_query, reason, confidence，
-以及 clarification_question, clarification_options。
+route 只能是 data、general 或 clarification。
+企业数字、经营、商机、项目、回款、目标、客户、事业部比较问题走 data。
+不需要企业经营数据的解释、写作、讨论、方法建议和一般知识问题走 general。
+仅当经营问题明确要求某个事业部、但输入中无法唯一确定事业部时走 clarification；
+不要因为用户没有指定事业部就追问，默认使用其完整授权范围。
+必须返回 route, rewritten_query, reason, confidence 和 clarification_question。
 confidence 是 0 到 1 的小数。
 """.strip(),
-    "data": """
-你是董事长的高级经营研究员。你只能使用输入中 authorized_result 里的数据，不得补造数字。
-如果输入同时包含 current_conversation_chunks，
-只能把这些当前会话文件片段与 authorized_result 结合分析，
-并为文件结论标注提供的文件名及页码、工作表区域或幻灯片定位；不得检索或引用其他会话文件。
-用简洁、准确、可行动的中文回答。先给结论，再给关键数字和必要的建议。
-必须说明数据时间与来源；任何数据域为 stale 或 failed 时必须明确提醒。
-输入为演示模拟数据时，不得称为客户真实经营数据。
+    "plan": """
+你是受控经营查询规划器。只输出一个 JSON 对象，不要解释。
+只能从 available_tools 中选择工具和参数，最多 4 个调用，不得编造参数、SQL、代码、网址或工具名。
+把复杂问题拆成必要且最少的工具调用；简单问题只调用一个工具。避免为了展示能力而增加调用。
+参数必须严格符合工具 parameters；organization_unit_ids 由系统注入，不要输出。
+返回 analysis_mode 和 calls。calls 每项必须包含 tool、arguments、reason。
+如果没有合适工具，calls 返回空数组。
 """.strip(),
-    "document": """
-你是董事长的文件研究员。只根据 current_conversation_chunks 回答，不得引用其他会话或补造内容。
-先给结论，再列出依据。对每个关键结论使用提供的文件名与页码、工作表区域或幻灯片定位。
-证据不足时直接说明，不得猜测。
+    "data": """
+你是董事长的高级经营研究员。你只能使用输入中 authorized_results 里的数据回答经营事实，不得补造数字。
+conversation_context 和 active_memories 只用于理解指代、偏好和表达方式，不能作为经营数字证据。
+用简洁、准确、可行动的中文回答。先给结论，再给关键数字和必要的建议。
+默认控制在 300 至 600 个中文字符；用户明确要求详细报告时才展开。
+使用短段落和换行组织“结论、关键发现、建议”，每部分不超过 5 项。
+不要把完整明细表再次抄进正文，结构化数据会由界面单独展示。
+必须说明数据时间与来源；任何数据域为 stale 或 failed 时必须明确提醒。
+只向用户展示 source_display_name 等自然名称，不输出内部 source_type、表名或字段名。
+输入为演示模拟数据时，不得称为客户真实经营数据。
+若部分工具失败，只使用成功结果并清楚说明缺口；若证据不足，直接说明。
+""".strip(),
+    "general": """
+你是董事长的高级人工智能研究员，负责非经营数据类的泛化问答、分析、写作和方法建议。
+结合 conversation_context 处理上下文与指代；
+仅当 memory_enabled 为 true 时使用 active_memories 中的偏好。
+不得声称查询了企业数据库、实时互联网或未提供的材料，不得编造当前经营数字。
+回答要克制、清晰、有判断；事实不确定时明确边界，必要时建议用户转成可验证的问题。
 """.strip(),
 }
+
+# The cap includes model reasoning tokens and visible output.  Keeping it
+# profile-specific prevents a short operating question from consuming an
+# unbounded GLM reasoning budget while leaving general analysis more room.
+PROFILE_MAX_OUTPUT_TOKENS = {
+    "route": 700,
+    "plan": 1100,
+    "data": 1600,
+    "general": 2200,
+}
+HERMES_RUNTIME_CONFIG = "agent: {}\n"
+GLM_52_RUNTIME_CONFIG = "agent:\n  reasoning_effort: none\n"
+
+
+def _runtime_config_for_model(model_id: str) -> str:
+    # Verified against Anspire's GLM-5.2 chat endpoint. Other catalog models
+    # keep their provider default so an OpenAI/Claude-compatible model is not
+    # sent a GLM-specific reasoning control after an administrator switches it.
+    return GLM_52_RUNTIME_CONFIG if model_id == "glm-5.2" else HERMES_RUNTIME_CONFIG
 
 
 class ProviderConfig(BaseModel):
@@ -128,7 +161,7 @@ class ProviderConfig(BaseModel):
 
 
 class RunRequest(BaseModel):
-    profile: Literal["route", "data", "document"]
+    profile: Literal["route", "plan", "data", "general"]
     payload: dict[str, Any]
     request_id: str = Field(min_length=1, max_length=200)
     provider_config: ProviderConfig
@@ -283,7 +316,20 @@ async def run(request: Request, payload: RunRequest) -> RunResponse:
     # short-lived subprocess and never persisted in Hermes user config.
     environment["ANSPIRE_API_KEY"] = config.api_key.get_secret_value()
     environment["CUSTOM_BASE_URL"] = ANSPIRE_ENDPOINT_URL
-    with tempfile.NamedTemporaryFile(suffix=".json") as usage_file:
+    environment["HERMES_MAX_TOKENS"] = str(PROFILE_MAX_OUTPUT_TOKENS[payload.profile])
+    with (
+        tempfile.NamedTemporaryFile(suffix=".json") as usage_file,
+        tempfile.TemporaryDirectory(prefix="executive-ai-hermes-") as hermes_home,
+    ):
+        # The Anspire GLM endpoint honors the generic custom-provider
+        # reasoning controls emitted by Hermes when reasoning is disabled.
+        # This keeps routine operating queries responsive while the explicit
+        # planner, evidence tools and server-side authorization remain intact.
+        Path(hermes_home, "config.yaml").write_text(
+            _runtime_config_for_model(config.model_id),
+            encoding="utf-8",
+        )
+        environment["HERMES_HOME"] = hermes_home
         command = [
             "hermes",
             "--oneshot",

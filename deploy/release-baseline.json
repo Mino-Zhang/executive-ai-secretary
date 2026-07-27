@@ -1,6 +1,6 @@
 {
   "schemaVersion": "executive-ai.release-baseline/v1",
-  "alembicHead": "c8e5a14d7f20",
+  "alembicHead": "d4a91f7c2e10",
   "infrastructureImages": {
     "postgres": "docker.io/pgvector/pgvector:0.8.5-pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0",
     "nginx": "docker.io/library/nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10",

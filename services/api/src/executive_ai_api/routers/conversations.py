@@ -14,6 +14,7 @@ from ..audit import record_audit
 from ..authz import (
     Principal,
     assert_org_scope,
+    build_assistant_scope_snapshot,
     build_scope_snapshot,
     get_executive_principal,
 )
@@ -24,8 +25,6 @@ from ..idempotency import replay, save_response
 from ..models import (
     Clarification,
     Conversation,
-    ConversationFile,
-    FileAsset,
     Job,
     Message,
     MessageEvidence,
@@ -67,7 +66,8 @@ def owned_conversation(
     item = db.scalar(statement)
     if item is None:
         raise AppError(404, "conversation_not_found", "会话不存在")
-    assert_org_scope(db, principal, item.organization_unit_id)
+    if item.organization_unit_id is not None:
+        assert_org_scope(db, principal, item.organization_unit_id)
     return item
 
 
@@ -116,7 +116,8 @@ def create_conversation(
     previous = replay(db, request, principal, payload)
     if previous:
         return ORJSONResponse(status_code=previous[0], content=previous[1])
-    assert_org_scope(db, principal, payload.organization_unit_id)
+    if payload.organization_unit_id is not None:
+        assert_org_scope(db, principal, payload.organization_unit_id)
     project = None
     if payload.project_id:
         project = db.scalar(
@@ -407,6 +408,21 @@ def resolve_clarification(
     if clarification.status != "pending":
         raise AppError(409, "clarification_resolved", "该范围确认已经处理")
     clarification.status = "resolved"
+    option = next(
+        (
+            item
+            for item in clarification.options_json
+            if isinstance(item, dict) and str(item.get("value")) == payload.value
+        ),
+        None,
+    )
+    if option is None:
+        raise AppError(422, "clarification_option_invalid", "请选择系统提供的有效查询范围")
+    try:
+        selected_organization_id = uuid.UUID(payload.value)
+    except ValueError as exc:
+        raise AppError(422, "clarification_option_invalid", "查询范围格式无效") from exc
+    assert_org_scope(db, principal, selected_organization_id)
     clarification.selected_value = payload.value
     clarification.resolved_by_user_id = principal.user.id
     clarification.resolved_at = utc_now()
@@ -425,7 +441,7 @@ def resolve_clarification(
         author_user_id=principal.user.id,
         role="user",
         content=(
-            f"{original_question}\n\n已确认查询范围：{payload.value}"
+            f"{original_question}\n\n已确认查询范围：{option.get('label', payload.value)}"
             if original_question
             else payload.value
         ),
@@ -459,7 +475,7 @@ def resolve_clarification(
                 "clarification_id": str(clarification.id),
             },
             scope_snapshot_json=build_scope_snapshot(
-                db, principal, conversation.organization_unit_id
+                db, principal, selected_organization_id
             ),
             status="queued",
             max_attempts=get_settings().worker_job_max_attempts,
@@ -524,18 +540,8 @@ def create_message(
     conversation = owned_conversation(db, principal, conversation_id, lock=True)
     if conversation.archived_at:
         raise AppError(409, "conversation_archived", "已归档会话不能继续发送消息")
-    files: list[FileAsset] = []
     if payload.file_ids:
-        files = db.scalars(
-            select(FileAsset).where(
-                FileAsset.id.in_(payload.file_ids),
-                FileAsset.enterprise_id == principal.enterprise_id,
-                FileAsset.uploaded_by_user_id == principal.user.id,
-                FileAsset.deleted_at.is_(None),
-            )
-        ).all()
-        if {item.id for item in files} != set(payload.file_ids):
-            raise AppError(404, "file_not_found", "一个或多个文件不存在")
+        raise AppError(410, "file_upload_disabled", "当前阶段不支持在会话中使用文件")
     sequence = (
         db.scalar(
             select(func.coalesce(func.max(Message.sequence), 0)).where(
@@ -549,7 +555,7 @@ def create_message(
         author_user_id=principal.user.id,
         role="user",
         content=payload.content,
-        content_json={"file_ids": [str(item.id) for item in files]},
+        content_json={},
         sequence=sequence,
         status="completed",
     )
@@ -565,15 +571,9 @@ def create_message(
     )
     db.add(assistant_message)
     db.flush()
-    for item in files:
-        exists = db.scalar(
-            select(ConversationFile).where(
-                ConversationFile.conversation_id == conversation.id,
-                ConversationFile.file_id == item.id,
-            )
-        )
-        if exists is None:
-            db.add(ConversationFile(conversation_id=conversation.id, file_id=item.id))
+    allowed_scope = build_assistant_scope_snapshot(
+        db, principal, conversation.organization_unit_id
+    )
     job = Job(
         enterprise_id=principal.enterprise_id,
         created_by_user_id=principal.user.id,
@@ -588,11 +588,7 @@ def create_message(
                 else None
             ),
         },
-        scope_snapshot_json=build_scope_snapshot(
-            db,
-            principal,
-            conversation.organization_unit_id,
-        ),
+        scope_snapshot_json=allowed_scope,
         status="queued",
         max_attempts=get_settings().worker_job_max_attempts,
     )

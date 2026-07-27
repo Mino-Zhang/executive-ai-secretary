@@ -6,10 +6,10 @@ import type {
   ConversationMessage,
   CursorPage,
   DataCapabilities,
-  FileExtraction,
-  FileMetadata,
   Job,
   Memory,
+  McpTool,
+  McpToolCatalog,
   MessageEvidence,
   ModelProviderConfig,
   ModelProviderTest,
@@ -65,6 +65,12 @@ export function createProductionServices(client: ApiClient = apiClient) {
     async revokeSession(sessionId: string) {
       return client.request<void>(`/auth/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
     },
+    async updatePreferences(memoryEnabled: boolean) {
+      return client.request<AuthMe["user"]>("/auth/preferences", {
+        method: "PATCH",
+        body: { memory_enabled: memoryEnabled },
+      });
+    },
   };
 
   const organizations = {
@@ -110,10 +116,10 @@ export function createProductionServices(client: ApiClient = apiClient) {
         `/conversations/${encodeURIComponent(id)}/messages${queryString({ after_sequence: cursor })}`,
       );
     },
-    async sendMessage(id: string, content: string, fileIds: string[] = []) {
+    async sendMessage(id: string, content: string) {
       return client.request<ConversationMessage>(
         `/conversations/${encodeURIComponent(id)}/messages`,
-        { method: "POST", headers: idempotencyHeaders(), body: { content, file_ids: fileIds } },
+        { method: "POST", headers: idempotencyHeaders(), body: { content, file_ids: [] } },
       );
     },
     async evidence(id: string, messageId: string) {
@@ -152,27 +158,6 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
   };
 
-  const files = {
-    async upload(file: File, conversationId?: string) {
-      const form = new FormData();
-      form.set("file", file);
-      if (conversationId) form.set("conversation_id", conversationId);
-      return client.request<FileMetadata>("/files", { method: "POST", headers: idempotencyHeaders(), body: form });
-    },
-    async get(id: string) {
-      return client.request<FileMetadata>(`/files/${encodeURIComponent(id)}`);
-    },
-    async extraction(id: string) {
-      return client.request<FileExtraction>(`/files/${encodeURIComponent(id)}/extraction`);
-    },
-    contentUrl(id: string) {
-      return `${client.baseUrl}/files/${encodeURIComponent(id)}/content`;
-    },
-    async remove(id: string) {
-      return client.request<void>(`/files/${encodeURIComponent(id)}`, { method: "DELETE" });
-    },
-  };
-
   const memories = {
     async list(cursor?: string | null) {
       return client.request<CursorPage<Memory>>(`/memories${queryString({ cursor })}`);
@@ -206,6 +191,16 @@ export function createProductionServices(client: ApiClient = apiClient) {
     async get(id: string) {
       return client.request<Job>(`/jobs/${encodeURIComponent(id)}`);
     },
+    async cancel(id: string) {
+      return client.request<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, {
+        method: "POST",
+      });
+    },
+    async retry(id: string) {
+      return client.request<Job>(`/jobs/${encodeURIComponent(id)}/retry`, {
+        method: "POST",
+      });
+    },
   };
 
   const data = {
@@ -231,7 +226,25 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
   };
 
-  return { auth, organizations, conversations, projects, files, memories, reports, jobs, data, adminModels };
+  const adminMcp = {
+    async list() {
+      return client.request<McpToolCatalog>("/admin/mcp-tools");
+    },
+    async update(toolName: string, values: Partial<Pick<McpTool, "display_name" | "description" | "is_enabled" | "planner_enabled" | "timeout_seconds" | "max_rows" | "operator_note">>) {
+      return client.request<McpTool>(`/admin/mcp-tools/${encodeURIComponent(toolName)}`, {
+        method: "PATCH",
+        body: values,
+      });
+    },
+    async validate(toolName: string) {
+      return client.request<{ tool: McpTool; ready: boolean; issues: string[] }>(
+        `/admin/mcp-tools/${encodeURIComponent(toolName)}/validate`,
+        { method: "POST" },
+      );
+    },
+  };
+
+  return { auth, organizations, conversations, projects, memories, reports, jobs, data, adminModels, adminMcp };
 }
 
 export type ProductionServices = ReturnType<typeof createProductionServices>;

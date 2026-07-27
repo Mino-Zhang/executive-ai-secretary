@@ -215,6 +215,29 @@ def build_scope_snapshot(
     }
 
 
+def build_assistant_scope_snapshot(
+    db: Session,
+    principal: Principal,
+    organization_unit_id: uuid.UUID | None = None,
+) -> dict[str, object]:
+    """Snapshot assistant authority without making general Q&A depend on data grants.
+
+    A user without an analyzable organization may still use the assistant for general
+    reasoning.  Such a job is permanently marked ``general_only`` so a later routing
+    decision cannot turn it into a business-data query without a new authorization
+    snapshot.
+    """
+
+    allowed = accessible_organization_unit_ids(db, principal)
+    if organization_unit_id is not None or allowed:
+        return build_scope_snapshot(db, principal, organization_unit_id)
+    return {
+        "enterprise_wide": False,
+        "organization_unit_ids": [],
+        "general_only": True,
+    }
+
+
 def scope_snapshot_is_current_for_user(
     db: Session,
     user: User,
@@ -228,7 +251,7 @@ def scope_snapshot_is_current_for_user(
     except (TypeError, ValueError):
         return False
     if not required:
-        return False
+        return snapshot.get("general_only") is True
     current = accessible_organization_unit_ids_for_user(db, user)
     if not required.issubset(current):
         return False

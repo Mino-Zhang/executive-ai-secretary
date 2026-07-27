@@ -53,7 +53,7 @@ test("API client sends cookie credentials and CSRF on mutations", async () => {
   assert.match(client, /cache: "no-store"/);
 });
 
-test("production services cover phase-one user domains", async () => {
+test("production services cover the active user domains without file upload", async () => {
   const services = await read("../app/production/services.ts");
   for (const path of [
     "/auth/login",
@@ -63,7 +63,6 @@ test("production services cover phase-one user domains", async () => {
     "/organization-units",
     "/conversations",
     "/projects",
-    "/files",
     "/memories",
     "/reports",
     "/jobs",
@@ -74,7 +73,7 @@ test("production services cover phase-one user domains", async () => {
   assert.match(services, /me\.user\.role !== "executive"/);
   assert.match(services, /"Idempotency-Key"/);
   assert.match(services, /organization_unit_id/);
-  assert.match(services, /original_name|FileMetadata/);
+  assert.doesNotMatch(services, /FormData|FileMetadata|\/files/);
   assert.doesNotMatch(services, /prototype-data|organizationCatalog/);
 });
 
@@ -99,4 +98,19 @@ test("management surface exposes only the controlled Anspire model channel", asy
   assert.match(types, /provider: "anspire"/);
   assert.doesNotMatch(admin, /OpenAI|Anthropic|自定义接口|endpoint_url.*onChange/);
   assert.doesNotMatch(services, /OPENAI_BASE_URL|HERMES_PROVIDER|model_api_key/);
+});
+
+test("management exposes a restrained MCP registry instead of arbitrary execution", async () => {
+  const admin = await read("../app/production/production-admin.tsx");
+  const services = await read("../app/production/services.ts");
+  const types = await read("../app/production/types.ts");
+
+  assert.match(admin, /MCP 工具/);
+  assert.match(admin, /允许自动规划/);
+  assert.match(admin, /最大返回行数/);
+  assert.match(admin, /依赖数据域/);
+  assert.match(admin, /规划器可用参数/);
+  assert.match(services, /\/admin\/mcp-tools/);
+  assert.match(types, /planner_enabled/);
+  assert.doesNotMatch(admin, /SQL 编辑器|脚本编辑器|自定义工具 URL/);
 });

@@ -56,6 +56,49 @@ class ModelProviderTestOut(BaseModel):
     tested_at: datetime
 
 
+class McpToolOut(BaseModel):
+    tool_name: str
+    display_name: str
+    description: str
+    category: str
+    domains: list[str]
+    parameters: dict[str, Any]
+    is_enabled: bool
+    planner_enabled: bool
+    timeout_seconds: int
+    max_rows: int
+    operator_note: str | None
+    configured: bool
+    readiness: Literal["ready", "disabled", "data_unavailable"]
+    readiness_issues: list[str]
+    updated_at: datetime | None
+
+
+class McpToolCatalogOut(BaseModel):
+    tools: list[McpToolOut]
+    enabled_count: int
+    planner_count: int
+    generated_at: datetime
+
+
+class McpToolUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+    description: str | None = Field(default=None, min_length=1, max_length=2000)
+    is_enabled: bool | None = None
+    planner_enabled: bool | None = None
+    timeout_seconds: int | None = Field(default=None, ge=3, le=60)
+    max_rows: int | None = Field(default=None, ge=1, le=100)
+    operator_note: str | None = Field(default=None, max_length=500)
+
+
+class McpToolValidationOut(BaseModel):
+    tool: McpToolOut
+    ready: bool
+    issues: list[str]
+
+
 class UserOut(ORMModel):
     id: uuid.UUID
     email: str
@@ -64,7 +107,14 @@ class UserOut(ORMModel):
     role: str
     locale: str
     timezone: str
+    memory_enabled: bool
     password_change_required: bool
+
+
+class UserPreferenceUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_enabled: bool
 
 
 class EnterpriseOut(ORMModel):
