@@ -40,6 +40,12 @@ executive_password="Tmp-E1!$(openssl rand -hex 18)"
 executive_new_password="Final-E2!$(openssl rand -hex 18)"
 
 "${SCRIPT_DIR}/prepare-env.sh" local-demo
+# Docker Compose implements local file-backed secrets as bind mounts on Linux,
+# preserving the host UID and mode. This drill is hard-restricted above to a
+# fresh, single-tenant GitHub-hosted runner and uses only one-time random keys.
+# Make those ephemeral files container-readable but never writable; real local
+# and customer environments retain the stricter 0600 host permissions.
+find "${runtime_dir}/secrets" -type f -exec chmod 0444 {} +
 "${SCRIPT_DIR}/start.sh" local-demo
 printf '%s\n' "${admin_password}" | "${SCRIPT_DIR}/bootstrap-admin.sh" \
   local-demo admin@ci.invalid "CI 企业管理员" "CI 演示企业" ci-enterprise
