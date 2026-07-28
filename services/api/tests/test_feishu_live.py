@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 
+from executive_ai_api.feishu import FeishuBitableClient
 from executive_ai_api.feishu_live import (
     COLLECTION_FIELDS,
     DELIVERY_FIELDS,
@@ -14,6 +15,34 @@ from executive_ai_api.feishu_live import (
     fetch_fixed_live_snapshot,
     live_snapshot_to_source_rows,
 )
+
+
+def test_bitable_client_requests_automatic_record_metadata(monkeypatch) -> None:
+    client = FeishuBitableClient(
+        app_id="app-id",
+        app_secret="app-secret",
+        app_token="app-token",
+        table_id="table-id",
+    )
+    requests: list[tuple[str, str, dict]] = []
+
+    def fake_request(method: str, path: str, **kwargs):
+        requests.append((method, path, kwargs))
+        return {"data": {"items": [{"record_id": "rec-1"}], "has_more": False}}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    try:
+        assert client.iter_records(page_size=200) == [{"record_id": "rec-1"}]
+    finally:
+        client.close()
+
+    assert requests == [
+        (
+            "GET",
+            "/bitable/v1/apps/app-token/tables/table-id/records",
+            {"params": {"page_size": 200, "automatic_fields": True}},
+        )
+    ]
 
 
 class FakeClient:
@@ -189,6 +218,45 @@ def test_fixed_live_snapshot_hash_ignores_feishu_record_order() -> None:
     assert [row["collection_id"] for row in second.collections] == ["COL-1", "COL-2", "COL-3"]
 
 
+def test_fixed_live_snapshot_hash_ignores_automatic_record_metadata() -> None:
+    bindings = _bindings()
+    first_records = _records()
+    second_records = _records()
+    for rows in second_records.values():
+        for record in rows:
+            record["last_modified_time"] += 60_000
+
+    first = fetch_fixed_live_snapshot(
+        bindings,
+        client_factory=lambda binding: FakeClient(binding.fields, first_records[binding.domain]),
+    )
+    second = fetch_fixed_live_snapshot(
+        bindings,
+        client_factory=lambda binding: FakeClient(binding.fields, second_records[binding.domain]),
+    )
+
+    assert first.content_sha256 == second.content_sha256
+
+
+def test_fixed_live_snapshot_hash_is_stable_when_automatic_metadata_is_missing() -> None:
+    bindings = _bindings()
+    records = _records()
+    for rows in records.values():
+        for record in rows:
+            record.pop("last_modified_time")
+
+    first = fetch_fixed_live_snapshot(
+        bindings,
+        client_factory=lambda binding: FakeClient(binding.fields, records[binding.domain]),
+    )
+    second = fetch_fixed_live_snapshot(
+        bindings,
+        client_factory=lambda binding: FakeClient(binding.fields, records[binding.domain]),
+    )
+
+    assert first.content_sha256 == second.content_sha256
+
+
 def test_fixed_live_snapshot_rejects_field_id_drift() -> None:
     bindings = _bindings()
     records = _records()
@@ -240,6 +308,34 @@ def test_fixed_live_snapshot_rejects_broken_financial_equation() -> None:
         )
 
     assert error.value.code == "feishu_financial_invariant_failed"
+
+
+def test_fixed_live_snapshot_reconstructs_customer_split_inside_parentheses() -> None:
+    records = _records()
+    records["opportunity"][0]["fields"]["客户名称"] = ["法国电信（Orange", "新加坡）"]
+    records["delivery"][0]["fields"]["客户名称"] = "法国电信（Orange，新加坡）"
+    for collection in records["collection"]:
+        collection["fields"]["客户名称"] = "法国电信（Orange，新加坡）"
+
+    snapshot = fetch_fixed_live_snapshot(
+        _bindings(),
+        client_factory=lambda binding: FakeClient(binding.fields, records[binding.domain]),
+    )
+
+    assert snapshot.opportunities[0]["customer_name"] == "法国电信（Orange，新加坡）"
+
+
+def test_fixed_live_snapshot_still_rejects_genuine_multiple_customers() -> None:
+    records = _records()
+    records["opportunity"][0]["fields"]["客户名称"] = ["客户甲", "客户乙"]
+
+    with pytest.raises(FeishuLiveSourceError) as error:
+        fetch_fixed_live_snapshot(
+            _bindings(),
+            client_factory=lambda binding: FakeClient(binding.fields, records[binding.domain]),
+        )
+
+    assert error.value.code == "feishu_customer_cardinality_invalid"
 
 
 def test_live_snapshot_maps_three_tables_to_one_conservative_source_batch() -> None:

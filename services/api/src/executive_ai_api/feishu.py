@@ -153,7 +153,11 @@ class FeishuBitableClient:
         records: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
-            params: dict[str, Any] = {"page_size": page_size}
+            # Request Feishu's record metadata explicitly. Without automatic
+            # fields the API omits last_modified_time, which used to force the
+            # connector to substitute the fetch timestamp and made identical
+            # business data look like a new snapshot on every run.
+            params: dict[str, Any] = {"page_size": page_size, "automatic_fields": True}
             if page_token:
                 params["page_token"] = page_token
             payload = self._request("GET", self.records_path, params=params)

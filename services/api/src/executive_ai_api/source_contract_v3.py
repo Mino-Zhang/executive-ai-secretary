@@ -1097,7 +1097,23 @@ def prepare_source_v3_batch(
         "delivery": tuple(sorted(deliveries, key=lambda row: row["source_record_id"])),
         "collection": tuple(sorted(collections, key=lambda row: row["source_record_id"])),
     }
-    table_content = {domain: _canonical_hash(rows[domain]) for domain in SOURCE_V3_DOMAINS}
+    # Batch identity and source observation timestamps are not business
+    # content. Excluding them keeps per-table fingerprints stable for an
+    # unchanged full snapshot while the immutable ODS rows still retain both
+    # values for evidence and freshness reporting.
+    table_content = {
+        domain: _canonical_hash(
+            tuple(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"load_batch_id", "source_updated_at"}
+                }
+                for row in rows[domain]
+            )
+        )
+        for domain in SOURCE_V3_DOMAINS
+    }
     reference_date = max(
         (
             row["data_updated_at"].date()

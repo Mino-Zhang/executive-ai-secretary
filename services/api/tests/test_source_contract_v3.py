@@ -210,6 +210,11 @@ def test_v3_hashes_are_deterministic_and_field_id_sensitive() -> None:
         source_v3_domain_fingerprint(second.rows["opportunity"])
     )
 
+    replay_identity = prepare_source_v3_batch(
+        _snapshot(), _bindings(), batch_id="feishu-v3-another-event"
+    )
+    assert first.table_content_sha256 == replay_identity.table_content_sha256
+
     changed_fields = (
         *OPPORTUNITY_FIELDS[:-1],
         FieldBinding("archived_date", "new-id", "归档时间", 5, False),

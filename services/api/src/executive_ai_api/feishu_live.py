@@ -258,14 +258,39 @@ def _normalize_text(value: Any) -> str | None:
 def _normalize_customer(value: Any) -> str | None:
     if isinstance(value, list):
         values = [str(item).strip() for item in value if str(item).strip()]
+        if len(values) == 1:
+            return values[0]
+        # A Base import can split a single bilingual customer name on a comma
+        # even when that comma is inside parentheses, for example
+        # ``Orange（Singapore, APAC）``.  Reconstruct only when every list
+        # boundary is demonstrably inside one balanced parenthetical phrase.
+        # Genuine multi-customer selections remain invalid.
+        if values and _all_boundaries_are_parenthetical(values):
+            return "，".join(values)
         if len(values) != 1:
             raise FeishuLiveSourceError(
                 "feishu_customer_cardinality_invalid",
                 "商机客户名称必须且只能包含一个客户",
                 {"values": values},
             )
-        return values[0]
     return _normalize_text(value)
+
+
+def _all_boundaries_are_parenthetical(values: list[str]) -> bool:
+    depth = 0
+    saw_opening = False
+    for index, value in enumerate(values):
+        for character in value:
+            if character in {"（", "("}:
+                depth += 1
+                saw_opening = True
+            elif character in {"）", ")"}:
+                depth -= 1
+                if depth < 0:
+                    return False
+        if index < len(values) - 1 and depth <= 0:
+            return False
+    return saw_opening and depth == 0
 
 
 def _normalize_decimal(value: Any) -> Decimal | None:
@@ -303,7 +328,7 @@ def _normalize_record(
         "source_modified_at": (
             datetime.fromtimestamp(modified_time / 1000, UTC)
             if modified_time
-            else datetime.now(UTC)
+            else None
         ),
     }
     for expected in binding.fields:
@@ -463,10 +488,23 @@ def fetch_fixed_live_snapshot(
     collections = rows_by_domain.get("collection", ())
     validation = validate_live_snapshot(opportunities, deliveries, collections)
     validation["warnings"] = [dict(item) for item in FIELD_COMPATIBILITY_WARNINGS]
+    # Hash only fields that can affect product facts. Feishu's automatic
+    # last-modified timestamp is operational metadata; including it would
+    # create a new batch when an unbound field changes or when the metadata is
+    # unavailable and a connector falls back to its fetch time.
     canonical = {
-        "opportunities": opportunities,
-        "deliveries": deliveries,
-        "collections": collections,
+        "opportunities": tuple(
+            {key: value for key, value in row.items() if key != "source_modified_at"}
+            for row in opportunities
+        ),
+        "deliveries": tuple(
+            {key: value for key, value in row.items() if key != "source_modified_at"}
+            for row in deliveries
+        ),
+        "collections": tuple(
+            {key: value for key, value in row.items() if key != "source_modified_at"}
+            for row in collections
+        ),
     }
     content_sha256 = hashlib.sha256(
         json.dumps(canonical, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
