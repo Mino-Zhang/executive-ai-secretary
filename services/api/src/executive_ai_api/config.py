@@ -50,8 +50,8 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=20, ge=0, le=100)
     source_database_url: SecretStr | None = None
     source_writer_database_url: SecretStr | None = None
-    source_schema: str = "executive_source"
-    source_schema_version: str = "2.0"
+    source_schema: str = "executive_source_v3"
+    source_schema_version: str = "3.0"
     source_connection_mode: Literal["internal", "external"] = "external"
     source_query_page_size: int = Field(default=1000, ge=100, le=10_000)
 
@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     feishu_runtime_secret: SecretStr | None = None
     feishu_bitable_app_token: str | None = None
     feishu_bitable_table_id: str | None = None
+    feishu_source_folder_token: str | None = None
+    feishu_opportunity_app_token: str | None = None
+    feishu_opportunity_table_id: str | None = None
+    feishu_delivery_app_token: str | None = None
+    feishu_delivery_table_id: str | None = None
+    feishu_collection_app_token: str | None = None
+    feishu_collection_table_id: str | None = None
 
     session_secret: SecretStr = Field(
         default=SecretStr("development-only-change-me-32-characters"),

@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from .data_source_configuration import public_data_source_configuration
+
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -63,6 +65,9 @@ class McpToolOut(BaseModel):
     category: str
     domains: list[str]
     parameters: dict[str, Any]
+    source_type: Literal["built_in", "composite"]
+    component_tools: list[str]
+    definition_version: int
     is_enabled: bool
     planner_enabled: bool
     timeout_seconds: int
@@ -90,6 +95,21 @@ class McpToolUpdate(BaseModel):
     planner_enabled: bool | None = None
     timeout_seconds: int | None = Field(default=None, ge=3, le=60)
     max_rows: int | None = Field(default=None, ge=1, le=100)
+    operator_note: str | None = Field(default=None, max_length=500)
+
+
+class McpCompositeToolCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str = Field(
+        min_length=8,
+        max_length=64,
+        pattern=r"^custom_[a-z0-9_]+$",
+    )
+    display_name: str = Field(min_length=1, max_length=160)
+    description: str = Field(min_length=12, max_length=2000)
+    category: str = Field(min_length=1, max_length=80)
+    component_tools: list[str] = Field(min_length=1, max_length=4)
     operator_note: str | None = Field(default=None, max_length=500)
 
 
@@ -590,8 +610,15 @@ class DataSourceOut(ORMModel):
     created_at: datetime
     updated_at: datetime
 
+    @field_validator("configuration_json", mode="before")
+    @classmethod
+    def redact_configuration(cls, value: object) -> dict[str, Any]:
+        return public_data_source_configuration(value)
+
 
 class DataSourceUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     display_name: str | None = Field(default=None, min_length=1, max_length=200)
     is_enabled: bool | None = None
     configuration_json: dict[str, Any] | None = None
@@ -624,10 +651,96 @@ class DataSyncRunOut(ORMModel):
     records_read: int
     records_written: int
     records_rejected: int
+    source_schema_hashes_json: dict[str, str]
+    source_record_counts_json: dict[str, int]
+    source_content_hashes_json: dict[str, str]
+    cross_table_validation_json: dict[str, Any]
+    activation_mode: str
+    atomic_activation_status: str
+    experience_weight_policy_id: uuid.UUID | None
+    activation_started_at: datetime | None
+    activated_at: datetime | None
     domain_results_json: dict[str, Any]
     error_code: str | None
     error_message: str | None
     created_at: datetime
+
+
+class FeishuFieldBindingOut(BaseModel):
+    field_id: str
+    field_name: str
+    field_type: int
+    required: bool
+
+
+class FeishuTableBindingStatusOut(BaseModel):
+    domain: Literal["opportunity", "delivery", "collection"]
+    display_name: str
+    configured: bool
+    app_token_masked: str | None
+    table_id: str | None
+    fields: list[FeishuFieldBindingOut]
+    schema_hash: str | None
+    content_hash: str | None
+    record_count: int | None
+    validation_status: Literal["not_configured", "configured", "validated", "rejected"]
+    last_validated_at: datetime | None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DataSourceOperationsStatusOut(BaseModel):
+    source_id: uuid.UUID
+    display_name: str
+    source_type: str
+    schema_version: str
+    is_enabled: bool
+    activation_policy: str
+    bindings: list[FeishuTableBindingStatusOut]
+    latest_successful_run: DataSyncRunOut | None
+    latest_rejected_run: DataSyncRunOut | None
+
+
+class ExperienceWeightValues(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    high: float = Field(ge=0, le=1)
+    medium: float = Field(ge=0, le=1)
+    low: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_order(self):
+        if not self.high >= self.medium >= self.low:
+            raise ValueError("经验权重必须满足高 ≥ 中 ≥ 低")
+        return self
+
+
+class OpportunityExperienceWeightPolicyOut(ORMModel):
+    id: uuid.UUID
+    version: int
+    label: str
+    weights_json: dict[str, float]
+    observation_windows_json: list[int]
+    observation_window_days: int
+    is_active: bool
+    activated_at: datetime
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class OpportunityExperienceWeightPolicyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_version: int = Field(ge=1)
+    weights: ExperienceWeightValues
+    label: str | None = Field(default=None, min_length=1, max_length=160)
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class DataOperationsV3OverviewOut(BaseModel):
+    sources: list[DataSourceOperationsStatusOut]
+    experience_weight_policy: OpportunityExperienceWeightPolicyOut
+    generated_at: datetime
 
 
 class ScheduledTaskOut(ORMModel):

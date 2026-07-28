@@ -6,6 +6,10 @@ import type {
   ConversationMessage,
   CursorPage,
   DataCapabilities,
+  DataOperationsV3Overview,
+  DataSource,
+  DataSourceTest,
+  DataSyncRun,
   ExecutivePersonalProfile,
   HarnessBusinessConfig,
   HarnessConfig,
@@ -17,14 +21,18 @@ import type {
   Memory,
   McpTool,
   McpToolCatalog,
+  McpCompositeToolCreate,
   MessageEvidence,
   ModelProviderConfig,
   ModelProviderTest,
+  OpportunityExperienceWeightPolicy,
   OrganizationUnit,
   OrganizationScope,
   ProductionBootstrap,
   Project,
   Report,
+  ScheduledTask,
+  ManualRun,
 } from "./types";
 
 function queryString(values: Record<string, string | boolean | null | undefined>) {
@@ -265,11 +273,64 @@ export function createProductionServices(client: ApiClient = apiClient) {
         body: values,
       });
     },
+    async create(values: McpCompositeToolCreate) {
+      return client.request<McpTool>("/admin/mcp-tools", {
+        method: "POST",
+        body: values,
+      });
+    },
     async validate(toolName: string) {
       return client.request<{ tool: McpTool; ready: boolean; issues: string[] }>(
         `/admin/mcp-tools/${encodeURIComponent(toolName)}/validate`,
         { method: "POST" },
       );
+    },
+  };
+
+  const adminData = {
+    async overview() {
+      return client.request<DataOperationsV3Overview>("/admin/data-operations/overview");
+    },
+    async sources() {
+      return client.request<CursorPage<DataSource>>("/admin/data-sources");
+    },
+    async updateSource(sourceId: string, values: { display_name?: string; is_enabled?: boolean; configuration_json?: Record<string, unknown> }) {
+      return client.request<DataSource>(`/admin/data-sources/${encodeURIComponent(sourceId)}`, {
+        method: "PATCH",
+        body: values,
+      });
+    },
+    async testSource(sourceId: string) {
+      return client.request<DataSourceTest>(`/admin/data-sources/${encodeURIComponent(sourceId)}/test`, { method: "POST" });
+    },
+    async syncSource(sourceId: string) {
+      return client.request<ManualRun>(`/admin/data-sources/${encodeURIComponent(sourceId)}/sync`, { method: "POST" });
+    },
+    async validateSource(sourceId: string) {
+      return client.request<ManualRun>(`/admin/data-sources/${encodeURIComponent(sourceId)}/validate`, { method: "POST" });
+    },
+    async runs() {
+      return client.request<CursorPage<DataSyncRun>>("/admin/data-sync-runs");
+    },
+    async scheduledTasks() {
+      return client.request<CursorPage<ScheduledTask>>("/admin/scheduled-tasks");
+    },
+    async runScheduledTask(taskId: string) {
+      return client.request<ManualRun>(`/admin/scheduled-tasks/${encodeURIComponent(taskId)}/run`, { method: "POST" });
+    },
+    async experienceWeightPolicy() {
+      return client.request<OpportunityExperienceWeightPolicy>("/admin/metric-policies/opportunity-experience-weight");
+    },
+    async updateExperienceWeightPolicy(values: {
+      base_version: number;
+      weights: { high: number; medium: number; low: number };
+      label?: string;
+      notes?: string;
+    }) {
+      return client.request<OpportunityExperienceWeightPolicy>("/admin/metric-policies/opportunity-experience-weight", {
+        method: "PATCH",
+        body: values,
+      });
     },
   };
 
@@ -306,7 +367,7 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
   };
 
-  return { auth, organizations, conversations, projects, memories, reports, jobs, data, adminModels, adminHarness, adminMcp };
+  return { auth, organizations, conversations, projects, memories, reports, jobs, data, adminModels, adminHarness, adminMcp, adminData };
 }
 
 export type ProductionServices = ReturnType<typeof createProductionServices>;

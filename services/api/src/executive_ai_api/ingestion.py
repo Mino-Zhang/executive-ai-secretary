@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import uuid
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings
@@ -19,6 +20,11 @@ from .database import SessionLocal
 from .feishu import (
     FeishuBitableClient,
     sync_feishu_opportunities_to_source,
+)
+from .feishu_live import (
+    fetch_fixed_live_snapshot_from_settings,
+    fixed_bindings_from_settings,
+    write_live_snapshot_to_source,
 )
 from .models import (
     DailySnapshot,
@@ -35,6 +41,12 @@ from .models import (
     OrganizationUnit,
     SourceCheckpoint,
 )
+from .operating_data_v3 import (
+    OperatingDataV3Error,
+    activate_source_v3_batch,
+    materialize_source_v3_batch,
+    v3_failure_payload,
+)
 from .security import utc_now
 from .source_contract import (
     SourceContractError,
@@ -43,6 +55,13 @@ from .source_contract import (
     latest_ready_batch,
     require_valid_source_contract,
     source_domain_fingerprint,
+)
+from .source_contract_v3 import (
+    SOURCE_V3_SCHEMA_VERSION,
+    latest_ready_source_v3_batch,
+    mark_source_v3_batch_activated,
+    record_rejected_source_v3_batch,
+    require_valid_source_v3_contract,
 )
 
 DOMAIN_TO_SOURCE = {
@@ -215,6 +234,7 @@ def test_source_connection(
     data_source: DataSource,
     *,
     db: Session,
+    allow_empty: bool = False,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
@@ -224,17 +244,30 @@ def test_source_connection(
         resolved.database_url,
         application_name="executive-ai-source-test",
     ) as connection:
-        inspection = require_valid_source_contract(
-            connection,
-            expected_version=resolved.schema_version,
-            schema=resolved.schema,
-        )
+        batch: dict[str, Any] | None = None
+        if resolved.schema_version == SOURCE_V3_SCHEMA_VERSION:
+            inspection = require_valid_source_v3_contract(
+                connection,
+                expected_version=resolved.schema_version,
+                schema=resolved.schema,
+            )
+            try:
+                batch = latest_ready_source_v3_batch(connection, schema=resolved.schema)
+            except SourceContractError as exc:
+                if not allow_empty or exc.code != "source_batch_missing":
+                    raise
+        else:
+            inspection = require_valid_source_contract(
+                connection,
+                expected_version=resolved.schema_version,
+                schema=resolved.schema,
+            )
+            batch = latest_ready_batch(connection, schema=resolved.schema)
         if resolved.connection_mode == "external" and not inspection.tls_active:
             raise SourceContractError(
                 "source_tls_required",
                 "客户外部脱敏源库必须使用 TLS 连接",
             )
-        batch = latest_ready_batch(connection, schema=resolved.schema)
     return {
         "ok": True,
         "schema_version": inspection.schema_version,
@@ -242,8 +275,8 @@ def test_source_connection(
         "current_user": inspection.current_user,
         "read_only": inspection.transaction_read_only,
         "tls_active": inspection.tls_active,
-        "latest_batch_id": batch["batch_id"],
-        "source_data_as_of": batch["source_data_as_of"],
+        "latest_batch_id": batch["batch_id"] if batch else "",
+        "source_data_as_of": batch["source_data_as_of"] if batch else None,
         "duration_ms": int((utc_now() - started_at).total_seconds() * 1000),
     }
 
@@ -677,6 +710,164 @@ def _activate_domain(
         }
 
 
+def _activate_live_domains_atomically(
+    *,
+    enterprise_id: uuid.UUID,
+    data_source: DataSource,
+    sync_run_id: uuid.UUID,
+    rows_by_domain: dict[str, list[dict[str, Any]]],
+    organization_map: dict[str, OrganizationUnit],
+    people_map: dict[str, DimPerson],
+    customer_map: dict[str, DimCustomer],
+    dataset_version: str,
+    fallback_source_data_as_of: datetime,
+) -> dict[str, dict[str, Any]]:
+    """Switch the three live Feishu facts in one product-database transaction."""
+
+    domains = ("opportunity", "delivery", "collection")
+    fingerprints = {domain: source_domain_fingerprint(rows_by_domain[domain]) for domain in domains}
+    source_times = {
+        domain: max(
+            (row["source_updated_at"] for row in rows_by_domain[domain]),
+            default=fallback_source_data_as_of,
+        )
+        for domain in domains
+    }
+    with SessionLocal.begin() as db:
+        checkpoints = {
+            item.domain: item
+            for item in db.scalars(
+                select(SourceCheckpoint).where(
+                    SourceCheckpoint.data_source_id == data_source.id,
+                    SourceCheckpoint.domain.in_(domains),
+                )
+            ).all()
+        }
+        statuses = {
+            item.domain: item
+            for item in db.scalars(
+                select(DataDomainStatus).where(
+                    DataDomainStatus.enterprise_id == enterprise_id,
+                    DataDomainStatus.domain.in_(domains),
+                )
+            ).all()
+        }
+        if all(
+            checkpoints.get(domain)
+            and checkpoints[domain].checksum == fingerprints[domain]
+            and statuses.get(domain)
+            and statuses[domain].active_sync_run_id
+            for domain in domains
+        ):
+            output: dict[str, dict[str, Any]] = {}
+            for domain in domains:
+                status = statuses[domain]
+                status.status = "fresh"
+                status.last_error_code = None
+                status.last_error_message = None
+                output[domain] = {
+                    "domain": domain,
+                    "status": "unchanged",
+                    "records": status.record_count,
+                    "source_data_as_of": (
+                        status.source_data_as_of.isoformat() if status.source_data_as_of else None
+                    ),
+                }
+            return output
+
+        materialized: dict[str, list[dict[str, Any]]] = {}
+        for domain in domains:
+            materialized[domain] = _fact_rows(
+                domain,
+                rows_by_domain[domain],
+                enterprise_id=enterprise_id,
+                data_source_id=data_source.id,
+                sync_run_id=sync_run_id,
+                organization_map=organization_map,
+                people_map=people_map,
+                customer_map=customer_map,
+                dataset_version=dataset_version,
+            )
+
+        output = {}
+        for domain in domains:
+            model = DOMAIN_MODELS[domain]
+            fact_rows = materialized[domain]
+            if fact_rows:
+                db.execute(insert(model), fact_rows)
+            db.execute(
+                update(model)
+                .where(model.enterprise_id == enterprise_id, model.is_current.is_(True))
+                .values(is_current=False)
+            )
+            db.execute(
+                update(model).where(model.sync_run_id == sync_run_id).values(is_current=True)
+            )
+
+            status = statuses.get(domain)
+            if status is None:
+                status = DataDomainStatus(
+                    enterprise_id=enterprise_id,
+                    data_source_id=data_source.id,
+                    domain=domain,
+                    source_type=data_source.source_type,
+                    source_display_name=data_source.display_name,
+                )
+                db.add(status)
+                statuses[domain] = status
+            status.previous_sync_run_id = status.active_sync_run_id
+            status.active_sync_run_id = sync_run_id
+            status.status = "fresh"
+            status.source_data_as_of = source_times[domain]
+            status.last_success_at = utc_now()
+            status.record_count = len(fact_rows)
+            status.dataset_version = dataset_version
+            status.source_type = data_source.source_type
+            status.source_display_name = data_source.display_name
+            status.last_error_code = None
+            status.last_error_message = None
+
+            checkpoint = checkpoints.get(domain)
+            if checkpoint is None:
+                checkpoint = SourceCheckpoint(data_source_id=data_source.id, domain=domain)
+                db.add(checkpoint)
+                checkpoints[domain] = checkpoint
+            checkpoint.source_updated_at = source_times[domain]
+            checkpoint.source_batch_id = dataset_version
+            checkpoint.checksum = fingerprints[domain]
+            output[domain] = {
+                "domain": domain,
+                "status": "activated",
+                "records": len(fact_rows),
+                "source_data_as_of": source_times[domain].isoformat(),
+            }
+
+        # The approved live source contains no target table. Retire the old
+        # generated target facts so they cannot be mixed into live answers.
+        db.execute(
+            update(FactTarget)
+            .where(FactTarget.enterprise_id == enterprise_id, FactTarget.is_current.is_(True))
+            .values(is_current=False)
+        )
+        target_status = db.scalar(
+            select(DataDomainStatus).where(
+                DataDomainStatus.enterprise_id == enterprise_id,
+                DataDomainStatus.domain == "target",
+            )
+        )
+        if target_status is not None:
+            target_status.previous_sync_run_id = target_status.active_sync_run_id
+            target_status.active_sync_run_id = None
+            target_status.status = "not_configured"
+            target_status.record_count = 0
+            target_status.dataset_version = dataset_version
+            target_status.source_type = data_source.source_type
+            target_status.source_display_name = data_source.display_name
+            target_status.last_error_code = None
+            target_status.last_error_message = None
+        return output
+
+
 def _decimal(value: Decimal | None) -> float:
     return float(value or Decimal("0"))
 
@@ -852,12 +1043,131 @@ def rebuild_daily_snapshots(
         return len(scopes)
 
 
+def _run_data_sync_v3(
+    *,
+    enterprise_id: uuid.UUID,
+    data_source_id: uuid.UUID,
+    sync_run_id: uuid.UUID,
+    source_snapshot: dict[str, Any],
+    resolved_source: ResolvedSourceConnection,
+    validate_only: bool,
+    settings: Settings,
+) -> dict[str, Any]:
+    source_batch: dict[str, Any] | None = None
+    try:
+        with SessionLocal.begin() as db:
+            # Use a transaction-scoped advisory lock instead of SELECT FOR
+            # UPDATE on the DataSource row.  The ingestion role deliberately
+            # has no permission to mutate source configuration, while the
+            # advisory lock still serializes the complete source-read ->
+            # product-activate step for this source.
+            if db.bind is not None and db.bind.dialect.name == "postgresql":
+                db.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:scope, 0))"),
+                    {"scope": f"operating-data-v3-activation:{data_source_id}"},
+                )
+            data_source = db.scalar(
+                select(DataSource)
+                .where(
+                    DataSource.id == data_source_id,
+                    DataSource.enterprise_id == enterprise_id,
+                    DataSource.is_enabled.is_(True),
+                )
+            )
+            if data_source is None:
+                raise IngestionError("data_source_not_found", "同步期间数据源被移除")
+            with connect_source(
+                resolved_source.database_url,
+                application_name="executive-ai-ingestion-v3",
+            ) as source_connection:
+                inspection = require_valid_source_v3_contract(
+                    source_connection,
+                    expected_version=resolved_source.schema_version,
+                    schema=resolved_source.schema,
+                )
+                if resolved_source.connection_mode == "external" and not inspection.tls_active:
+                    raise SourceContractError(
+                        "source_tls_required",
+                        "客户外部脱敏源库必须使用 TLS 连接",
+                    )
+                source_batch = latest_ready_source_v3_batch(
+                    source_connection, schema=resolved_source.schema
+                )
+                rows_by_domain = materialize_source_v3_batch(
+                    source_connection,
+                    batch_id=str(source_batch["batch_id"]),
+                    schema=resolved_source.schema,
+                    page_size=settings.source_query_page_size,
+                )
+            result = activate_source_v3_batch(
+                db,
+                enterprise_id=enterprise_id,
+                data_source=data_source,
+                sync_run_id=sync_run_id,
+                source_batch=source_batch,
+                rows_by_domain=rows_by_domain,
+                validate_only=validate_only,
+            )
+        result.update(
+            {
+                "sync_run_id": str(sync_run_id),
+                "schema_version": SOURCE_V3_SCHEMA_VERSION,
+                "source_data_as_of": source_batch["source_data_as_of"].isoformat(),
+            }
+        )
+        return result
+    except Exception as exc:
+        code, message, details = v3_failure_payload(exc)
+        if not validate_only:
+            for domain in ("opportunity", "delivery", "collection"):
+                _set_domain_failure(
+                    enterprise_id=enterprise_id,
+                    data_source_id=data_source_id,
+                    domain=domain,
+                    source_type=str(source_snapshot["source_type"]),
+                    source_display_name=str(source_snapshot["display_name"]),
+                    code=code,
+                    message=message,
+                )
+        with SessionLocal.begin() as db:
+            sync_run = db.get(DataSyncRun, sync_run_id)
+            if sync_run is not None:
+                sync_run.status = "rejected" if validate_only else "failed"
+                sync_run.atomic_activation_status = "not_requested" if validate_only else "failed"
+                sync_run.completed_at = utc_now()
+                sync_run.error_code = code
+                sync_run.error_message = message[:2000]
+                sync_run.cross_table_validation_json = {
+                    "valid": False,
+                    "error_code": code,
+                    "details": details,
+                }
+                if source_batch:
+                    sync_run.dataset_version = str(source_batch.get("dataset_version") or "")
+                    sync_run.source_schema_version = SOURCE_V3_SCHEMA_VERSION
+                    sync_run.source_batch_id = str(source_batch.get("batch_id") or "")
+                    sync_run.source_data_as_of = source_batch.get("source_data_as_of")
+                    sync_run.source_schema_hashes_json = dict(
+                        source_batch.get("table_schema_sha256") or {}
+                    )
+                    sync_run.source_record_counts_json = dict(
+                        source_batch.get("record_counts") or {}
+                    )
+                    sync_run.source_content_hashes_json = dict(
+                        source_batch.get("table_content_sha256") or {}
+                    )
+        if isinstance(exc, (IngestionError, SourceContractError, OperatingDataV3Error)):
+            raise
+        raise IngestionError(code, message) from exc
+
+
 def run_data_sync(
     *,
     enterprise_id: uuid.UUID,
     data_source_id: uuid.UUID,
     job_id: uuid.UUID | None,
     trigger_type: str,
+    validate_only: bool = False,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
@@ -889,6 +1199,16 @@ def run_data_sync(
             "source_type": data_source.source_type,
             "display_name": data_source.display_name,
         }
+    if resolved_source.schema_version == SOURCE_V3_SCHEMA_VERSION:
+        return _run_data_sync_v3(
+            enterprise_id=enterprise_id,
+            data_source_id=data_source_id,
+            sync_run_id=sync_run_id,
+            source_snapshot=source_snapshot,
+            resolved_source=resolved_source,
+            validate_only=validate_only,
+            settings=settings,
+        )
     domain_results: dict[str, Any] = {}
     total_read = 0
     total_written = 0
@@ -984,62 +1304,106 @@ def run_data_sync(
                         )
                     ).all()
                 }
-            for domain, source_domain in DOMAIN_TO_SOURCE.items():
-                try:
-                    rows = _materialize_source(
+            if source_snapshot["source_type"] == "feishu_three_table":
+                live_rows = {
+                    domain: _materialize_source(
                         source_connection,
                         source_domain,
                         settings=settings,
                         schema=resolved_source.schema,
                     )
-                    total_read += len(rows)
-                    fingerprint = source_domain_fingerprint(rows)
-                    with SessionLocal() as db:
-                        data_source = db.scalar(
-                            select(DataSource).where(
-                                DataSource.id == source_snapshot["id"],
-                                DataSource.enterprise_id == source_snapshot["enterprise_id"],
-                                DataSource.is_enabled.is_(True),
-                            )
-                        )
-                        if data_source is None:
-                            raise IngestionError("data_source_not_found", "同步期间数据源被移除")
-                        result = _activate_domain(
-                            enterprise_id=enterprise_id,
-                            data_source=data_source,
-                            sync_run_id=sync_run_id,
-                            domain=domain,
-                            rows=rows,
-                            organization_map=organization_map,
-                            people_map=people_map,
-                            customer_map=customer_map,
-                            dataset_version=dataset_version,
-                            source_data_as_of=max(
-                                (row["source_updated_at"] for row in rows),
-                                default=source_data_as_of,
-                            ),
-                            fingerprint=fingerprint,
-                        )
-                    domain_results[domain] = result
-                    if result["status"] == "activated":
-                        total_written += int(result["records"])
-                except Exception as exc:
-                    code = getattr(exc, "code", "domain_sync_failed")
-                    domain_results[domain] = {
-                        "domain": domain,
-                        "status": "failed",
-                        "error_code": code,
-                        "error_message": str(exc),
-                    }
-                    _set_domain_failure(
-                        enterprise_id=enterprise_id,
-                        data_source_id=data_source_id,
-                        domain=domain,
-                        source_type=str(source_snapshot["source_type"]),
-                        source_display_name=str(source_snapshot["display_name"]),
-                        code=code,
-                        message=str(exc),
+                    for domain, source_domain in (
+                        ("opportunity", "opportunities"),
+                        ("delivery", "deliveries"),
+                        ("collection", "collections"),
                     )
+                }
+                total_read += sum(len(rows) for rows in live_rows.values())
+                with SessionLocal() as db:
+                    data_source = db.scalar(
+                        select(DataSource).where(
+                            DataSource.id == source_snapshot["id"],
+                            DataSource.enterprise_id == source_snapshot["enterprise_id"],
+                            DataSource.is_enabled.is_(True),
+                        )
+                    )
+                    if data_source is None:
+                        raise IngestionError("data_source_not_found", "同步期间数据源被移除")
+                    domain_results = _activate_live_domains_atomically(
+                        enterprise_id=enterprise_id,
+                        data_source=data_source,
+                        sync_run_id=sync_run_id,
+                        rows_by_domain=live_rows,
+                        organization_map=organization_map,
+                        people_map=people_map,
+                        customer_map=customer_map,
+                        dataset_version=dataset_version,
+                        fallback_source_data_as_of=source_data_as_of,
+                    )
+                total_written += sum(
+                    int(result["records"])
+                    for result in domain_results.values()
+                    if result["status"] == "activated"
+                )
+            else:
+                for domain, source_domain in DOMAIN_TO_SOURCE.items():
+                    try:
+                        rows = _materialize_source(
+                            source_connection,
+                            source_domain,
+                            settings=settings,
+                            schema=resolved_source.schema,
+                        )
+                        total_read += len(rows)
+                        fingerprint = source_domain_fingerprint(rows)
+                        with SessionLocal() as db:
+                            data_source = db.scalar(
+                                select(DataSource).where(
+                                    DataSource.id == source_snapshot["id"],
+                                    DataSource.enterprise_id == source_snapshot["enterprise_id"],
+                                    DataSource.is_enabled.is_(True),
+                                )
+                            )
+                            if data_source is None:
+                                raise IngestionError(
+                                    "data_source_not_found", "同步期间数据源被移除"
+                                )
+                            result = _activate_domain(
+                                enterprise_id=enterprise_id,
+                                data_source=data_source,
+                                sync_run_id=sync_run_id,
+                                domain=domain,
+                                rows=rows,
+                                organization_map=organization_map,
+                                people_map=people_map,
+                                customer_map=customer_map,
+                                dataset_version=dataset_version,
+                                source_data_as_of=max(
+                                    (row["source_updated_at"] for row in rows),
+                                    default=source_data_as_of,
+                                ),
+                                fingerprint=fingerprint,
+                            )
+                        domain_results[domain] = result
+                        if result["status"] == "activated":
+                            total_written += int(result["records"])
+                    except Exception as exc:
+                        code = getattr(exc, "code", "domain_sync_failed")
+                        domain_results[domain] = {
+                            "domain": domain,
+                            "status": "failed",
+                            "error_code": code,
+                            "error_message": str(exc),
+                        }
+                        _set_domain_failure(
+                            enterprise_id=enterprise_id,
+                            data_source_id=data_source_id,
+                            domain=domain,
+                            source_type=str(source_snapshot["source_type"]),
+                            source_display_name=str(source_snapshot["display_name"]),
+                            code=code,
+                            message=str(exc),
+                        )
             successful = [
                 result
                 for result in domain_results.values()
@@ -1052,9 +1416,14 @@ def run_data_sync(
                     dataset_version=dataset_version,
                     source_data_as_of=source_data_as_of,
                 )
+            expected_domain_count = (
+                3
+                if source_snapshot["source_type"] == "feishu_three_table"
+                else len(DOMAIN_TO_SOURCE)
+            )
             overall_status = (
                 "completed"
-                if len(successful) == len(DOMAIN_TO_SOURCE)
+                if len(successful) == expected_domain_count
                 else "partial"
                 if successful
                 else "failed"
@@ -1091,6 +1460,17 @@ def run_data_sync(
             }
     except Exception as exc:
         code = getattr(exc, "code", "source_sync_failed")
+        if source_snapshot["source_type"] == "feishu_three_table":
+            for domain in ("opportunity", "delivery", "collection"):
+                _set_domain_failure(
+                    enterprise_id=enterprise_id,
+                    data_source_id=data_source_id,
+                    domain=domain,
+                    source_type=str(source_snapshot["source_type"]),
+                    source_display_name=str(source_snapshot["display_name"]),
+                    code=code,
+                    message=str(exc),
+                )
         with SessionLocal.begin() as db:
             sync_run = db.get(DataSyncRun, sync_run_id)
             if sync_run is not None:
@@ -1108,8 +1488,24 @@ def run_data_sync(
         raise IngestionError(code, str(exc)) from exc
 
 
+def _job_requests_validation_only(payload: dict[str, Any]) -> bool:
+    """Accept both current and legacy validation-only job contracts.
+
+    Validation is fail-safe: either supported field can request it, so a mixed
+    payload can never turn an explicitly non-activating job into an activation.
+    """
+
+    explicit = payload.get("validation_only")
+    explicit_validation = explicit is True or (
+        isinstance(explicit, str) and explicit.strip().lower() in {"true", "1", "yes"}
+    )
+    legacy_validation = str(payload.get("operation") or "").strip().lower() == "validate"
+    return explicit_validation or legacy_validation
+
+
 def run_data_sync_job(job: Job, settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
+    validate_only = _job_requests_validation_only(job.payload_json)
     try:
         data_source_id = uuid.UUID(str(job.payload_json["data_source_id"]))
     except (KeyError, ValueError) as exc:
@@ -1127,6 +1523,126 @@ def run_data_sync_job(job: Job, settings: Settings | None = None) -> dict[str, A
         resolved_source = resolve_source_connection(db, data_source, settings)
         source_type = data_source.source_type
     feishu_result = None
+    if (
+        settings.app_env == "local-demo"
+        and source_type == "feishu_three_table"
+        and settings.feishu_app_id
+        and settings.feishu_runtime_secret
+        and settings.source_writer_database_url
+    ):
+        writer_url = settings.source_writer_database_url.get_secret_value()
+        if _database_target_identity(writer_url) != _database_target_identity(
+            resolved_source.database_url
+        ):
+            raise IngestionError(
+                "source_writer_target_mismatch",
+                "飞书三表写入库与当前 DataSource 读取库不一致",
+            )
+        try:
+            bindings = fixed_bindings_from_settings(settings)
+            snapshot = fetch_fixed_live_snapshot_from_settings(
+                settings,
+                app_secret=settings.feishu_runtime_secret.get_secret_value(),
+            )
+            feishu_result = write_live_snapshot_to_source(
+                snapshot,
+                source_writer_database_url=writer_url,
+                dataset_version=f"feishu-live-{snapshot.content_sha256[:16]}",
+                schema=resolved_source.schema,
+                schema_version=resolved_source.schema_version,
+                bindings=bindings,
+            )
+        except Exception as exc:
+            code = str(getattr(exc, "code", "feishu_live_sync_failed"))
+            rejection_persisted = False
+            rejection_persist_error: str | None = None
+            if (
+                resolved_source.schema_version == SOURCE_V3_SCHEMA_VERSION
+                and settings.source_writer_database_url
+            ):
+                rejected_at = utc_now()
+                rejected_batch_id = f"feishu-v3-rejected-{job.id}"
+                rejected_hash = hashlib.sha256(
+                    f"{job.id}:{code}".encode()
+                ).hexdigest()
+                try:
+                    with connect_source(
+                        settings.source_writer_database_url.get_secret_value(),
+                        application_name="executive-ai-feishu-v3-rejection-audit",
+                        read_only=False,
+                    ) as source_connection:
+                        require_valid_source_v3_contract(
+                            source_connection,
+                            expected_version=SOURCE_V3_SCHEMA_VERSION,
+                            schema=resolved_source.schema,
+                            require_read_only=False,
+                        )
+                        record_rejected_source_v3_batch(
+                            source_connection,
+                            batch_id=rejected_batch_id,
+                            dataset_version=f"rejected-{rejected_at:%Y%m%d}",
+                            source_data_as_of=rejected_at,
+                            content_sha256=rejected_hash,
+                            issues=(
+                                {
+                                    "severity": "error",
+                                    "domain": str(
+                                        (getattr(exc, "details", {}) or {}).get("domain")
+                                        or "batch"
+                                    ),
+                                    "source_record_id": (
+                                        (getattr(exc, "details", {}) or {}).get("record_id")
+                                    ),
+                                    "field_name": (
+                                        (getattr(exc, "details", {}) or {}).get("field_name")
+                                    ),
+                                    "error_code": code,
+                                    "message": str(exc),
+                                    "details": getattr(exc, "details", {}) or {},
+                                },
+                            ),
+                            schema=resolved_source.schema,
+                        )
+                    rejection_persisted = True
+                except Exception as persist_exc:  # preserve the primary source failure
+                    rejection_persist_error = type(persist_exc).__name__
+            with SessionLocal.begin() as db:
+                db.add(
+                    DataSyncRun(
+                        enterprise_id=job.enterprise_id,
+                        data_source_id=data_source_id,
+                        job_id=job.id,
+                        trigger_type=str(job.payload_json.get("trigger_type", "manual")),
+                        status="rejected",
+                        source_schema_version=resolved_source.schema_version,
+                        started_at=utc_now(),
+                        completed_at=utc_now(),
+                        records_rejected=1,
+                        activation_mode="all_three_atomic",
+                        atomic_activation_status="failed",
+                        cross_table_validation_json={
+                            "valid": False,
+                            "stage": "feishu_extract_or_validate",
+                            "error_code": code,
+                            "details": getattr(exc, "details", {}),
+                            "source_rejection_persisted": rejection_persisted,
+                            "source_rejection_persist_error": rejection_persist_error,
+                        },
+                        error_code=code,
+                        error_message=str(exc)[:2000],
+                    )
+                )
+            for domain in ("opportunity", "delivery", "collection"):
+                _set_domain_failure(
+                    enterprise_id=job.enterprise_id,
+                    data_source_id=data_source_id,
+                    domain=domain,
+                    source_type=source_type,
+                    source_display_name=data_source.display_name,
+                    code=code,
+                    message=str(exc),
+                )
+            raise IngestionError(code, str(exc)) from exc
     if (
         settings.app_env == "local-demo"
         and source_type in {"simulated_generator", "simulated_feishu"}
@@ -1162,8 +1678,20 @@ def run_data_sync_job(job: Job, settings: Settings | None = None) -> dict[str, A
         data_source_id=data_source_id,
         job_id=job.id,
         trigger_type=str(job.payload_json.get("trigger_type", "manual")),
+        validate_only=validate_only,
         settings=settings,
     )
+    if (
+        resolved_source.schema_version == SOURCE_V3_SCHEMA_VERSION
+        and not validate_only
+        and settings.source_writer_database_url
+        and result.get("source_batch_id")
+    ):
+        mark_source_v3_batch_activated(
+            source_writer_database_url=settings.source_writer_database_url.get_secret_value(),
+            batch_id=str(result["source_batch_id"]),
+            schema=resolved_source.schema,
+        )
     if feishu_result is not None:
         result["feishu_import"] = feishu_result
     return result

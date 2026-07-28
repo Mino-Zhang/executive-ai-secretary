@@ -5,21 +5,25 @@ from collections.abc import Callable
 from datetime import date
 from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import case, func, or_, select
+from sqlalchemy.orm import Session, aliased
 
 from .capabilities import CapabilityClaims, CapabilityError
 from .config import get_settings
 from .data_freshness import effective_domain_status
-from .mcp_registry import effective_tool
+from .mcp_registry import effective_tool, registered_spec
 from .models import (
     DailySnapshot,
     DataDomainStatus,
+    DataSyncRun,
     DimCustomer,
+    DimPerson,
     FactDelivery,
     FactFinanceCollection,
     FactOpportunity,
-    FactTarget,
+    FactOpportunityParticipant,
+    FactOpportunityProduct,
+    OpportunityExperienceWeightPolicy,
     OrganizationUnit,
 )
 
@@ -28,7 +32,230 @@ def _number(value: Any) -> float:
     return float(value or 0)
 
 
-_REVENUE_TARGET_CODES = {"revenue", "signed_revenue", "quarterly_revenue"}
+_DEFAULT_EXPERIENCE_WEIGHTS = {"high": 0.20, "medium": 0.10, "low": 0.05}
+_RELIABILITY_ALIASES = {
+    "高": "high",
+    "high": "high",
+    "中": "medium",
+    "medium": "medium",
+    "低": "low",
+    "low": "low",
+}
+
+
+def _bounded_limit(arguments: dict[str, Any], *, default: int = 50) -> int:
+    try:
+        return min(max(int(arguments.get("limit", default)), 1), 100)
+    except (TypeError, ValueError) as exc:
+        raise CapabilityError("limit is malformed") from exc
+
+
+def _normalized_reliability(value: Any) -> str:
+    return _RELIABILITY_ALIASES.get(str(value or "").strip().lower(), "")
+
+
+def _normalized_reliability_values(arguments: dict[str, Any]) -> list[str]:
+    values = _list_argument(arguments, "reliability_levels")
+    normalized = [_normalized_reliability(value) for value in values]
+    if any(not value for value in normalized):
+        raise CapabilityError("reliability_levels is malformed")
+    return list(dict.fromkeys(normalized))
+
+
+def _status_expression() -> Any:
+    return func.coalesce(FactOpportunity.status_code, FactOpportunity.status)
+
+
+def _stage_expression() -> Any:
+    return func.coalesce(FactOpportunity.stage_label, FactOpportunity.stage)
+
+
+def _signed_amount_expression() -> Any:
+    return case(
+        (
+            _status_expression() == "won",
+            func.coalesce(FactOpportunity.signed_amount, FactOpportunity.expected_amount),
+        ),
+        else_=0,
+    )
+
+
+def _active_experience_weight_policy(
+    db: Session, enterprise_id: uuid.UUID
+) -> tuple[dict[str, float], dict[str, Any]]:
+    policy = db.scalar(
+        select(OpportunityExperienceWeightPolicy)
+        .where(
+            OpportunityExperienceWeightPolicy.enterprise_id == enterprise_id,
+            OpportunityExperienceWeightPolicy.is_active.is_(True),
+        )
+        .order_by(
+            OpportunityExperienceWeightPolicy.activated_at.desc(),
+            OpportunityExperienceWeightPolicy.created_at.desc(),
+        )
+        .limit(1)
+    )
+    if policy is None:
+        return dict(_DEFAULT_EXPERIENCE_WEIGHTS), {
+            "version": "v1-default",
+            "label": "保守经验权重（默认）",
+            "weights": dict(_DEFAULT_EXPERIENCE_WEIGHTS),
+            "observation_window_days": 90,
+            "source": "system_default",
+        }
+    weights: dict[str, float] = {}
+    for level in ("high", "medium", "low"):
+        try:
+            value = float(policy.weights_json[level])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CapabilityError("active experience weight policy is malformed") from exc
+        if value < 0 or value > 1:
+            raise CapabilityError("active experience weight policy is malformed")
+        weights[level] = value
+    return weights, {
+        "id": str(policy.id),
+        "version": policy.version,
+        "label": policy.label,
+        "weights": weights,
+        "observation_window_days": policy.observation_window_days,
+        "source": "enterprise_configuration",
+    }
+
+
+def _experience_weight_expression(weights: dict[str, float]) -> Any:
+    return case(
+        (
+            func.lower(FactOpportunity.reliability_level).in_(["高", "high"]),
+            weights["high"],
+        ),
+        (
+            func.lower(FactOpportunity.reliability_level).in_(["中", "medium"]),
+            weights["medium"],
+        ),
+        (
+            func.lower(FactOpportunity.reliability_level).in_(["低", "low"]),
+            weights["low"],
+        ),
+        else_=0,
+    )
+
+
+def _atomic_batch_identity(
+    db: Session, claims: CapabilityClaims, *, required: bool = False
+) -> dict[str, Any] | None:
+    domains = {"opportunity", "delivery", "collection"}
+    rows = db.scalars(
+        select(DataDomainStatus).where(
+            DataDomainStatus.enterprise_id == claims.enterprise_id,
+            DataDomainStatus.domain.in_(domains),
+        )
+    ).all()
+    if not rows and not required:
+        return None
+    by_domain = {row.domain: row for row in rows}
+    sync_run_ids = {
+        str(by_domain[domain].active_sync_run_id)
+        for domain in domains
+        if domain in by_domain and by_domain[domain].active_sync_run_id is not None
+    }
+    source_batch_ids = {
+        str(by_domain[domain].current_source_batch_id)
+        for domain in domains
+        if domain in by_domain and by_domain[domain].current_source_batch_id
+    }
+    contract_versions = {
+        str(by_domain[domain].contract_version)
+        for domain in domains
+        if domain in by_domain and by_domain[domain].contract_version
+    }
+    is_v3 = "3.0" in contract_versions
+    if set(by_domain) != domains or len(sync_run_ids) != 1:
+        raise CapabilityError("operating data domains are not on one atomic batch")
+    if is_v3 and (len(source_batch_ids) != 1 or contract_versions != {"3.0"}):
+        raise CapabilityError("operating data domains are not on one atomic batch")
+    source_times = [
+        by_domain[domain].source_data_as_of
+        for domain in domains
+        if by_domain[domain].source_data_as_of is not None
+    ]
+    return {
+        "source_batch_id": next(iter(source_batch_ids), None),
+        "sync_run_id": next(iter(sync_run_ids)),
+        "contract_version": next(iter(contract_versions), "2.0"),
+        # The oldest domain timestamp is the conservative common cutoff for a
+        # cross-domain answer; individual timestamps remain in freshness.
+        "source_data_as_of": min(source_times).isoformat() if source_times else None,
+    }
+
+
+def _opportunity_dimension_filters(
+    arguments: dict[str, Any],
+) -> tuple[list[Any], dict[str, Any]]:
+    filters: list[Any] = []
+    applied: dict[str, Any] = {}
+    reliability_levels = _normalized_reliability_values(arguments)
+    if reliability_levels:
+        database_values: list[str] = []
+        for level in reliability_levels:
+            database_values.extend(
+                {
+                    "high": ["高", "high"],
+                    "medium": ["中", "medium"],
+                    "low": ["低", "low"],
+                }[level]
+            )
+        filters.append(func.lower(FactOpportunity.reliability_level).in_(database_values))
+        applied["reliability_levels"] = reliability_levels
+
+    for argument_key, column in (
+        ("customer_value_levels", FactOpportunity.customer_value_level),
+        ("industries", FactOpportunity.industry),
+    ):
+        values = _list_argument(arguments, argument_key)
+        if values:
+            filters.append(column.in_(values))
+            applied[argument_key] = values
+
+    product_services = _list_argument(arguments, "product_services")
+    if product_services:
+        product_filters = [
+            FactOpportunityProduct.normalized_product_name.ilike(f"%{value[:120]}%")
+            for value in product_services
+        ]
+        filters.append(
+            FactOpportunity.id.in_(
+                select(FactOpportunityProduct.opportunity_id).where(or_(*product_filters))
+            )
+        )
+        applied["product_services"] = product_services
+
+    for argument_key, role in (
+        ("sales_owner_query", "sales"),
+        ("presales_owner_query", "pre_sales"),
+    ):
+        query = str(arguments.get(argument_key) or "").strip()
+        if not query:
+            continue
+        participant_ids = (
+            select(FactOpportunityParticipant.opportunity_id)
+            .join(DimPerson, DimPerson.id == FactOpportunityParticipant.person_id)
+            .where(
+                FactOpportunityParticipant.participant_role == role,
+                DimPerson.display_name.ilike(f"%{query[:120]}%"),
+            )
+        )
+        if role == "sales":
+            owner_ids = select(DimPerson.id).where(DimPerson.display_name.ilike(f"%{query[:120]}%"))
+            filters.append(
+                or_(
+                    FactOpportunity.owner_person_id.in_(owner_ids),
+                    FactOpportunity.id.in_(participant_ids),
+                )
+            )
+        else:
+            filters.append(FactOpportunity.id.in_(participant_ids))
+        applied[argument_key] = query[:120]
+    return filters, applied
 
 
 def _period_filters(arguments: dict[str, Any], column: Any) -> list[Any]:
@@ -52,76 +279,6 @@ def _list_argument(arguments: dict[str, Any], key: str) -> list[str]:
     if not isinstance(value, list):
         raise CapabilityError(f"{key} is malformed")
     return [str(item).strip() for item in value[:20] if str(item).strip()]
-
-
-def _target_actual(
-    db: Session,
-    claims: CapabilityClaims,
-    organization_ids: set[uuid.UUID],
-    *,
-    metric_code: str,
-    period_start: date,
-    period_end: date,
-) -> tuple[float | None, str]:
-    """Return a period- and scope-matched actual for a standard target metric."""
-
-    if metric_code == "collection":
-        value = db.scalar(
-            select(func.sum(FactFinanceCollection.collected_amount)).where(
-                FactFinanceCollection.enterprise_id == claims.enterprise_id,
-                FactFinanceCollection.organization_unit_id.in_(organization_ids),
-                FactFinanceCollection.is_current.is_(True),
-                FactFinanceCollection.actual_collection_date >= period_start,
-                FactFinanceCollection.actual_collection_date <= period_end,
-            )
-        )
-        return _number(value), "sum(collected_amount) by actual_collection_date in target period"
-
-    if metric_code in _REVENUE_TARGET_CODES:
-        value = db.scalar(
-            select(func.sum(FactOpportunity.expected_amount)).where(
-                FactOpportunity.enterprise_id == claims.enterprise_id,
-                FactOpportunity.organization_unit_id.in_(organization_ids),
-                FactOpportunity.is_current.is_(True),
-                FactOpportunity.status == "won",
-                FactOpportunity.closed_date >= period_start,
-                FactOpportunity.closed_date <= period_end,
-            )
-        )
-        return _number(value), "sum(won expected_amount) by closed_date in target period"
-
-    if metric_code == "gross_profit":
-        value = db.scalar(
-            select(func.sum(FactOpportunity.expected_gross_profit)).where(
-                FactOpportunity.enterprise_id == claims.enterprise_id,
-                FactOpportunity.organization_unit_id.in_(organization_ids),
-                FactOpportunity.is_current.is_(True),
-                FactOpportunity.status == "won",
-                FactOpportunity.closed_date >= period_start,
-                FactOpportunity.closed_date <= period_end,
-            )
-        )
-        return _number(value), "sum(won expected_gross_profit) by closed_date in target period"
-
-    if metric_code == "weighted_pipeline":
-        value = db.scalar(
-            select(
-                func.sum(FactOpportunity.expected_amount * FactOpportunity.probability / 100)
-            ).where(
-                FactOpportunity.enterprise_id == claims.enterprise_id,
-                FactOpportunity.organization_unit_id.in_(organization_ids),
-                FactOpportunity.is_current.is_(True),
-                FactOpportunity.status.in_(["active", "stalled"]),
-                FactOpportunity.expected_close_date >= period_start,
-                FactOpportunity.expected_close_date <= period_end,
-            )
-        )
-        return _number(value), (
-            "sum(expected_amount * probability / 100) for active opportunities "
-            "by expected_close_date in target period"
-        )
-
-    return None, "no standard actual definition for this metric"
 
 
 def _aggregate_evidence(
@@ -167,15 +324,16 @@ def _freshness(db: Session, claims: CapabilityClaims, domains: set[str]) -> list
     return [
         {
             "domain": row.domain,
-            "status": effective_domain_status(
-                row, get_settings().data_stale_after_hours
-            ),
+            "status": effective_domain_status(row, get_settings().data_stale_after_hours),
             "source_type": row.source_type,
             "source_display_name": row.source_display_name,
             "source_data_as_of": (
                 row.source_data_as_of.isoformat() if row.source_data_as_of else None
             ),
             "dataset_version": row.dataset_version,
+            "source_batch_id": row.current_source_batch_id,
+            "sync_run_id": str(row.active_sync_run_id) if row.active_sync_run_id else None,
+            "contract_version": row.contract_version,
             "last_error": row.last_error_message,
         }
         for row in rows
@@ -233,14 +391,20 @@ def get_overall_business(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    weights, weight_policy = _active_experience_weight_policy(db, claims.enterprise_id)
+    weight_expression = _experience_weight_expression(weights)
+    status_expression = _status_expression()
     opportunity_filters = _period_filters(arguments, FactOpportunity.expected_close_date)
     delivery_filters = _period_filters(arguments, FactDelivery.planned_end_date)
     collection_filters = _period_filters(arguments, FactFinanceCollection.planned_collection_date)
     opportunity = db.execute(
         select(
             func.count(FactOpportunity.id),
-            func.sum(FactOpportunity.expected_amount),
-            func.sum(FactOpportunity.expected_amount * FactOpportunity.probability / 100),
+            func.sum(FactOpportunity.expected_amount).filter(status_expression == "active"),
+            func.sum(FactOpportunity.expected_amount * weight_expression).filter(
+                status_expression == "active"
+            ),
+            func.sum(_signed_amount_expression()),
         ).where(
             FactOpportunity.enterprise_id == claims.enterprise_id,
             FactOpportunity.organization_unit_id.in_(organization_ids),
@@ -252,6 +416,8 @@ def get_overall_business(
         select(
             func.count(FactDelivery.id),
             func.count(FactDelivery.id).filter(FactDelivery.risk_level != "normal"),
+            func.sum(FactDelivery.contract_amount),
+            func.sum(FactDelivery.recognized_revenue),
         ).where(
             FactDelivery.enterprise_id == claims.enterprise_id,
             FactDelivery.organization_unit_id.in_(organization_ids),
@@ -274,17 +440,27 @@ def get_overall_business(
             *collection_filters,
         )
     ).one()
+    atomic_batch = _atomic_batch_identity(db, claims)
     return _result(
         db,
         claims,
         tool="get_overall_business",
-        domains={"opportunity", "delivery", "collection", "target"},
+        domains={"opportunity", "delivery", "collection"},
         data={
+            "atomic_batch_id": atomic_batch["source_batch_id"] if atomic_batch else None,
+            "source_batch_id": atomic_batch["source_batch_id"] if atomic_batch else None,
+            "sync_run_id": atomic_batch["sync_run_id"] if atomic_batch else None,
+            "contract_version": atomic_batch["contract_version"] if atomic_batch else None,
+            "source_data_as_of": atomic_batch["source_data_as_of"] if atomic_batch else None,
             "opportunity_count": int(opportunity[0] or 0),
-            "pipeline_amount": _number(opportunity[1]),
-            "weighted_pipeline_amount": _number(opportunity[2]),
+            "active_pipeline_amount": _number(opportunity[1]),
+            "experience_weighted_pipeline_amount": _number(opportunity[2]),
+            "signed_amount": _number(opportunity[3]),
+            "experience_weight_policy": weight_policy,
             "delivery_count": int(delivery[0] or 0),
             "delivery_attention_count": int(delivery[1] or 0),
+            "contract_amount": _number(delivery[2]),
+            "recognized_revenue": _number(delivery[3]),
             "receivable_amount": _number(collection[0]),
             "collected_amount": _number(collection[1]),
             "outstanding_amount": _number(collection[2]),
@@ -295,8 +471,16 @@ def get_overall_business(
                 domain="opportunity",
                 metrics=[
                     ("opportunity_count", "count(source_record_id)"),
-                    ("pipeline_amount", "sum(expected_amount)"),
-                    ("weighted_pipeline_amount", "sum(expected_amount * probability / 100)"),
+                    ("active_pipeline_amount", "sum(expected_amount where status_code = active)"),
+                    (
+                        "experience_weighted_pipeline_amount",
+                        "sum(expected_amount * configured experience weight) "
+                        "where status_code = active",
+                    ),
+                    (
+                        "signed_amount",
+                        "sum(coalesce(signed_amount, expected_amount) where status_code = won)",
+                    ),
                 ],
                 organization_ids=organization_ids,
             ),
@@ -305,6 +489,8 @@ def get_overall_business(
                 metrics=[
                     ("delivery_count", "count(source_record_id)"),
                     ("delivery_attention_count", "count(risk_level != normal)"),
+                    ("contract_amount", "sum(contract_amount)"),
+                    ("recognized_revenue", "sum(recognized_revenue)"),
                 ],
                 organization_ids=organization_ids,
             ),
@@ -318,6 +504,12 @@ def get_overall_business(
                 ],
                 organization_ids=organization_ids,
             ),
+            {
+                "domain": "metric_policy",
+                "metric": "experience_weighted_pipeline_amount",
+                "calculation": "configured high/medium/low experience weights",
+                "policy": weight_policy,
+            },
         ],
         organization_ids=organization_ids,
     )
@@ -327,122 +519,25 @@ def get_target_completion(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
-    target_filters = [
-        FactTarget.enterprise_id == claims.enterprise_id,
-        FactTarget.organization_unit_id.in_(organization_ids),
-        FactTarget.is_current.is_(True),
-    ]
-    period_type = arguments.get("period_type")
-    if period_type is not None:
-        period_type = str(period_type).strip()
-        if not period_type:
-            raise CapabilityError("target period type is malformed")
-        target_filters.append(FactTarget.period_type == period_type)
-
-    requested_period_start = arguments.get("period_start")
-    if requested_period_start:
-        try:
-            resolved_period_start = date.fromisoformat(str(requested_period_start))
-        except ValueError as exc:
-            raise CapabilityError("target period start is malformed") from exc
-    else:
-        resolved_period_start = db.scalar(
-            select(func.max(FactTarget.period_start)).where(*target_filters)
-        )
-    if resolved_period_start is not None:
-        target_filters.append(FactTarget.period_start == resolved_period_start)
-
-    statement = select(
-        FactTarget.metric_code,
-        FactTarget.metric_name,
-        FactTarget.unit,
-        FactTarget.period_type,
-        FactTarget.period_start,
-        FactTarget.period_end,
-        func.sum(FactTarget.target_value),
-    ).where(*target_filters)
-    rows = db.execute(
-        statement.group_by(
-            FactTarget.metric_code,
-            FactTarget.metric_name,
-            FactTarget.unit,
-            FactTarget.period_type,
-            FactTarget.period_start,
-            FactTarget.period_end,
-        ).order_by(FactTarget.period_start.desc(), FactTarget.period_type, FactTarget.metric_code)
-    ).all()
-    metrics = []
-    actual_cache: dict[tuple[str, date, date], tuple[float | None, str]] = {}
-    for code, name, unit, row_period_type, row_period_start, row_period_end, target in rows:
-        target_value = _number(target)
-        cache_key = (str(code), row_period_start, row_period_end)
-        actual, actual_calculation = actual_cache.setdefault(
-            cache_key,
-            _target_actual(
-                db,
-                claims,
-                organization_ids,
-                metric_code=str(code),
-                period_start=row_period_start,
-                period_end=row_period_end,
-            ),
-        )
-        metrics.append(
-            {
-                "metric_code": code,
-                "metric_name": name,
-                "unit": unit,
-                "period_type": row_period_type,
-                "period_start": row_period_start.isoformat(),
-                "period_end": row_period_end.isoformat(),
-                "target": target_value,
-                "actual": actual,
-                "completion_rate": actual / target_value
-                if actual is not None and target_value
-                else None,
-                "actual_calculation": actual_calculation,
-            }
-        )
-    domains = {"target"}
-    references: list[dict[str, Any]] = []
-    for item in metrics:
-        period_filters = {
-            "is_current": True,
-            "period_type": item["period_type"],
-            "period_start": item["period_start"],
-            "period_end": item["period_end"],
-        }
-        references.append(
-            {
-                "domain": "target",
-                "metric": f"{item['metric_code']}:target",
-                "calculation": "sum(target_value)",
-                "grouping": "metric_code, period_type, period_start, period_end",
-                "organization_unit_ids": sorted(str(value) for value in organization_ids),
-                "filters": period_filters,
-            }
-        )
-        if item["actual"] is None:
-            continue
-        actual_domain = "collection" if item["metric_code"] == "collection" else "opportunity"
-        domains.add(actual_domain)
-        references.append(
-            {
-                "domain": actual_domain,
-                "metric": f"{item['metric_code']}:actual",
-                "calculation": item["actual_calculation"],
-                "grouping": None,
-                "organization_unit_ids": sorted(str(value) for value in organization_ids),
-                "filters": period_filters,
-            }
-        )
     return _result(
         db,
         claims,
         tool="get_target_completion",
-        domains=domains,
-        data={"metrics": metrics},
-        references=references,
+        domains={"target"},
+        data={
+            "availability": "not_configured",
+            "message": "目标数据尚未接入",
+            "metrics": [],
+        },
+        references=[
+            {
+                "domain": "target",
+                "metric": "availability",
+                "calculation": "target domain configuration status",
+                "status": "not_configured",
+                "organization_unit_ids": sorted(str(value) for value in organization_ids),
+            }
+        ],
         organization_ids=organization_ids,
     )
 
@@ -451,16 +546,31 @@ def get_opportunity_funnel(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
+    weights, weight_policy = _active_experience_weight_policy(db, claims.enterprise_id)
+    status_expression = _status_expression()
+    stage_expression = _stage_expression()
     filters = _period_filters(arguments, FactOpportunity.expected_close_date)
     statuses = _list_argument(arguments, "statuses")
     if statuses:
-        filters.append(FactOpportunity.status.in_(statuses))
+        filters.append(status_expression.in_(statuses))
+    dimension_filters, applied_filters = _opportunity_dimension_filters(arguments)
+    filters.extend(dimension_filters)
+    weight_expression = _experience_weight_expression(weights)
     rows = db.execute(
         select(
-            FactOpportunity.stage,
+            stage_expression,
             func.count(FactOpportunity.id),
             func.sum(FactOpportunity.expected_amount),
-            func.sum(FactOpportunity.expected_amount * FactOpportunity.probability / 100),
+            func.sum(
+                case(
+                    (
+                        status_expression == "active",
+                        FactOpportunity.expected_amount * weight_expression,
+                    ),
+                    else_=0,
+                )
+            ),
+            func.sum(_signed_amount_expression()),
         )
         .where(
             FactOpportunity.enterprise_id == claims.enterprise_id,
@@ -468,7 +578,7 @@ def get_opportunity_funnel(
             FactOpportunity.is_current.is_(True),
             *filters,
         )
-        .group_by(FactOpportunity.stage)
+        .group_by(stage_expression)
         .order_by(func.sum(FactOpportunity.expected_amount).desc())
     ).all()
     return _result(
@@ -482,17 +592,44 @@ def get_opportunity_funnel(
                     "stage": stage,
                     "count": int(count),
                     "amount": _number(amount),
-                    "weighted_amount": _number(weighted),
+                    "experience_weighted_amount": _number(weighted),
+                    "signed_amount": _number(signed),
                 }
-                for stage, count, amount, weighted in rows
-            ]
+                for stage, count, amount, weighted, signed in rows
+            ],
+            "experience_weight_policy": weight_policy,
+            "applied_filters": {
+                **applied_filters,
+                **({"statuses": statuses} if statuses else {}),
+            },
         },
-        references=_aggregate_evidence(
-            domain="opportunity",
-            metrics=[("stage_funnel", "count and sum by stage")],
-            organization_ids=organization_ids,
-            grouping="stage",
-        ),
+        references=[
+            {
+                **_aggregate_evidence(
+                    domain="opportunity",
+                    metrics=[
+                        (
+                            "stage_funnel",
+                            "count, sum(expected_amount), experience-weighted active "
+                            "amount and won signed amount by stage_label",
+                        )
+                    ],
+                    organization_ids=organization_ids,
+                    grouping="stage_label",
+                )[0],
+                "filters": {
+                    "is_current": True,
+                    **applied_filters,
+                    **({"statuses": statuses} if statuses else {}),
+                },
+            },
+            {
+                "domain": "metric_policy",
+                "metric": "experience_weighted_amount",
+                "calculation": "configured high/medium/low experience weights",
+                "policy": weight_policy,
+            },
+        ],
         organization_ids=organization_ids,
     )
 
@@ -501,26 +638,45 @@ def get_sales_forecast(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
-    statuses = _list_argument(arguments, "statuses") or ["active", "stalled"]
-    try:
-        minimum_probability = min(max(int(arguments.get("min_probability", 0)), 0), 100)
-    except (TypeError, ValueError) as exc:
-        raise CapabilityError("min_probability is malformed") from exc
+    weights, weight_policy = _active_experience_weight_policy(db, claims.enterprise_id)
+    status_expression = _status_expression()
+    weight_expression = _experience_weight_expression(weights)
+    reliability_levels = _normalized_reliability_values(arguments)
     filters = [
-        FactOpportunity.status.in_(statuses),
-        FactOpportunity.probability >= minimum_probability,
+        status_expression == "active",
         *_period_filters(arguments, FactOpportunity.expected_close_date),
     ]
-    limit = min(max(int(arguments.get("limit", 50)), 1), 100)
-    weighted_forecast = _number(
+    if reliability_levels:
+        database_values: list[str] = []
+        for level in reliability_levels:
+            database_values.extend(
+                {
+                    "high": ["高", "high"],
+                    "medium": ["中", "medium"],
+                    "low": ["低", "low"],
+                }[level]
+            )
+        filters.append(func.lower(FactOpportunity.reliability_level).in_(database_values))
+    period_filters = _period_filters(arguments, FactOpportunity.expected_close_date)
+    limit = _bounded_limit(arguments)
+    experience_weighted_forecast = _number(
         db.scalar(
-            select(
-                func.sum(FactOpportunity.expected_amount * FactOpportunity.probability / 100)
-            ).where(
+            select(func.sum(FactOpportunity.expected_amount * weight_expression)).where(
                 FactOpportunity.enterprise_id == claims.enterprise_id,
                 FactOpportunity.organization_unit_id.in_(organization_ids),
                 FactOpportunity.is_current.is_(True),
                 *filters,
+            )
+        )
+    )
+    won_signed_amount = _number(
+        db.scalar(
+            select(func.sum(_signed_amount_expression())).where(
+                FactOpportunity.enterprise_id == claims.enterprise_id,
+                FactOpportunity.organization_unit_id.in_(organization_ids),
+                FactOpportunity.is_current.is_(True),
+                status_expression == "won",
+                *period_filters,
             )
         )
     )
@@ -532,27 +688,33 @@ def get_sales_forecast(
             FactOpportunity.is_current.is_(True),
             *filters,
         )
-        .order_by((FactOpportunity.expected_amount * FactOpportunity.probability).desc())
+        .order_by((FactOpportunity.expected_amount * weight_expression).desc())
         .limit(limit)
     ).all()
-    items = [
-        {
-            "source_record_id": row.source_record_id,
-            "title": row.title,
-            "probability": row.probability,
-            "amount": _number(row.expected_amount),
-            "weighted_amount": _number(row.expected_amount) * row.probability / 100,
-            "expected_close_date": row.expected_close_date.isoformat(),
-        }
-        for row in rows
-    ]
+    items = []
+    for row in rows:
+        reliability_level = _normalized_reliability(row.reliability_level)
+        weight = weights.get(reliability_level, 0)
+        items.append(
+            {
+                "source_record_id": row.source_record_id,
+                "title": row.title,
+                "reliability_level": reliability_level,
+                "experience_weight": weight,
+                "amount": _number(row.expected_amount),
+                "experience_weighted_amount": _number(row.expected_amount) * weight,
+                "expected_close_date": row.expected_close_date.isoformat(),
+            }
+        )
     return _result(
         db,
         claims,
         tool="get_sales_forecast",
         domains={"opportunity"},
         data={
-            "weighted_forecast": weighted_forecast,
+            "experience_weighted_forecast_amount": experience_weighted_forecast,
+            "won_signed_amount": won_signed_amount,
+            "experience_weight_policy": weight_policy,
             "opportunities": items,
         },
         references=[
@@ -560,13 +722,23 @@ def get_sales_forecast(
                 domain="opportunity",
                 metrics=[
                     (
-                        "weighted_forecast",
-                        "sum(expected_amount * probability / 100) "
-                        "where status is active or stalled",
-                    )
+                        "experience_weighted_forecast_amount",
+                        "sum(expected_amount * configured experience weight) "
+                        "where status_code = active",
+                    ),
+                    (
+                        "won_signed_amount",
+                        "sum(coalesce(signed_amount, expected_amount)) where status_code = won",
+                    ),
                 ],
                 organization_ids=organization_ids,
             ),
+            {
+                "domain": "metric_policy",
+                "metric": "experience_weighted_forecast_amount",
+                "calculation": "configured high/medium/low experience weights",
+                "policy": weight_policy,
+            },
             *[
                 {"domain": "opportunity", "source_record_id": item["source_record_id"]}
                 for item in items
@@ -580,43 +752,119 @@ def get_customer_status(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
-    limit = min(max(int(arguments.get("limit", 20)), 1), 100)
-    filters: list[Any] = []
+    limit = _bounded_limit(arguments, default=20)
+    customer_filters: list[Any] = []
     customer_query = str(arguments.get("customer_query") or "").strip()
     if customer_query:
-        filters.append(DimCustomer.display_name.ilike(f"%{customer_query[:120]}%"))
-    if arguments.get("only_overdue") is True:
-        filters.append(FactFinanceCollection.overdue_days > 0)
-    rows = db.execute(
+        customer_filters.append(DimCustomer.display_name.ilike(f"%{customer_query[:120]}%"))
+    customer_rows = db.scalars(
+        select(DimCustomer).where(
+            DimCustomer.enterprise_id == claims.enterprise_id,
+            *customer_filters,
+        )
+    ).all()
+    if not customer_rows:
+        return _result(
+            db,
+            claims,
+            tool="get_customer_status",
+            domains={"opportunity", "delivery", "collection"},
+            data={"customers": []},
+            references=[],
+            organization_ids=organization_ids,
+        )
+    customer_ids = {row.id for row in customer_rows}
+    opportunity_rows = db.execute(
         select(
-            DimCustomer.source_record_id,
-            DimCustomer.display_name,
+            FactOpportunity.customer_id,
+            func.count(FactOpportunity.id),
+            func.sum(FactOpportunity.expected_amount).filter(_status_expression() == "active"),
+            func.sum(_signed_amount_expression()),
+        )
+        .where(
+            FactOpportunity.enterprise_id == claims.enterprise_id,
+            FactOpportunity.organization_unit_id.in_(organization_ids),
+            FactOpportunity.customer_id.in_(customer_ids),
+            FactOpportunity.is_current.is_(True),
+        )
+        .group_by(FactOpportunity.customer_id)
+    ).all()
+    delivery_rows = db.execute(
+        select(
+            FactDelivery.customer_id,
+            func.count(FactDelivery.id),
+            func.sum(FactDelivery.contract_amount),
+            func.sum(FactDelivery.recognized_revenue),
+        )
+        .where(
+            FactDelivery.enterprise_id == claims.enterprise_id,
+            FactDelivery.organization_unit_id.in_(organization_ids),
+            FactDelivery.customer_id.in_(customer_ids),
+            FactDelivery.is_current.is_(True),
+        )
+        .group_by(FactDelivery.customer_id)
+    ).all()
+    collection_rows = db.execute(
+        select(
+            FactFinanceCollection.customer_id,
+            func.sum(FactFinanceCollection.receivable_amount),
+            func.sum(FactFinanceCollection.collected_amount),
             func.sum(FactFinanceCollection.outstanding_amount),
             func.sum(FactFinanceCollection.outstanding_amount).filter(
                 FactFinanceCollection.overdue_days > 0
             ),
         )
-        .join(FactFinanceCollection, FactFinanceCollection.customer_id == DimCustomer.id)
         .where(
-            DimCustomer.enterprise_id == claims.enterprise_id,
             FactFinanceCollection.enterprise_id == claims.enterprise_id,
             FactFinanceCollection.organization_unit_id.in_(organization_ids),
+            FactFinanceCollection.customer_id.in_(customer_ids),
             FactFinanceCollection.is_current.is_(True),
-            *filters,
         )
-        .group_by(DimCustomer.id)
-        .order_by(func.sum(FactFinanceCollection.outstanding_amount).desc())
-        .limit(limit)
+        .group_by(FactFinanceCollection.customer_id)
     ).all()
-    customers = [
-        {
-            "source_record_id": source_id,
-            "name": name,
-            "outstanding_amount": _number(outstanding),
-            "overdue_amount": _number(overdue),
+    opportunities = {
+        customer_id: (count, active_pipeline, signed)
+        for customer_id, count, active_pipeline, signed in opportunity_rows
+    }
+    deliveries = {
+        customer_id: (count, contract, recognized)
+        for customer_id, count, contract, recognized in delivery_rows
+    }
+    collections = {
+        customer_id: (receivable, collected, outstanding, overdue)
+        for customer_id, receivable, collected, outstanding, overdue in collection_rows
+    }
+    customers = []
+    for customer in customer_rows:
+        opportunity = opportunities.get(customer.id, (0, 0, 0))
+        delivery = deliveries.get(customer.id, (0, 0, 0))
+        collection = collections.get(customer.id, (0, 0, 0, 0))
+        row = {
+            "source_record_id": customer.source_record_id,
+            "name": customer.display_name,
+            "industry": customer.industry,
+            "opportunity_count": int(opportunity[0] or 0),
+            "active_pipeline_amount": _number(opportunity[1]),
+            "signed_amount": _number(opportunity[2]),
+            "project_count": int(delivery[0] or 0),
+            "contract_amount": _number(delivery[1]),
+            "recognized_revenue": _number(delivery[2]),
+            "receivable_amount": _number(collection[0]),
+            "collected_amount": _number(collection[1]),
+            "outstanding_amount": _number(collection[2]),
+            "overdue_amount": _number(collection[3]),
         }
-        for source_id, name, outstanding, overdue in rows
-    ]
+        if arguments.get("only_overdue") is not True or row["overdue_amount"] > 0:
+            customers.append(row)
+    customers.sort(
+        key=lambda item: (
+            item["overdue_amount"],
+            item["outstanding_amount"],
+            item["signed_amount"],
+        ),
+        reverse=True,
+    )
+    customers = customers[:limit]
     return _result(
         db,
         claims,
@@ -644,11 +892,13 @@ def get_delivery_status(
     risk_levels = _list_argument(arguments, "risk_levels")
     if risk_levels:
         filters.append(FactDelivery.risk_level.in_(risk_levels))
-    limit = min(max(int(arguments.get("limit", 50)), 1), 100)
+    limit = _bounded_limit(arguments)
     delivery_totals = db.execute(
         select(
             func.count(FactDelivery.id),
             func.count(FactDelivery.id).filter(FactDelivery.risk_level != "normal"),
+            func.sum(FactDelivery.contract_amount),
+            func.sum(FactDelivery.recognized_revenue),
         ).where(
             FactDelivery.enterprise_id == claims.enterprise_id,
             FactDelivery.organization_unit_id.in_(organization_ids),
@@ -656,8 +906,15 @@ def get_delivery_status(
             *filters,
         )
     ).one()
-    rows = db.scalars(
-        select(FactDelivery)
+    manager = aliased(DimPerson)
+    delivery_owner = aliased(DimPerson)
+    rows = db.execute(
+        select(FactDelivery, manager.display_name, delivery_owner.display_name)
+        .outerjoin(manager, manager.id == FactDelivery.manager_person_id)
+        .outerjoin(
+            delivery_owner,
+            delivery_owner.id == FactDelivery.delivery_owner_person_id,
+        )
         .where(
             FactDelivery.enterprise_id == claims.enterprise_id,
             FactDelivery.organization_unit_id.in_(organization_ids),
@@ -669,16 +926,23 @@ def get_delivery_status(
     ).all()
     projects = [
         {
-            "source_record_id": row.source_record_id,
-            "project_name": row.project_name,
-            "status": row.status,
-            "risk_level": row.risk_level,
-            "completion_percent": row.completion_percent,
-            "milestone": row.current_milestone,
-            "delay_days": row.delay_days,
-            "contract_amount": _number(row.contract_amount),
+            "source_record_id": project.source_record_id,
+            "project_name": project.project_name,
+            "status": project.status,
+            "risk_level": project.risk_level,
+            "project_manager": manager_name,
+            "delivery_owner": delivery_owner_name,
+            "completion_percent": project.completion_percent,
+            "milestone": project.current_milestone,
+            "delay_days": project.delay_days,
+            "contract_amount": _number(project.contract_amount),
+            "recognized_revenue": _number(project.recognized_revenue),
+            "actual_start_date": (
+                project.actual_start_date.isoformat() if project.actual_start_date else None
+            ),
+            "latest_progress": project.latest_progress,
         }
-        for row in rows
+        for project, manager_name, delivery_owner_name in rows
     ]
     return _result(
         db,
@@ -688,6 +952,8 @@ def get_delivery_status(
         data={
             "project_count": int(delivery_totals[0] or 0),
             "attention_count": int(delivery_totals[1] or 0),
+            "contract_amount": _number(delivery_totals[2]),
+            "recognized_revenue": _number(delivery_totals[3]),
             "projects": projects,
         },
         references=[
@@ -696,6 +962,8 @@ def get_delivery_status(
                 metrics=[
                     ("project_count", "count(source_record_id)"),
                     ("attention_count", "count(risk_level != normal)"),
+                    ("contract_amount", "sum(contract_amount)"),
+                    ("recognized_revenue", "sum(recognized_revenue)"),
                 ],
                 organization_ids=organization_ids,
             ),
@@ -713,19 +981,24 @@ def get_finance_margin(
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
     filters = _period_filters(arguments, FactDelivery.planned_end_date)
-    contract, gross_profit = db.execute(
-        select(
-            func.sum(FactDelivery.contract_amount),
-            func.sum(FactDelivery.contract_amount * FactDelivery.gross_margin_rate),
-        ).where(
-            FactDelivery.enterprise_id == claims.enterprise_id,
-            FactDelivery.organization_unit_id.in_(organization_ids),
-            FactDelivery.is_current.is_(True),
-            *filters,
-        )
-    ).one()
+    contract, recognized_revenue, recognized_gross_profit, contract_expected_gross_profit = (
+        db.execute(
+            select(
+                func.sum(FactDelivery.contract_amount),
+                func.sum(FactDelivery.recognized_revenue),
+                func.sum(FactDelivery.recognized_revenue * FactDelivery.gross_margin_rate),
+                func.sum(FactDelivery.contract_amount * FactDelivery.gross_margin_rate),
+            ).where(
+                FactDelivery.enterprise_id == claims.enterprise_id,
+                FactDelivery.organization_unit_id.in_(organization_ids),
+                FactDelivery.is_current.is_(True),
+                *filters,
+            )
+        ).one()
+    )
     contract_amount = _number(contract)
-    gross_profit_amount = _number(gross_profit)
+    recognized_revenue_amount = _number(recognized_revenue)
+    recognized_gross_profit_amount = _number(recognized_gross_profit)
     return _result(
         db,
         claims,
@@ -733,15 +1006,32 @@ def get_finance_margin(
         domains={"delivery", "collection"},
         data={
             "contract_amount": contract_amount,
-            "gross_profit_amount": gross_profit_amount,
-            "gross_margin_rate": gross_profit_amount / contract_amount if contract_amount else 0,
+            "recognized_revenue": recognized_revenue_amount,
+            "recognized_gross_profit_amount": recognized_gross_profit_amount,
+            "contract_expected_gross_profit_amount": _number(contract_expected_gross_profit),
+            "gross_margin_rate": (
+                recognized_gross_profit_amount / recognized_revenue_amount
+                if recognized_revenue_amount
+                else 0
+            ),
         },
         references=_aggregate_evidence(
             domain="delivery",
             metrics=[
                 ("contract_amount", "sum(contract_amount)"),
-                ("gross_profit_amount", "sum(contract_amount * gross_margin_rate)"),
-                ("gross_margin_rate", "gross_profit_amount / contract_amount"),
+                ("recognized_revenue", "sum(recognized_revenue)"),
+                (
+                    "recognized_gross_profit_amount",
+                    "sum(recognized_revenue * gross_margin_rate)",
+                ),
+                (
+                    "contract_expected_gross_profit_amount",
+                    "sum(contract_amount * gross_margin_rate)",
+                ),
+                (
+                    "gross_margin_rate",
+                    "recognized_gross_profit_amount / recognized_revenue",
+                ),
             ],
             organization_ids=organization_ids,
         ),
@@ -757,53 +1047,146 @@ def get_collection_aging(
     aging_buckets = _list_argument(arguments, "aging_buckets")
     if aging_buckets:
         filters.append(FactFinanceCollection.aging_bucket.in_(aging_buckets))
+    for argument_key, column in (
+        ("payment_types", FactFinanceCollection.payment_type),
+        ("payment_milestones", FactFinanceCollection.payment_milestone),
+        ("invoice_statuses", FactFinanceCollection.invoice_status),
+    ):
+        values = _list_argument(arguments, argument_key)
+        if values:
+            filters.append(column.in_(values))
     minimum_overdue_days = arguments.get("minimum_overdue_days")
     if minimum_overdue_days is not None:
         try:
             filters.append(
-                FactFinanceCollection.overdue_days
-                >= min(max(int(minimum_overdue_days), 0), 3650)
+                FactFinanceCollection.overdue_days >= min(max(int(minimum_overdue_days), 0), 3650)
             )
         except (TypeError, ValueError) as exc:
             raise CapabilityError("minimum_overdue_days is malformed") from exc
     customer_query = str(arguments.get("customer_query") or "").strip()
+    if customer_query:
+        filters.append(
+            FactFinanceCollection.customer_id.in_(
+                select(DimCustomer.id).where(
+                    DimCustomer.enterprise_id == claims.enterprise_id,
+                    DimCustomer.display_name.ilike(f"%{customer_query[:120]}%"),
+                )
+            )
+        )
+    owner_query = str(arguments.get("owner_query") or "").strip()
+    if owner_query:
+        filters.append(
+            FactFinanceCollection.collection_owner_person_id.in_(
+                select(DimPerson.id).where(
+                    DimPerson.enterprise_id == claims.enterprise_id,
+                    DimPerson.display_name.ilike(f"%{owner_query[:120]}%"),
+                )
+            )
+        )
+    base_filters = [
+        FactFinanceCollection.enterprise_id == claims.enterprise_id,
+        FactFinanceCollection.organization_unit_id.in_(organization_ids),
+        FactFinanceCollection.is_current.is_(True),
+        *filters,
+    ]
     statement = select(
         FactFinanceCollection.aging_bucket,
         func.count(FactFinanceCollection.id),
         func.sum(FactFinanceCollection.outstanding_amount),
     )
-    if customer_query:
-        statement = statement.join(
-            DimCustomer, DimCustomer.id == FactFinanceCollection.customer_id
-        )
-        filters.append(DimCustomer.display_name.ilike(f"%{customer_query[:120]}%"))
     rows = db.execute(
-        statement
-        .where(
-            FactFinanceCollection.enterprise_id == claims.enterprise_id,
-            FactFinanceCollection.organization_unit_id.in_(organization_ids),
-            FactFinanceCollection.is_current.is_(True),
-            *filters,
-        )
-        .group_by(FactFinanceCollection.aging_bucket)
+        statement.where(*base_filters).group_by(FactFinanceCollection.aging_bucket)
     ).all()
+    totals = db.execute(
+        select(
+            func.sum(FactFinanceCollection.receivable_amount),
+            func.sum(FactFinanceCollection.collected_amount),
+            func.sum(FactFinanceCollection.outstanding_amount),
+            func.sum(FactFinanceCollection.outstanding_amount).filter(
+                FactFinanceCollection.overdue_days > 0
+            ),
+        ).where(*base_filters)
+    ).one()
+    customer = aliased(DimCustomer)
+    owner = aliased(DimPerson)
+    item_rows = db.execute(
+        select(FactFinanceCollection, customer.display_name, owner.display_name)
+        .outerjoin(customer, customer.id == FactFinanceCollection.customer_id)
+        .outerjoin(owner, owner.id == FactFinanceCollection.collection_owner_person_id)
+        .where(*base_filters)
+        .order_by(
+            FactFinanceCollection.overdue_days.desc(),
+            FactFinanceCollection.outstanding_amount.desc(),
+        )
+        .limit(_bounded_limit(arguments))
+    ).all()
+    items = [
+        {
+            "source_record_id": row.source_record_id,
+            "customer_name": customer_name,
+            "project_source_record_id": row.project_source_record_id,
+            "payment_type": row.payment_type,
+            "payment_milestone": row.payment_milestone,
+            "receivable_amount": _number(row.receivable_amount),
+            "collected_amount": _number(row.collected_amount),
+            "outstanding_amount": _number(row.outstanding_amount),
+            "planned_collection_date": row.planned_collection_date.isoformat(),
+            "actual_collection_date": (
+                row.actual_collection_date.isoformat() if row.actual_collection_date else None
+            ),
+            "overdue_days": row.overdue_days,
+            "aging_bucket": row.aging_bucket,
+            "status": row.status,
+            "invoice_status": row.invoice_status,
+            "invoice_number": row.invoice_number,
+            "collection_owner": owner_name,
+            "latest_follow_up": row.latest_follow_up,
+        }
+        for row, customer_name, owner_name in item_rows
+    ]
     return _result(
         db,
         claims,
         tool="get_collection_aging",
         domains={"collection"},
         data={
+            "receivable_amount": _number(totals[0]),
+            "collected_amount": _number(totals[1]),
+            "outstanding_amount": _number(totals[2]),
+            "overdue_amount": _number(totals[3]),
             "aging": [
                 {"bucket": bucket, "count": int(count), "outstanding_amount": _number(amount)}
                 for bucket, count, amount in rows
-            ]
+            ],
+            "items": items,
         },
-        references=_aggregate_evidence(
-            domain="collection",
-            metrics=[("collection_aging", "count and sum(outstanding_amount) by aging_bucket")],
-            organization_ids=organization_ids,
-            grouping="aging_bucket",
-        ),
+        references=[
+            *_aggregate_evidence(
+                domain="collection",
+                metrics=[
+                    (
+                        "collection_aging",
+                        "count and sum(outstanding_amount) by aging_bucket",
+                    ),
+                    ("receivable_amount", "sum(receivable_amount)"),
+                    ("collected_amount", "sum(collected_amount)"),
+                    ("outstanding_amount", "sum(outstanding_amount)"),
+                    (
+                        "overdue_amount",
+                        "sum(outstanding_amount where overdue_days > 0)",
+                    ),
+                ],
+                organization_ids=organization_ids,
+                grouping="aging_bucket",
+            ),
+            *[
+                {
+                    "domain": "collection",
+                    "source_record_id": item["source_record_id"],
+                }
+                for item in items
+            ],
+        ],
         organization_ids=organization_ids,
     )
 
@@ -812,49 +1195,134 @@ def get_organization_performance(
     db: Session, claims: CapabilityClaims, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     organization_ids = _scope(claims, arguments)
-    filters = _period_filters(arguments, FactFinanceCollection.planned_collection_date)
-    rows = db.execute(
+    organization_rows = db.execute(
+        select(OrganizationUnit.id, OrganizationUnit.name).where(
+            OrganizationUnit.enterprise_id == claims.enterprise_id,
+            OrganizationUnit.id.in_(organization_ids),
+        )
+    ).all()
+    opportunity_rows = db.execute(
         select(
-            OrganizationUnit.id,
-            OrganizationUnit.name,
+            FactOpportunity.organization_unit_id,
+            func.sum(_signed_amount_expression()),
+            func.sum(FactOpportunity.expected_amount).filter(_status_expression() == "active"),
+        )
+        .where(
+            FactOpportunity.enterprise_id == claims.enterprise_id,
+            FactOpportunity.organization_unit_id.in_(organization_ids),
+            FactOpportunity.is_current.is_(True),
+            *_period_filters(arguments, FactOpportunity.expected_close_date),
+        )
+        .group_by(FactOpportunity.organization_unit_id)
+    ).all()
+    delivery_rows = db.execute(
+        select(
+            FactDelivery.organization_unit_id,
+            func.sum(FactDelivery.contract_amount),
+            func.sum(FactDelivery.recognized_revenue),
+        )
+        .where(
+            FactDelivery.enterprise_id == claims.enterprise_id,
+            FactDelivery.organization_unit_id.in_(organization_ids),
+            FactDelivery.is_current.is_(True),
+            *_period_filters(arguments, FactDelivery.planned_end_date),
+        )
+        .group_by(FactDelivery.organization_unit_id)
+    ).all()
+    collection_rows = db.execute(
+        select(
+            FactFinanceCollection.organization_unit_id,
+            func.sum(FactFinanceCollection.receivable_amount),
             func.sum(FactFinanceCollection.collected_amount),
             func.sum(FactFinanceCollection.outstanding_amount),
         )
-        .join(
-            FactFinanceCollection,
-            FactFinanceCollection.organization_unit_id == OrganizationUnit.id,
-        )
         .where(
-            OrganizationUnit.enterprise_id == claims.enterprise_id,
-            OrganizationUnit.id.in_(organization_ids),
+            FactFinanceCollection.enterprise_id == claims.enterprise_id,
+            FactFinanceCollection.organization_unit_id.in_(organization_ids),
             FactFinanceCollection.is_current.is_(True),
-            *filters,
+            *_period_filters(arguments, FactFinanceCollection.planned_collection_date),
         )
-        .group_by(OrganizationUnit.id)
-        .order_by(func.sum(FactFinanceCollection.collected_amount).desc())
+        .group_by(FactFinanceCollection.organization_unit_id)
     ).all()
+    opportunities = {
+        identifier: (signed, pipeline) for identifier, signed, pipeline in opportunity_rows
+    }
+    deliveries = {
+        identifier: (contract, recognized) for identifier, contract, recognized in delivery_rows
+    }
+    collections = {
+        identifier: (receivable, collected, outstanding)
+        for identifier, receivable, collected, outstanding in collection_rows
+    }
+    organizations = []
+    for identifier, name in organization_rows:
+        opportunity = opportunities.get(identifier, (0, 0))
+        delivery = deliveries.get(identifier, (0, 0))
+        collection = collections.get(identifier, (0, 0, 0))
+        organizations.append(
+            {
+                "organization_unit_id": str(identifier),
+                "name": name,
+                "signed_amount": _number(opportunity[0]),
+                "active_pipeline_amount": _number(opportunity[1]),
+                "contract_amount": _number(delivery[0]),
+                "recognized_revenue": _number(delivery[1]),
+                "receivable_amount": _number(collection[0]),
+                "collected_amount": _number(collection[1]),
+                "outstanding_amount": _number(collection[2]),
+            }
+        )
+    organizations.sort(key=lambda item: item["collected_amount"], reverse=True)
+    atomic_batch = _atomic_batch_identity(db, claims)
     return _result(
         db,
         claims,
         tool="get_organization_performance",
-        domains={"opportunity", "delivery", "collection", "target"},
+        domains={"opportunity", "delivery", "collection"},
         data={
-            "organizations": [
-                {
-                    "organization_unit_id": str(identifier),
-                    "name": name,
-                    "collected_amount": _number(collected),
-                    "outstanding_amount": _number(outstanding),
-                }
-                for identifier, name, collected, outstanding in rows
-            ]
+            "atomic_batch_id": atomic_batch["source_batch_id"] if atomic_batch else None,
+            "source_batch_id": atomic_batch["source_batch_id"] if atomic_batch else None,
+            "sync_run_id": atomic_batch["sync_run_id"] if atomic_batch else None,
+            "contract_version": atomic_batch["contract_version"] if atomic_batch else None,
+            "source_data_as_of": atomic_batch["source_data_as_of"] if atomic_batch else None,
+            "organizations": organizations,
         },
-        references=_aggregate_evidence(
-            domain="collection",
-            metrics=[("organization_performance", "sum by organization_unit_id")],
-            organization_ids=organization_ids,
-            grouping="organization_unit_id",
-        ),
+        references=[
+            *_aggregate_evidence(
+                domain="opportunity",
+                metrics=[
+                    ("signed_amount", "sum signed amount by organization_unit_id"),
+                    (
+                        "active_pipeline_amount",
+                        "sum active expected amount by organization_unit_id",
+                    ),
+                ],
+                organization_ids=organization_ids,
+                grouping="organization_unit_id",
+            ),
+            *_aggregate_evidence(
+                domain="delivery",
+                metrics=[
+                    ("contract_amount", "sum contract amount by organization_unit_id"),
+                    (
+                        "recognized_revenue",
+                        "sum recognized revenue by organization_unit_id",
+                    ),
+                ],
+                organization_ids=organization_ids,
+                grouping="organization_unit_id",
+            ),
+            *_aggregate_evidence(
+                domain="collection",
+                metrics=[
+                    ("receivable_amount", "sum receivable by organization_unit_id"),
+                    ("collected_amount", "sum collected by organization_unit_id"),
+                    ("outstanding_amount", "sum outstanding by organization_unit_id"),
+                ],
+                organization_ids=organization_ids,
+                grouping="organization_unit_id",
+            ),
+        ],
         organization_ids=organization_ids,
     )
 
@@ -867,36 +1335,114 @@ def get_daily_changes(
         days = min(max(int(arguments.get("days", 2)), 1), 31)
     except (TypeError, ValueError) as exc:
         raise CapabilityError("days is malformed") from exc
+    successful_runs = db.scalars(
+        select(DataSyncRun)
+        .where(
+            DataSyncRun.enterprise_id == claims.enterprise_id,
+            DataSyncRun.status == "completed",
+            DataSyncRun.source_schema_version == "3.0",
+            DataSyncRun.atomic_activation_status == "activated",
+            DataSyncRun.dataset_version.is_not(None),
+        )
+        .order_by(DataSyncRun.activated_at.desc(), DataSyncRun.completed_at.desc())
+        .limit(days)
+    ).all()
+    source_batch_ids = [
+        str(row.source_batch_id) for row in successful_runs if row.source_batch_id
+    ]
+    if not source_batch_ids:
+        return _result(
+            db,
+            claims,
+            tool="get_daily_changes",
+            domains={"opportunity", "delivery", "collection"},
+            data={
+                "availability": "insufficient_comparable_batches",
+                "message": "尚无可比较的3.0成功原子批次",
+                "snapshots": [],
+                "changes": [],
+            },
+            references=[],
+            organization_ids=organization_ids,
+        )
     rows = db.scalars(
         select(DailySnapshot)
         .where(
             DailySnapshot.enterprise_id == claims.enterprise_id,
             DailySnapshot.organization_unit_id.in_(organization_ids),
+            DailySnapshot.source_batch_id.in_(source_batch_ids),
         )
-        .order_by(DailySnapshot.snapshot_date.desc())
-        .limit(len(organization_ids) * days)
+        .limit(len(organization_ids) * len(source_batch_ids))
     ).all()
+    batch_rank = {batch_id: index for index, batch_id in enumerate(source_batch_ids)}
     snapshots = [
         {
             "organization_unit_id": str(row.organization_unit_id),
             "snapshot_date": row.snapshot_date.isoformat(),
+            "source_batch_id": row.source_batch_id,
+            "dataset_version": row.dataset_version,
             "metrics": row.metrics_json,
             "anomalies": row.anomalies_json,
             "source_data_as_of": row.source_data_as_of.isoformat(),
         }
         for row in rows
     ]
+    snapshots.sort(
+        key=lambda item: (
+            batch_rank[str(item["source_batch_id"])],
+            str(item["organization_unit_id"]),
+        )
+    )
+    changes: list[dict[str, Any]] = []
+    by_organization: dict[str, list[dict[str, Any]]] = {}
+    for snapshot in snapshots:
+        by_organization.setdefault(snapshot["organization_unit_id"], []).append(snapshot)
+    for organization_id, organization_snapshots in by_organization.items():
+        ordered = sorted(
+            organization_snapshots,
+            key=lambda item: batch_rank[str(item["source_batch_id"])],
+        )
+        for current, previous in zip(ordered, ordered[1:], strict=False):
+            metric_deltas: dict[str, float] = {}
+            for key, current_value in current["metrics"].items():
+                previous_value = previous["metrics"].get(key)
+                if (
+                    not key.startswith("_")
+                    and isinstance(current_value, (int, float))
+                    and isinstance(previous_value, (int, float))
+                ):
+                    metric_deltas[key] = float(current_value) - float(previous_value)
+            changes.append(
+                {
+                    "organization_unit_id": organization_id,
+                    "current_snapshot_date": current["snapshot_date"],
+                    "previous_snapshot_date": previous["snapshot_date"],
+                    "current_source_batch_id": current["source_batch_id"],
+                    "previous_source_batch_id": previous["source_batch_id"],
+                    "metric_deltas": metric_deltas,
+                }
+            )
     return _result(
         db,
         claims,
         tool="get_daily_changes",
         domains={"opportunity", "delivery", "collection"},
-        data={"snapshots": snapshots},
+        data={
+            "availability": "ready" if len(source_batch_ids) >= 2 else "single_batch_only",
+            "dataset_versions": [
+                str(row.dataset_version) for row in successful_runs if row.dataset_version
+            ],
+            "source_batch_ids": source_batch_ids,
+            "snapshots": snapshots,
+            "changes": changes,
+        },
         references=[
             {
                 "domain": "daily_snapshot",
                 "organization_unit_id": row["organization_unit_id"],
                 "snapshot_date": row["snapshot_date"],
+                "source_batch_id": row["source_batch_id"],
+                "dataset_version": row["dataset_version"],
             }
             for row in snapshots
         ],
@@ -930,19 +1476,86 @@ def execute_business_tool(
 ) -> dict[str, Any]:
     if tool_name not in claims.tools:
         raise CapabilityError("tool is not allowed by this capability")
-    handler = TOOLS.get(tool_name)
-    if handler is None:
-        raise CapabilityError("unknown tool")
+    return _execute_registered_tool(db, claims, tool_name, arguments)
+
+
+def _execute_registered_tool(
+    db: Session,
+    claims: CapabilityClaims,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
     configuration = effective_tool(db, claims.enterprise_id, tool_name)
     if configuration is None or not configuration["is_enabled"]:
         raise CapabilityError("tool is disabled by enterprise configuration")
+    spec = registered_spec(db, claims.enterprise_id, tool_name)
+    if spec is None:
+        raise CapabilityError("unknown tool")
     bounded_arguments = dict(arguments)
-    if "limit" in bounded_arguments:
+    if "limit" in spec.parameters:
         try:
             bounded_arguments["limit"] = min(
-                max(int(bounded_arguments["limit"]), 1),
+                max(int(bounded_arguments.get("limit", configuration["max_rows"])), 1),
                 int(configuration["max_rows"]),
             )
         except (TypeError, ValueError) as exc:
             raise CapabilityError("tool limit is malformed") from exc
-    return handler(db, claims, bounded_arguments)
+    handler = TOOLS.get(tool_name)
+    if handler is not None:
+        return handler(db, claims, bounded_arguments)
+
+    if spec.source_type != "composite" or not spec.component_tools:
+        raise CapabilityError("unknown tool")
+
+    component_results: list[dict[str, Any]] = []
+    freshness: list[dict[str, Any]] = []
+    freshness_keys: set[tuple[str, str | None, str | None]] = set()
+    evidence: list[dict[str, Any]] = []
+    for component_name in spec.component_tools:
+        component_spec = registered_spec(db, claims.enterprise_id, component_name)
+        if component_spec is None or component_spec.source_type != "built_in":
+            raise CapabilityError("composite tool has an invalid dependency")
+        component_arguments = {
+            key: value
+            for key, value in bounded_arguments.items()
+            if key in component_spec.parameters or key == "organization_unit_ids"
+        }
+        result = _execute_registered_tool(
+            db,
+            claims,
+            component_name,
+            component_arguments,
+        )
+        component_configuration = effective_tool(db, claims.enterprise_id, component_name)
+        if component_configuration is None:
+            raise CapabilityError("composite tool dependency is unavailable")
+        component_results.append(
+            {
+                "tool": component_name,
+                "display_name": component_configuration["display_name"],
+                "data": result.get("data", {}),
+            }
+        )
+        for row in result.get("freshness", []):
+            key = (
+                str(row.get("domain")),
+                row.get("source_data_as_of"),
+                row.get("dataset_version"),
+            )
+            if key not in freshness_keys:
+                freshness_keys.add(key)
+                freshness.append(row)
+        for row in result.get("evidence", []):
+            evidence.append({**row, "component_tool": component_name})
+
+    return {
+        "tool": tool_name,
+        "data": {"components": component_results},
+        "freshness": freshness,
+        "scope": {
+            "organization_unit_ids": sorted(
+                str(value) for value in _scope(claims, bounded_arguments)
+            )
+        },
+        "evidence": evidence[:100],
+    }

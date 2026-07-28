@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import time
+import uuid
+
 from sqlalchemy import select
 
+from executive_ai_api.business_tools import execute_business_tool
+from executive_ai_api.capabilities import CapabilityClaims
 from executive_ai_api.database import SessionLocal
 from executive_ai_api.models import AuditEvent, McpToolConfig
 
 from .conftest import login, login_and_change_password
 
 
-def test_mcp_registry_is_visible_but_only_operations_roles_can_configure_it(
-    client, seeded
-) -> None:
+def test_mcp_registry_is_visible_but_only_operations_roles_can_configure_it(client, seeded) -> None:
     login_and_change_password(client)
     forbidden = client.get("/api/v1/admin/mcp-tools")
     assert forbidden.status_code == 403
@@ -22,7 +25,12 @@ def test_mcp_registry_is_visible_but_only_operations_roles_can_configure_it(
         body = catalog.json()
         assert len(body["tools"]) == 11
         assert body["enabled_count"] == 11
-        assert body["planner_count"] == 11
+        assert body["planner_count"] == 10
+        target_tool = next(
+            item for item in body["tools"] if item["tool_name"] == "get_target_completion"
+        )
+        assert target_tool["is_enabled"] is True
+        assert target_tool["planner_enabled"] is False
         scope_tool = next(
             item for item in body["tools"] if item["tool_name"] == "list_query_scopes"
         )
@@ -64,11 +72,62 @@ def test_mcp_registry_is_visible_but_only_operations_roles_can_configure_it(
         assert unknown.status_code == 404
         assert unknown.json()["error"]["code"] == "mcp_tool_not_found"
 
+        created = admin_client.post(
+            "/api/v1/admin/mcp-tools",
+            headers={"X-CSRF-Token": admin["csrf_token"]},
+            json={
+                "tool_name": "custom_scope_review",
+                "display_name": "授权范围复核",
+                "description": "组合现有范围工具，供管理端验证企业自定义工具发布链路。",
+                "category": "权限与范围",
+                "component_tools": ["list_query_scopes"],
+            },
+        )
+        assert created.status_code == 201, created.text
+        custom = created.json()
+        assert custom["source_type"] == "composite"
+        assert custom["component_tools"] == ["list_query_scopes"]
+        assert custom["is_enabled"] is False
+        assert custom["planner_enabled"] is False
+
+        enabled = admin_client.patch(
+            "/api/v1/admin/mcp-tools/custom_scope_review",
+            headers={"X-CSRF-Token": admin["csrf_token"]},
+            json={"is_enabled": True, "planner_enabled": True},
+        )
+        assert enabled.status_code == 200, enabled.text
+        assert enabled.json()["readiness"] == "ready"
+
+        custom_validated = admin_client.post(
+            "/api/v1/admin/mcp-tools/custom_scope_review/validate",
+            headers={"X-CSRF-Token": admin["csrf_token"]},
+        )
+        assert custom_validated.status_code == 200
+        assert custom_validated.json()["ready"] is True
+
+        catalog_after_create = admin_client.get("/api/v1/admin/mcp-tools")
+        assert len(catalog_after_create.json()["tools"]) == 12
+
     with SessionLocal() as db:
+        result = execute_business_tool(
+            db,
+            CapabilityClaims(
+                enterprise_id=seeded["enterprise_id"],
+                user_id=seeded["users"]["admin@example.com"],
+                organization_unit_ids=frozenset({seeded["east_id"], seeded["west_id"]}),
+                tools=frozenset({"custom_scope_review"}),
+                message_id=uuid.uuid4(),
+                expires_at=int(time.time()) + 60,
+            ),
+            "custom_scope_review",
+            {},
+        )
+        assert result["tool"] == "custom_scope_review"
+        assert result["data"]["components"][0]["tool"] == "list_query_scopes"
+        assert len(result["data"]["components"][0]["data"]["organization_units"]) == 2
+
         config = db.scalar(
-            select(McpToolConfig).where(
-                McpToolConfig.tool_name == "get_collection_aging"
-            )
+            select(McpToolConfig).where(McpToolConfig.tool_name == "get_collection_aging")
         )
         assert config is not None
         assert config.updated_by_user_id == seeded["users"]["admin@example.com"]
@@ -76,9 +135,17 @@ def test_mcp_registry_is_visible_but_only_operations_roles_can_configure_it(
             db.scalars(
                 select(AuditEvent.action).where(
                     AuditEvent.action.in_(
-                        ["admin.mcp_tool_updated", "admin.mcp_tool_validated"]
+                        [
+                            "admin.mcp_tool_created",
+                            "admin.mcp_tool_updated",
+                            "admin.mcp_tool_validated",
+                        ]
                     )
                 )
             ).all()
         )
-        assert actions == {"admin.mcp_tool_updated", "admin.mcp_tool_validated"}
+        assert actions == {
+            "admin.mcp_tool_created",
+            "admin.mcp_tool_updated",
+            "admin.mcp_tool_validated",
+        }

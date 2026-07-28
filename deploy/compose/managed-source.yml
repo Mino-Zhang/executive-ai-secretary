@@ -16,6 +16,7 @@ services:
       - managed_source_postgres_data:/var/lib/postgresql/data
       - ./deploy/source-postgres/01-init-source.sh:/docker-entrypoint-initdb.d/01-init-source.sh:ro
       - ./deploy/source-postgres/standard-ods.sql:/opt/executive-ai-source/standard-ods.sql:ro
+      - ./deploy/source-postgres/standard-ods-v3.sql:/opt/executive-ai-source/standard-ods-v3.sql:ro
     ports:
       - "127.0.0.1:${MANAGED_SOURCE_HOST_PORT:-55432}:5432"
     networks:

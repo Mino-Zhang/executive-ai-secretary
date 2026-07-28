@@ -49,6 +49,7 @@ fi
 timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
 backup_dir="${REPO_ROOT}/backups/${environment}/${timestamp}-${label}"
 database_file="${backup_dir}/database.dump.enc"
+source_database_file="${backup_dir}/source-database.dump.enc"
 files_file="${backup_dir}/files.tar.enc"
 manifest_file="${backup_dir}/manifest.env"
 signature_file="${backup_dir}/manifest.sig"
@@ -65,6 +66,18 @@ compose "${environment}" --profile tools run --rm -T db-backup-tool \
     --format=custom --no-owner --no-acl \
   | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
       -pass "file:${backup_key}" -out "${database_file}"
+
+source_database_sha256=""
+if printf '%s\n' "${running_services}" | grep -qx source-postgres; then
+  info "Creating encrypted source-database backup for ${environment}..."
+  compose "${environment}" exec -T source-postgres /bin/sh -ec '
+    export PGPASSWORD="$(cat /run/secrets/source_postgres_password)"
+    exec pg_dump --host 127.0.0.1 --username executive_ai_source \
+      --dbname "${POSTGRES_DB}" --format=custom --no-owner --no-acl
+  ' | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+      -pass "file:${backup_key}" -out "${source_database_file}"
+  source_database_sha256="$(sha256_file "${source_database_file}")"
+fi
 
 info "Creating encrypted private-file backup for ${environment}..."
 compose "${environment}" --profile tools run --rm -T file-tool \
@@ -102,6 +115,10 @@ enterprise_count="$(compose "${environment}" --profile tools run --rm -T db-back
   printf 'consistency=application-quiesced\n'
   printf 'database_file=database.dump.enc\n'
   printf 'database_sha256=%s\n' "${database_sha256}"
+  if [ -n "${source_database_sha256}" ]; then
+    printf 'source_database_file=source-database.dump.enc\n'
+    printf 'source_database_sha256=%s\n' "${source_database_sha256}"
+  fi
   printf 'files_file=files.tar.enc\n'
   printf 'files_sha256=%s\n' "${files_sha256}"
   printf 'encryption=aes-256-cbc-pbkdf2-iter200000\n'
@@ -110,6 +127,9 @@ openssl pkeyutl -sign -rawin \
   -inkey "$(runtime_dir_for "${environment}")/secrets/backup_signing_key" \
   -in "${manifest_file}" -out "${signature_file}"
 chmod 600 "${manifest_file}" "${signature_file}" "${database_file}" "${files_file}"
+if [ -s "${source_database_file}" ]; then
+  chmod 600 "${source_database_file}"
+fi
 
 "${SCRIPT_DIR}/verify-backup.sh" "${environment}" "${backup_dir}"
 resume_application

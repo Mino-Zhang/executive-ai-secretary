@@ -4,15 +4,21 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..audit import record_audit
 from ..authz import Principal, require_roles
 from ..database import get_db
 from ..errors import AppError
-from ..mcp_registry import MCP_TOOL_SPECS, effective_catalog
-from ..models import DataDomainStatus, McpToolConfig
+from ..mcp_registry import (
+    MCP_TOOL_SPECS,
+    effective_catalog,
+    registered_spec,
+)
+from ..models import DataDomainStatus, McpToolConfig, McpToolDefinition
 from ..schemas import (
+    McpCompositeToolCreate,
     McpToolCatalogOut,
     McpToolOut,
     McpToolUpdate,
@@ -38,8 +44,19 @@ def _domain_readiness(db: Session, principal: Principal) -> dict[str, bool]:
     }
 
 
-def _decorate(item: dict[str, Any], readiness: dict[str, bool]) -> McpToolOut:
+def _decorate(
+    item: dict[str, Any],
+    readiness: dict[str, bool],
+    catalog_by_name: dict[str, dict[str, Any]],
+) -> McpToolOut:
     issues = [domain for domain in item["domains"] if not readiness.get(domain, False)]
+    if item["source_type"] == "composite":
+        for component in item["component_tools"]:
+            dependency = catalog_by_name.get(component)
+            if dependency is None:
+                issues.append(f"依赖工具不存在：{component}")
+            elif not dependency["is_enabled"]:
+                issues.append(f"依赖工具已停用：{dependency['display_name']}")
     if not item["is_enabled"]:
         state = "disabled"
         messages = ["工具已由企业管理员停用"]
@@ -58,7 +75,9 @@ def _decorate(item: dict[str, Any], readiness: dict[str, bool]) -> McpToolOut:
 
 def _catalog(db: Session, principal: Principal) -> McpToolCatalogOut:
     readiness = _domain_readiness(db, principal)
-    tools = [_decorate(item, readiness) for item in effective_catalog(db, principal.enterprise_id)]
+    raw_catalog = effective_catalog(db, principal.enterprise_id)
+    catalog_by_name = {item["tool_name"]: item for item in raw_catalog}
+    tools = [_decorate(item, readiness, catalog_by_name) for item in raw_catalog]
     return McpToolCatalogOut(
         tools=tools,
         enabled_count=sum(item.is_enabled for item in tools),
@@ -75,6 +94,94 @@ def list_mcp_tools(
     return _catalog(db, principal)
 
 
+@router.post("", response_model=McpToolOut, status_code=201)
+def create_mcp_tool(
+    payload: McpCompositeToolCreate,
+    request: Request,
+    principal: OperationsPrincipal,
+    db: Annotated[Session, Depends(get_db)],
+) -> McpToolOut:
+    if registered_spec(db, principal.enterprise_id, payload.tool_name) is not None:
+        raise AppError(409, "mcp_tool_name_conflict", "工具标识已经存在")
+    component_names = list(dict.fromkeys(payload.component_tools))
+    if len(component_names) != len(payload.component_tools):
+        raise AppError(422, "invalid_mcp_components", "组合工具不能重复选择同一个依赖工具")
+    unknown = [name for name in component_names if name not in MCP_TOOL_SPECS]
+    if unknown:
+        raise AppError(
+            422,
+            "invalid_mcp_components",
+            f"组合工具只能依赖系统内置工具：{', '.join(unknown)}",
+        )
+
+    domains: list[str] = []
+    parameters: dict[str, dict[str, Any]] = {}
+    for name in component_names:
+        spec = MCP_TOOL_SPECS[name]
+        for domain in spec.domains:
+            if domain not in domains:
+                domains.append(domain)
+        for parameter, schema in spec.parameters.items():
+            existing = parameters.get(parameter)
+            if existing is not None and existing != schema:
+                raise AppError(
+                    422,
+                    "incompatible_mcp_parameters",
+                    f"依赖工具的参数定义冲突：{parameter}",
+                )
+            parameters[parameter] = schema
+
+    definition = McpToolDefinition(
+        enterprise_id=principal.enterprise_id,
+        tool_name=payload.tool_name,
+        display_name=payload.display_name.strip(),
+        description=payload.description.strip(),
+        category=payload.category.strip(),
+        tool_type="composite",
+        component_tools_json=component_names,
+        domains_json=domains,
+        parameters_json=parameters,
+        version=1,
+        created_by_user_id=principal.user.id,
+        updated_by_user_id=principal.user.id,
+    )
+    config = McpToolConfig(
+        enterprise_id=principal.enterprise_id,
+        tool_name=payload.tool_name,
+        display_name=payload.display_name.strip(),
+        description=payload.description.strip(),
+        is_enabled=False,
+        planner_enabled=False,
+        timeout_seconds=min(
+            60,
+            max(MCP_TOOL_SPECS[name].default_timeout_seconds for name in component_names) + 5,
+        ),
+        max_rows=min(MCP_TOOL_SPECS[name].default_limit for name in component_names),
+        operator_note=payload.operator_note,
+        updated_by_user_id=principal.user.id,
+    )
+    db.add_all([definition, config])
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise AppError(409, "mcp_tool_name_conflict", "工具标识已经存在") from exc
+    record_audit(
+        db,
+        request,
+        "admin.mcp_tool_created",
+        actor=principal.user,
+        session=principal.session,
+        target_type="mcp_tool",
+        target_id=payload.tool_name,
+        metadata={"tool_type": "composite", "component_tools": component_names},
+    )
+    db.commit()
+    return next(
+        item for item in _catalog(db, principal).tools if item.tool_name == payload.tool_name
+    )
+
+
 @router.patch("/{tool_name}", response_model=McpToolOut)
 def update_mcp_tool(
     tool_name: str,
@@ -83,7 +190,7 @@ def update_mcp_tool(
     principal: OperationsPrincipal,
     db: Annotated[Session, Depends(get_db)],
 ) -> McpToolOut:
-    spec = MCP_TOOL_SPECS.get(tool_name)
+    spec = registered_spec(db, principal.enterprise_id, tool_name)
     if spec is None:
         raise AppError(404, "mcp_tool_not_found", "MCP 工具不存在")
     changes = payload.model_dump(exclude_unset=True)
@@ -133,7 +240,7 @@ def validate_mcp_tool(
     principal: OperationsPrincipal,
     db: Annotated[Session, Depends(get_db)],
 ) -> McpToolValidationOut:
-    if tool_name not in MCP_TOOL_SPECS:
+    if registered_spec(db, principal.enterprise_id, tool_name) is None:
         raise AppError(404, "mcp_tool_not_found", "MCP 工具不存在")
     tool = next(
         item for item in _catalog(db, principal).tools if item.tool_name == tool_name

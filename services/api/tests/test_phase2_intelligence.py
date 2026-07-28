@@ -668,7 +668,7 @@ def test_business_tool_rejects_cross_scope_before_query() -> None:
         )
 
 
-def test_target_completion_monthly_uses_distinct_period_actuals(seeded) -> None:
+def test_target_completion_reports_domain_not_configured(seeded) -> None:
     _seed_target_completion_facts(seeded)
     claims = _target_claims(seeded, {seeded["east_id"]})
 
@@ -684,36 +684,15 @@ def test_target_completion_monthly_uses_distinct_period_actuals(seeded) -> None:
             },
         )
 
-    metrics = {item["metric_code"]: item for item in result["data"]["metrics"]}
-    assert metrics["signed_revenue"] == {
-        "metric_code": "signed_revenue",
-        "metric_name": "签约收入",
-        "unit": "元",
-        "period_type": "month",
-        "period_start": "2026-07-01",
-        "period_end": "2026-07-31",
-        "target": 1000.0,
-        "actual": 400.0,
-        "completion_rate": 0.4,
-        "actual_calculation": "sum(won expected_amount) by closed_date in target period",
+    assert result["data"] == {
+        "availability": "not_configured",
+        "message": "目标数据尚未接入",
+        "metrics": [],
     }
-    assert metrics["collection"]["actual"] == 200.0
-    assert metrics["collection"]["completion_rate"] == 0.25
-    assert metrics["gross_profit"]["actual"] == 100.0
-    assert metrics["weighted_pipeline"]["actual"] == 500.0
-    assert {item["domain"] for item in result["evidence"]} == {
-        "target",
-        "opportunity",
-        "collection",
-    }
-    assert all(
-        item["filters"]["period_start"] == "2026-07-01"
-        and item["filters"]["period_end"] == "2026-07-31"
-        for item in result["evidence"]
-    )
+    assert result["evidence"][0]["status"] == "not_configured"
 
 
-def test_target_completion_quarterly_uses_target_period_end(seeded) -> None:
+def test_target_completion_ignores_stale_target_facts(seeded) -> None:
     _seed_target_completion_facts(seeded)
     claims = _target_claims(seeded, {seeded["east_id"]})
 
@@ -729,23 +708,11 @@ def test_target_completion_quarterly_uses_target_period_end(seeded) -> None:
             },
         )
 
-    assert result["data"]["metrics"] == [
-        {
-            "metric_code": "quarterly_revenue",
-            "metric_name": "季度签约收入",
-            "unit": "元",
-            "period_type": "quarter",
-            "period_start": "2026-07-01",
-            "period_end": "2026-09-30",
-            "target": 3000.0,
-            "actual": 1000.0,
-            "completion_rate": 1 / 3,
-            "actual_calculation": "sum(won expected_amount) by closed_date in target period",
-        }
-    ]
+    assert result["data"]["availability"] == "not_configured"
+    assert result["data"]["metrics"] == []
 
 
-def test_target_completion_applies_organization_scope_to_target_and_actual(seeded) -> None:
+def test_target_completion_preserves_requested_organization_scope(seeded) -> None:
     _seed_target_completion_facts(seeded)
     claims = _target_claims(seeded, {seeded["east_id"], seeded["west_id"]})
 
@@ -771,16 +738,11 @@ def test_target_completion_applies_organization_scope_to_target_and_actual(seede
             },
         )
 
-    east_metrics = {item["metric_code"]: item for item in east_result["data"]["metrics"]}
-    all_metrics = {item["metric_code"]: item for item in all_result["data"]["metrics"]}
-    assert east_metrics["signed_revenue"]["target"] == 1000.0
-    assert east_metrics["signed_revenue"]["actual"] == 400.0
-    assert east_metrics["collection"]["target"] == 800.0
-    assert east_metrics["collection"]["actual"] == 200.0
-    assert all_metrics["signed_revenue"]["target"] == 6000.0
-    assert all_metrics["signed_revenue"]["actual"] == 2900.0
-    assert all_metrics["collection"]["target"] == 4800.0
-    assert all_metrics["collection"]["actual"] == 1700.0
+    assert east_result["scope"]["organization_unit_ids"] == [str(seeded["east_id"])]
+    assert set(all_result["scope"]["organization_unit_ids"]) == {
+        str(seeded["east_id"]),
+        str(seeded["west_id"]),
+    }
 
 
 def test_data_capabilities_exposes_domain_freshness(client, seeded) -> None:

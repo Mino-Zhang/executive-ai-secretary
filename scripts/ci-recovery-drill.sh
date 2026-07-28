@@ -96,6 +96,7 @@ printf '%s\n' "${executive_password}" | "${SCRIPT_DIR}/create-executive.sh" \
 "${SCRIPT_DIR}/seed-demo.sh" local-demo ci-enterprise "SEED local-demo/ci-enterprise"
 
 load_runtime_environment local-demo
+source_db_name="${SOURCE_DB_NAME:-executive_ai_source_demo}"
 api="${PUBLIC_BASE_URL}/api/v1"
 admin_cookie="${temporary_dir}/admin.cookies"
 executive_cookie="${temporary_dir}/executive.cookies"
@@ -146,6 +147,18 @@ curl --fail-with-body --silent --show-error --cookie "${executive_cookie}" \
   "${api}/files/${baseline_file_id}/content" --output "${temporary_dir}/downloaded-before.txt"
 cmp "${temporary_dir}/baseline.txt" "${temporary_dir}/downloaded-before.txt"
 
+compose local-demo exec -T source-postgres \
+  psql --username executive_ai_source --dbname "${source_db_name}" \
+    --set=ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE IF NOT EXISTS public.ci_recovery_marker (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  marker text NOT NULL
+);
+INSERT INTO public.ci_recovery_marker (singleton, marker)
+VALUES (true, 'ci-source-baseline')
+ON CONFLICT (singleton) DO UPDATE SET marker = EXCLUDED.marker;
+SQL
+
 backup_dir="$("${SCRIPT_DIR}/backup.sh" local-demo ci-recovery-baseline)"
 
 transient_conversation="$(curl --fail-with-body --silent --show-error \
@@ -166,6 +179,13 @@ transient_file="$(curl --fail-with-body --silent --show-error \
   "${api}/files")"
 transient_file_id="$(printf '%s' "${transient_file}" | json_field id)"
 
+compose local-demo exec -T source-postgres \
+  psql --username executive_ai_source --dbname "${source_db_name}" \
+    --set=ON_ERROR_STOP=1 \
+    --command "UPDATE public.ci_recovery_marker
+      SET marker = 'ci-source-transient'
+      WHERE singleton = true;"
+
 "${SCRIPT_DIR}/restore.sh" local-demo "${backup_dir}" "RESTORE local-demo"
 
 curl --fail-with-body --silent --show-error --cookie "${executive_cookie}" \
@@ -177,6 +197,15 @@ curl --fail-with-body --silent --show-error --cookie "${executive_cookie}" \
 cmp "${temporary_dir}/baseline.txt" "${temporary_dir}/downloaded-after.txt"
 [ "$(http_status --cookie "${executive_cookie}" "${api}/files/${transient_file_id}")" = "404" ] \
   || die "post-backup file metadata survived restore"
+restored_source_marker="$(
+  compose local-demo exec -T source-postgres \
+    psql --username executive_ai_source --dbname "${source_db_name}" \
+      --tuples-only --no-align \
+      --command "SELECT marker FROM public.ci_recovery_marker WHERE singleton = true;" \
+    | tail -n 1
+)"
+[ "${restored_source_marker}" = "ci-source-baseline" ] \
+  || die "managed source database did not return to the backup consistency point"
 
 "${SCRIPT_DIR}/smoke-test.sh" local-demo
-info "CI recovery drill passed: auth, first-password change, RBAC, encrypted file I/O and restore integrity."
+info "CI recovery drill passed: auth, RBAC, product/source databases, encrypted files and restore integrity."

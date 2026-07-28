@@ -47,7 +47,12 @@ FEISHU_FIELDS = {
 
 
 class FeishuError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        if code is not None:
+            self.code = code
+        elif not hasattr(self, "code"):
+            self.code = "feishu_api_failed"
+        super().__init__(message)
 
 
 def _feishu_value(value: object) -> object:
@@ -94,10 +99,14 @@ class FeishuBitableClient:
             "/auth/v3/tenant_access_token/internal",
             json={"app_id": self.app_id, "app_secret": self.app_secret},
         )
-        response.raise_for_status()
         payload = response.json()
         if payload.get("code") != 0 or not payload.get("tenant_access_token"):
-            raise FeishuError(f"飞书鉴权失败: {payload.get('msg', 'unknown error')}")
+            raise FeishuError(
+                f"飞书鉴权失败 [{payload.get('code', response.status_code)}]: "
+                f"{payload.get('msg', 'unknown error')}",
+                code=str(payload.get("code") or "feishu_auth_failed"),
+            )
+        response.raise_for_status()
         self._token = str(payload["tenant_access_token"])
         self._token_expires_at = time.monotonic() + int(payload.get("expire", 7200))
         return self._token
@@ -106,15 +115,39 @@ class FeishuBitableClient:
         headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {self._tenant_token()}"
         response = self.client.request(method, path, headers=headers, **kwargs)
-        response.raise_for_status()
         payload = response.json()
         if payload.get("code") != 0:
-            raise FeishuError(f"飞书接口失败: {payload.get('msg', 'unknown error')}")
+            raise FeishuError(
+                f"飞书接口失败 [{payload.get('code', response.status_code)}]: "
+                f"{payload.get('msg', 'unknown error')}",
+                code=str(payload.get("code") or "feishu_api_failed"),
+            )
+        response.raise_for_status()
         return payload
 
     @property
     def records_path(self) -> str:
         return f"/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/records"
+
+    @property
+    def fields_path(self) -> str:
+        return f"/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/fields"
+
+    def list_fields(self, *, page_size: int = 100) -> list[dict[str, Any]]:
+        fields: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {"page_size": page_size}
+            if page_token:
+                params["page_token"] = page_token
+            payload = self._request("GET", self.fields_path, params=params)
+            data = payload.get("data") or {}
+            fields.extend(data.get("items") or [])
+            if not data.get("has_more"):
+                return fields
+            page_token = data.get("page_token")
+            if not page_token:
+                raise FeishuError("飞书字段分页响应缺少 page_token")
 
     def iter_records(self, *, page_size: int = 500) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []

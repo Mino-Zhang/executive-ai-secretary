@@ -85,7 +85,12 @@ def update_harness_config(
     principal: OperationsPrincipal,
     db: Annotated[Session, Depends(get_db)],
 ) -> HarnessConfigOut:
-    clean = validate_harness_config(payload.config)
+    clean = validate_harness_config(
+        payload.config,
+        allowed_tools={
+            item["tool_name"] for item in effective_catalog(db, principal.enterprise_id)
+        },
+    )
     current = db.scalar(
         select(HarnessConfigVersion)
         .where(
@@ -176,7 +181,12 @@ def restore_harness_version(
     )
     if current:
         current.is_active = False
-    clean = validate_harness_config(source.config_json)
+    clean = validate_harness_config(
+        source.config_json,
+        allowed_tools={
+            item["tool_name"] for item in effective_catalog(db, principal.enterprise_id)
+        },
+    )
     row = HarnessConfigVersion(
         enterprise_id=principal.enterprise_id,
         version=next_harness_version(db, principal.enterprise_id),
@@ -241,7 +251,12 @@ def simulate_harness(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HarnessSimulationOut:
     current = active_harness_config(db, principal.enterprise_id)
-    config = validate_harness_config(payload.config or current.config_json)
+    config = validate_harness_config(
+        payload.config or current.config_json,
+        allowed_tools={
+            item["tool_name"] for item in effective_catalog(db, principal.enterprise_id)
+        },
+    )
     scope, resolved_ids = _simulation_scope(
         db, principal.enterprise_id, payload.organization_scope
     )

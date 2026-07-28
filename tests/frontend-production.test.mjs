@@ -110,9 +110,44 @@ test("management exposes a restrained MCP registry instead of arbitrary executio
   assert.match(admin, /最大返回行数/);
   assert.match(admin, /依赖数据域/);
   assert.match(admin, /规划器可用参数/);
+  assert.match(admin, /新增工具/);
+  assert.match(admin, /企业组合工具/);
+  assert.match(admin, /1–4 个系统工具/);
+  assert.match(services, /adminMcp[\s\S]*create/);
+  assert.match(types, /McpCompositeToolCreate/);
   assert.match(services, /\/admin\/mcp-tools/);
   assert.match(types, /planner_enabled/);
   assert.doesNotMatch(admin, /SQL 编辑器|脚本编辑器|自定义工具 URL/);
+});
+
+test("management includes controlled data operations and a collapsible guide", async () => {
+  const admin = await read("../app/production/production-admin.tsx");
+  const services = await read("../app/production/services.ts");
+  const types = await read("../app/production/types.ts");
+
+  assert.match(admin, /数据运营/);
+  assert.match(admin, /DataOperationsPanel/);
+  assert.match(admin, /飞书三表绑定/);
+  assert.match(admin, /校验但不生效/);
+  assert.match(admin, /同步并原子切换/);
+  assert.match(admin, /跨表关联检查/);
+  assert.match(admin, /金额恒等式/);
+  assert.match(admin, /经验权重口径/);
+  assert.match(admin, /这不是赢单概率/);
+  assert.match(admin, /AdminGuide/);
+  assert.match(admin, /收起页面说明/);
+  assert.match(admin, /executive-workbench-theme/);
+  assert.match(admin, /saved.*\?.*saved.*: "system"/);
+  assert.match(services, /\/admin\/data-operations\/overview/);
+  assert.match(services, /\/admin\/data-sources/);
+  assert.match(services, /\/validate/);
+  assert.match(services, /\/admin\/data-sync-runs/);
+  assert.match(services, /\/admin\/scheduled-tasks/);
+  assert.match(services, /\/admin\/metric-policies\/opportunity-experience-weight/);
+  assert.match(types, /source_schema_hashes_json/);
+  assert.match(types, /source_record_counts_json/);
+  assert.match(types, /cross_table_validation_json/);
+  assert.match(types, /OpportunityExperienceWeightPolicy/);
 });
 
 test("phase three workspace uses scoped multi-organization chat without legacy empty-state copy", async () => {

@@ -607,6 +607,35 @@ class McpToolConfig(UUIDMixin, TimestampMixin, Base):
     )
 
 
+class McpToolDefinition(UUIDMixin, TimestampMixin, Base):
+    """Enterprise-owned declarative tools composed from audited built-in tools."""
+
+    __tablename__ = "mcp_tool_definitions"
+    __table_args__ = (
+        UniqueConstraint("enterprise_id", "tool_name", name="uq_mcp_definition_enterprise_name"),
+        Index("ix_mcp_definition_enterprise_type", "enterprise_id", "tool_type"),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(String(80), nullable=False)
+    tool_type: Mapped[str] = mapped_column(String(32), default="composite", nullable=False)
+    component_tools_json: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+    domains_json: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+    parameters_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
 class HarnessConfigVersion(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "harness_config_versions"
     __table_args__ = (
@@ -724,6 +753,59 @@ class ScheduleRun(UUIDMixin, TimestampMixin, Base):
     error_message: Mapped[str | None] = mapped_column(Text)
 
 
+class OpportunityExperienceWeightPolicy(UUIDMixin, TimestampMixin, Base):
+    """Versioned, auditable experience weights used for pipeline forecasting.
+
+    These values are an operating convention rather than a claim about the
+    statistical probability of winning an opportunity.  Only one policy may
+    be active for an enterprise at a time.
+    """
+
+    __tablename__ = "opportunity_experience_weight_policies"
+    __table_args__ = (
+        UniqueConstraint(
+            "enterprise_id",
+            "version",
+            name="uq_opportunity_weight_policy_enterprise_version",
+        ),
+        Index(
+            "ix_opportunity_weight_policy_enterprise_active",
+            "enterprise_id",
+            "is_active",
+        ),
+        Index(
+            "uq_opportunity_weight_policy_one_active",
+            "enterprise_id",
+            unique=True,
+            postgresql_where=text("is_active"),
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str] = mapped_column(String(160), nullable=False)
+    weights_json: Mapped[dict[str, float]] = mapped_column(
+        JSONType,
+        default=lambda: {"high": 0.20, "medium": 0.10, "low": 0.05},
+        nullable=False,
+    )
+    observation_windows_json: Mapped[list[int]] = mapped_column(
+        JSONType, default=lambda: [30, 60, 90], nullable=False
+    )
+    observation_window_days: Mapped[int] = mapped_column(Integer, default=90, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
 class DataSyncRun(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "data_sync_runs"
     __table_args__ = (
@@ -751,6 +833,30 @@ class DataSyncRun(UUIDMixin, TimestampMixin, Base):
     records_read: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     records_written: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     records_rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source_schema_hashes_json: Mapped[dict[str, str]] = mapped_column(
+        JSONType, default=dict, nullable=False
+    )
+    source_record_counts_json: Mapped[dict[str, int]] = mapped_column(
+        JSONType, default=dict, nullable=False
+    )
+    source_content_hashes_json: Mapped[dict[str, str]] = mapped_column(
+        JSONType, default=dict, nullable=False
+    )
+    cross_table_validation_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONType, default=dict, nullable=False
+    )
+    activation_mode: Mapped[str] = mapped_column(
+        String(40), default="all_three_atomic", nullable=False
+    )
+    atomic_activation_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False
+    )
+    experience_weight_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("opportunity_experience_weight_policies.id", ondelete="SET NULL"),
+        index=True,
+    )
+    activation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     domain_results_json: Mapped[dict[str, Any]] = mapped_column(
         JSONType, default=dict, nullable=False
     )
@@ -785,6 +891,9 @@ class DataDomainStatus(UUIDMixin, TimestampMixin, Base):
     dataset_version: Mapped[str | None] = mapped_column(String(80))
     source_type: Mapped[str] = mapped_column(String(64), nullable=False)
     source_display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    current_source_batch_id: Mapped[str | None] = mapped_column(String(160))
+    contract_version: Mapped[str | None] = mapped_column(String(32))
+    status_reason: Mapped[str | None] = mapped_column(Text)
     last_error_code: Mapped[str | None] = mapped_column(String(100))
     last_error_message: Mapped[str | None] = mapped_column(Text)
 
@@ -824,6 +933,9 @@ class DimPerson(UUIDMixin, TimestampMixin, Base):
     )
     source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
     display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    normalized_name: Mapped[str | None] = mapped_column(String(200))
+    identity_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    role_types_json: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
     role_title: Mapped[str | None] = mapped_column(String(160))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     source_system: Mapped[str] = mapped_column(String(80), nullable=False)
@@ -854,6 +966,10 @@ class DimCustomer(UUIDMixin, TimestampMixin, Base):
     )
     source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
     display_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    normalized_name: Mapped[str | None] = mapped_column(String(240))
+    identity_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    aliases_json: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+    customer_value_level: Mapped[str | None] = mapped_column(String(40))
     industry: Mapped[str | None] = mapped_column(String(120))
     region: Mapped[str | None] = mapped_column(String(120))
     source_system: Mapped[str] = mapped_column(String(80), nullable=False)
@@ -894,20 +1010,92 @@ class FactOpportunity(UUIDMixin, TimestampMixin, Base):
         ForeignKey("dim_person.id", ondelete="SET NULL")
     )
     source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    upstream_record_id: Mapped[str | None] = mapped_column(String(160))
     opportunity_code: Mapped[str] = mapped_column(String(120), nullable=False)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     stage: Mapped[str] = mapped_column(String(80), nullable=False)
     status: Mapped[str] = mapped_column(String(40), nullable=False)
-    probability: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage_label: Mapped[str | None] = mapped_column(String(80))
+    status_code: Mapped[str | None] = mapped_column(String(40), index=True)
+    reliability_level: Mapped[str | None] = mapped_column(String(24), index=True)
+    customer_value_level: Mapped[str | None] = mapped_column(String(40))
+    industry: Mapped[str | None] = mapped_column(String(120))
+    probability: Mapped[int | None] = mapped_column(Integer)
     expected_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
-    expected_gross_profit: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    signed_amount: Mapped[float | None] = mapped_column(Numeric(18, 2))
+    expected_gross_profit: Mapped[float | None] = mapped_column(Numeric(18, 2))
     created_date: Mapped[date] = mapped_column(Date, nullable=False)
     expected_close_date: Mapped[date] = mapped_column(Date, nullable=False)
     closed_date: Mapped[date | None] = mapped_column(Date)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latest_progress: Mapped[str | None] = mapped_column(Text)
     source_system: Mapped[str] = mapped_column(String(80), nullable=False)
     source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     dataset_version: Mapped[str | None] = mapped_column(String(80))
     is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class FactOpportunityParticipant(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "fact_opportunity_participant"
+    __table_args__ = (
+        UniqueConstraint(
+            "opportunity_id",
+            "person_id",
+            "participant_role",
+            name="uq_fact_opportunity_participant_role",
+        ),
+        Index(
+            "ix_fact_opportunity_participant_lookup",
+            "enterprise_id",
+            "participant_role",
+            "person_id",
+        ),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    opportunity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("fact_opportunity.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    person_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("dim_person.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    participant_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class FactOpportunityProduct(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "fact_opportunity_product"
+    __table_args__ = (
+        UniqueConstraint(
+            "opportunity_id",
+            "normalized_product_name",
+            name="uq_fact_opportunity_product_name",
+        ),
+        Index(
+            "ix_fact_opportunity_product_lookup",
+            "enterprise_id",
+            "normalized_product_name",
+        ),
+    )
+
+    enterprise_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("enterprises.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("data_sync_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    opportunity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("fact_opportunity.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    normalized_product_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class FactDelivery(UUIDMixin, TimestampMixin, Base):
@@ -938,6 +1126,12 @@ class FactDelivery(UUIDMixin, TimestampMixin, Base):
     manager_person_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("dim_person.id", ondelete="SET NULL")
     )
+    delivery_owner_person_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_person.id", ondelete="SET NULL")
+    )
+    opportunity_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("fact_opportunity.id", ondelete="CASCADE"), index=True
+    )
     source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
     opportunity_source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
     project_code: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -946,12 +1140,15 @@ class FactDelivery(UUIDMixin, TimestampMixin, Base):
     risk_level: Mapped[str] = mapped_column(String(40), nullable=False)
     completion_percent: Mapped[int] = mapped_column(Integer, nullable=False)
     contract_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    recognized_revenue: Mapped[float | None] = mapped_column(Numeric(18, 2))
     gross_margin_rate: Mapped[float] = mapped_column(Numeric(8, 4), nullable=False)
     planned_start_date: Mapped[date] = mapped_column(Date, nullable=False)
     planned_end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    actual_start_date: Mapped[date | None] = mapped_column(Date)
     actual_end_date: Mapped[date | None] = mapped_column(Date)
     current_milestone: Mapped[str | None] = mapped_column(String(200))
     delay_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    latest_progress: Mapped[str | None] = mapped_column(Text)
     source_system: Mapped[str] = mapped_column(String(80), nullable=False)
     source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     dataset_version: Mapped[str | None] = mapped_column(String(80))
@@ -986,9 +1183,18 @@ class FactFinanceCollection(UUIDMixin, TimestampMixin, Base):
     customer_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("dim_customer.id", ondelete="SET NULL")
     )
+    opportunity_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("fact_opportunity.id", ondelete="CASCADE"), index=True
+    )
+    delivery_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("fact_delivery.id", ondelete="CASCADE"), index=True
+    )
+    collection_owner_person_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dim_person.id", ondelete="SET NULL")
+    )
     source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
     project_source_record_id: Mapped[str] = mapped_column(String(160), nullable=False)
-    invoice_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    invoice_amount: Mapped[float | None] = mapped_column(Numeric(18, 2))
     receivable_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
     collected_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
     outstanding_amount: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
@@ -997,6 +1203,11 @@ class FactFinanceCollection(UUIDMixin, TimestampMixin, Base):
     overdue_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     aging_bucket: Mapped[str] = mapped_column(String(40), nullable=False)
     status: Mapped[str] = mapped_column(String(40), nullable=False)
+    payment_type: Mapped[str | None] = mapped_column(String(80))
+    payment_milestone: Mapped[str | None] = mapped_column(String(160))
+    invoice_status: Mapped[str | None] = mapped_column(String(40))
+    invoice_number: Mapped[str | None] = mapped_column(String(120))
+    latest_follow_up: Mapped[str | None] = mapped_column(Text)
     source_system: Mapped[str] = mapped_column(String(80), nullable=False)
     source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     dataset_version: Mapped[str | None] = mapped_column(String(80))
@@ -1042,11 +1253,24 @@ class FactTarget(UUIDMixin, TimestampMixin, Base):
 class DailySnapshot(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "daily_snapshot"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_daily_snapshot_org_date_batch",
             "enterprise_id",
             "organization_unit_id",
             "snapshot_date",
-            name="uq_daily_snapshot_scope_date",
+            text("coalesce(source_batch_id, '')"),
+            unique=True,
+            postgresql_where=text("organization_unit_id IS NOT NULL"),
+            sqlite_where=text("organization_unit_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_daily_snapshot_enterprise_date_batch",
+            "enterprise_id",
+            "snapshot_date",
+            text("coalesce(source_batch_id, '')"),
+            unique=True,
+            postgresql_where=text("organization_unit_id IS NULL"),
+            sqlite_where=text("organization_unit_id IS NULL"),
         ),
         Index("ix_daily_snapshot_enterprise_date", "enterprise_id", "snapshot_date"),
     )
@@ -1060,6 +1284,7 @@ class DailySnapshot(UUIDMixin, TimestampMixin, Base):
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
     source_data_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     dataset_version: Mapped[str | None] = mapped_column(String(80))
+    source_batch_id: Mapped[str | None] = mapped_column(String(160), index=True)
     metrics_json: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
     anomalies_json: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONType, default=list, nullable=False

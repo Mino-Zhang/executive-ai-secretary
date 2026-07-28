@@ -224,6 +224,25 @@ assert_service_database_identity mcp-hub hermes-runtime postgres_mcp_password PO
 grep -q "(:'mcp_user', 'fact_opportunity')" \
   "${REPO_ROOT}/deploy/postgres/ensure-runtime-role.sh" \
   || die "MCP role is missing explicit business-fact read access"
+for table_name in \
+  data_sync_runs \
+  mcp_tool_definitions \
+  opportunity_experience_weight_policies \
+  dim_person \
+  fact_opportunity_participant \
+  fact_opportunity_product; do
+  grep -q "(:'mcp_user', '${table_name}')" \
+    "${REPO_ROOT}/deploy/postgres/ensure-runtime-role.sh" \
+    || die "MCP role is missing V3 read access: ${table_name}"
+done
+for table_name in \
+  opportunity_experience_weight_policies \
+  fact_opportunity_participant \
+  fact_opportunity_product; do
+  grep -q "(:'ingestion_user', '${table_name}')" \
+    "${REPO_ROOT}/deploy/postgres/ensure-runtime-role.sh" \
+    || die "ingestion role is missing V3 read access: ${table_name}"
+done
 if grep -Eq "\(:'mcp_user', '(INSERT|UPDATE|DELETE)" \
   "${REPO_ROOT}/deploy/postgres/ensure-runtime-role.sh"; then
   die "MCP role receives a mutation grant"
@@ -564,14 +583,39 @@ fi
 restore_script="${SCRIPT_DIR}/restore.sh"
 compatibility_line="$(grep -n 'executive_ai_api.migration_compatibility' "${restore_script}" | head -n 1 | cut -d: -f1)"
 destructive_restore_line="$(grep -n 'pg_restore --username' "${restore_script}" | head -n 1 | cut -d: -f1)"
+source_restore_line="$(grep -n 'Restoring the managed sanitized source database' "${restore_script}" | head -n 1 | cut -d: -f1)"
+file_restore_line="$(grep -n 'Replacing the isolated private-file volume' "${restore_script}" | head -n 1 | cut -d: -f1)"
 if [ -z "${compatibility_line}" ] || [ -z "${destructive_restore_line}" ] \
   || [ "${compatibility_line}" -ge "${destructive_restore_line}" ]; then
   die "restore does not reject incompatible migrations before destructive pg_restore"
+fi
+if [ -z "${source_restore_line}" ] || [ -z "${file_restore_line}" ] \
+  || [ "${destructive_restore_line}" -ge "${source_restore_line}" ] \
+  || [ "${source_restore_line}" -ge "${file_restore_line}" ]; then
+  die "restore must apply product database, managed source database and files in that order"
 fi
 for restore_step in db-role-init migrate db-permissions restored_revision; do
   grep -q "${restore_step}" "${restore_script}" \
     || die "restore is missing required migration/permission step: ${restore_step}"
 done
+[ "$(grep -c -- '--single-transaction' "${restore_script}")" -ge 2 ] \
+  || die "product and managed source database restores must each be transactional"
+grep -q 'Legacy backup has no managed source-database artifact' "${restore_script}" \
+  || die "restore does not document its backward-compatible source-database behavior"
+grep -q 'partially restored environment remains stopped' "${restore_script}" \
+  || die "restore does not fail closed after a partial destructive restore"
+grep -q 'ci-source-baseline' "${SCRIPT_DIR}/ci-recovery-drill.sh" \
+  || die "CI recovery drill does not verify managed source-database restoration"
+
+reset_v3_script="${SCRIPT_DIR}/reset-local-demo-operating-data-v3.sh"
+grep -q 'mode_or_backup="${2:-}"' "${reset_v3_script}" \
+  || die "V3 reset wrapper does not expose its safe dry-run mode"
+# shellcheck disable=SC2016
+grep -q 'export DATABASE_URL="postgresql+psycopg://${POSTGRES_API_USER}:${DB_PASSWORD}@postgres:5432/${POSTGRES_DB}"' \
+  "${reset_v3_script}" \
+  || die "V3 reset wrapper does not construct the in-container database URL"
+grep -q "local-demo --dry-run" "${REPO_ROOT}/docs/operations/operating-data-v3-cutover.md" \
+  || die "V3 cutover runbook does not use the protected dry-run wrapper"
 
 # These nginx variables are intentionally matched literally.
 # shellcheck disable=SC2016

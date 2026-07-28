@@ -53,6 +53,17 @@ openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
   -pass "file:${backup_key}" -in "${database_file}" \
   | compose "${environment}" exec -T postgres pg_restore --list >/dev/null
 
+source_database_name="$(manifest_value source_database_file)"
+if [ -n "${source_database_name}" ]; then
+  source_database_file="${backup_dir}/${source_database_name}"
+  [ -s "${source_database_file}" ] || die "encrypted source database artifact is missing"
+  [ "$(sha256_file "${source_database_file}")" = "$(manifest_value source_database_sha256)" ] \
+    || die "source database backup checksum mismatch"
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+    -pass "file:${backup_key}" -in "${source_database_file}" \
+    | compose "${environment}" exec -T source-postgres pg_restore --list >/dev/null
+fi
+
 openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
   -pass "file:${backup_key}" -in "${files_file}" \
   | tar -tf - >/dev/null

@@ -121,7 +121,9 @@ def _clean_text(value: Any, *, field: str, minimum: int = 1, maximum: int = 1200
     return cleaned
 
 
-def validate_harness_config(raw: dict[str, Any]) -> dict[str, Any]:
+def validate_harness_config(
+    raw: dict[str, Any], *, allowed_tools: set[str] | None = None
+) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) != {"prompts", "glossary", "fast_rules"}:
         raise AppError(422, "invalid_harness_config", "编排配置结构无效")
     prompts = raw.get("prompts")
@@ -185,7 +187,7 @@ def validate_harness_config(raw: dict[str, Any]) -> dict[str, Any]:
         candidate_tools = item.get("candidate_tools", [])
         if not isinstance(candidate_tools, list) or len(candidate_tools) > 4:
             raise AppError(422, "invalid_harness_config", "候选 MCP 工具最多 4 个")
-        unknown_tools = set(candidate_tools) - set(MCP_TOOL_SPECS)
+        unknown_tools = set(candidate_tools) - (allowed_tools or set(MCP_TOOL_SPECS))
         if unknown_tools:
             raise AppError(
                 422,

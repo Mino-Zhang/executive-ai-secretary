@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import McpToolConfig
+from .models import McpToolConfig, McpToolDefinition
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,10 @@ class McpToolSpec:
     parameters: dict[str, dict[str, Any]]
     default_limit: int = 50
     default_timeout_seconds: int = 20
+    source_type: str = "built_in"
+    component_tools: tuple[str, ...] = ()
+    definition_version: int = 1
+    planner_selectable: bool = True
 
 
 COMMON_PERIOD_PARAMETERS = {
@@ -49,17 +53,17 @@ MCP_TOOL_SPECS: dict[str, McpToolSpec] = {
     "get_overall_business": McpToolSpec(
         name="get_overall_business",
         display_name="整体经营概览",
-        description="汇总商机、交付、应收、回款和逾期等核心经营指标。",
+        description=("汇总签约、在途商机、项目合同、已确认收入、应收、回款和逾期等核心经营指标。"),
         category="综合经营",
-        domains=("opportunity", "delivery", "collection", "target"),
+        domains=("opportunity", "delivery", "collection"),
         parameters=COMMON_PERIOD_PARAMETERS,
     ),
     "get_target_completion": McpToolSpec(
         name="get_target_completion",
         display_name="目标完成情况",
-        description="按月、季度或年度口径核对目标、实际值和完成率。",
+        description="目标数据域尚未接入；明确调用时返回当前接入状态。",
         category="目标与计划",
-        domains=("target", "opportunity", "collection"),
+        domains=("target",),
         parameters={
             "period_type": {
                 "type": "string",
@@ -68,34 +72,64 @@ MCP_TOOL_SPECS: dict[str, McpToolSpec] = {
             },
             "period_start": COMMON_PERIOD_PARAMETERS["period_start"],
         },
+        planner_selectable=False,
     ),
     "get_opportunity_funnel": McpToolSpec(
         name="get_opportunity_funnel",
         display_name="商机漏斗",
-        description="按阶段汇总商机数量、金额和加权金额。",
+        description=(
+            "按阶段汇总商机数量、金额和经验权重金额，并支持靠谱度、客户价值、行业、"
+            "产品及负责人筛选。"
+        ),
         category="销售与商机",
         domains=("opportunity",),
         parameters={
             **COMMON_PERIOD_PARAMETERS,
             "statuses": {
                 "type": "array",
-                "items": {"type": "string", "enum": ["active", "stalled", "won", "lost", "paused"]},
+                "items": {
+                    "type": "string",
+                    "enum": ["active", "won", "paused", "archived"],
+                },
                 "description": "商机状态过滤",
             },
+            "reliability_levels": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["high", "medium", "low"]},
+                "description": "商机靠谱度过滤",
+            },
+            "customer_value_levels": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "客户价值等级过滤",
+            },
+            "industries": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "行业过滤",
+            },
+            "product_services": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "产品或服务过滤",
+            },
+            "sales_owner_query": {"type": "string", "maxLength": 120},
+            "presales_owner_query": {"type": "string", "maxLength": 120},
         },
     ),
     "get_sales_forecast": McpToolSpec(
         name="get_sales_forecast",
         display_name="销售预测",
-        description="计算加权商机预测，并返回影响最大的商机。",
+        description=(
+            "按版本化的保守经验权重计算在途商机预测，单列已赢单签约额，并返回影响最大的商机。"
+        ),
         category="销售与商机",
         domains=("opportunity",),
         parameters={
             **COMMON_PERIOD_PARAMETERS,
-            "min_probability": {"type": "integer", "minimum": 0, "maximum": 100},
-            "statuses": {
+            "reliability_levels": {
                 "type": "array",
-                "items": {"type": "string", "enum": ["active", "stalled", "won", "lost", "paused"]},
+                "items": {"type": "string", "enum": ["high", "medium", "low"]},
             },
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
         },
@@ -103,7 +137,7 @@ MCP_TOOL_SPECS: dict[str, McpToolSpec] = {
     "get_customer_status": McpToolSpec(
         name="get_customer_status",
         display_name="客户经营情况",
-        description="查询客户应收、逾期和风险排序，支持脱敏客户名称检索。",
+        description="关联查询客户商机、项目、应收、回款和逾期，支持脱敏客户名称检索。",
         category="客户与回款",
         domains=("opportunity", "delivery", "collection"),
         parameters={
@@ -115,7 +149,7 @@ MCP_TOOL_SPECS: dict[str, McpToolSpec] = {
     "get_delivery_status": McpToolSpec(
         name="get_delivery_status",
         display_name="项目交付情况",
-        description="查询项目进度、风险、延期天数和当前里程碑。",
+        description=("查询项目经理、交付负责人、项目进度、风险、合同金额、已确认收入和最新进展。"),
         category="项目与交付",
         domains=("delivery",),
         parameters={
@@ -132,7 +166,7 @@ MCP_TOOL_SPECS: dict[str, McpToolSpec] = {
     "get_finance_margin": McpToolSpec(
         name="get_finance_margin",
         display_name="收入与毛利",
-        description="汇总合同金额、毛利金额和综合毛利率。",
+        description="区分项目合同金额与已确认收入，并按已确认收入计算毛利金额和综合毛利率。",
         category="财务经营",
         domains=("delivery", "collection"),
         parameters=COMMON_PERIOD_PARAMETERS,
@@ -140,27 +174,34 @@ MCP_TOOL_SPECS: dict[str, McpToolSpec] = {
     "get_collection_aging": McpToolSpec(
         name="get_collection_aging",
         display_name="回款与账龄",
-        description="按账龄汇总未回款金额，并可限定客户或逾期区间。",
+        description=(
+            "按账龄汇总未回款金额，展示付款节点、开票状态和回款责任人，并可限定客户或逾期区间。"
+        ),
         category="客户与回款",
         domains=("collection",),
         parameters={
             "customer_query": {"type": "string", "maxLength": 120},
             "aging_buckets": {"type": "array", "items": {"type": "string"}},
             "minimum_overdue_days": {"type": "integer", "minimum": 0, "maximum": 3650},
+            "payment_types": {"type": "array", "items": {"type": "string"}},
+            "payment_milestones": {"type": "array", "items": {"type": "string"}},
+            "invoice_statuses": {"type": "array", "items": {"type": "string"}},
+            "owner_query": {"type": "string", "maxLength": 120},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
         },
     ),
     "get_organization_performance": McpToolSpec(
         name="get_organization_performance",
         display_name="事业部表现",
-        description="比较获准范围内各事业部的回款和未回款表现。",
+        description=("在同一原子批次内比较获准事业部的签约、合同、已确认收入、应收和回款表现。"),
         category="组织分析",
-        domains=("opportunity", "delivery", "collection", "target"),
+        domains=("opportunity", "delivery", "collection"),
         parameters=COMMON_PERIOD_PARAMETERS,
     ),
     "get_daily_changes": McpToolSpec(
         name="get_daily_changes",
         display_name="经营变化",
-        description="读取最近经营快照，识别日度变化和异常事项。",
+        description="只比较同一3.0数据契约下相邻成功原子批次的经营变化和异常事项。",
         category="综合经营",
         domains=("opportunity", "delivery", "collection"),
         parameters={
@@ -180,10 +221,42 @@ def configured_rows(db: Session, enterprise_id: uuid.UUID) -> dict[str, McpToolC
     }
 
 
+def custom_tool_specs(db: Session, enterprise_id: uuid.UUID) -> dict[str, McpToolSpec]:
+    rows = db.scalars(
+        select(McpToolDefinition)
+        .where(McpToolDefinition.enterprise_id == enterprise_id)
+        .order_by(McpToolDefinition.created_at, McpToolDefinition.tool_name)
+    ).all()
+    return {
+        row.tool_name: McpToolSpec(
+            name=row.tool_name,
+            display_name=row.display_name,
+            description=row.description,
+            category=row.category,
+            domains=tuple(str(value) for value in row.domains_json),
+            parameters={str(key): value for key, value in row.parameters_json.items()},
+            source_type=row.tool_type,
+            component_tools=tuple(str(value) for value in row.component_tools_json),
+            definition_version=row.version,
+        )
+        for row in rows
+    }
+
+
+def registered_specs(db: Session, enterprise_id: uuid.UUID) -> dict[str, McpToolSpec]:
+    # System tools are an immutable safety boundary. Even if a malformed legacy
+    # row reuses a built-in name, it must never replace the audited definition.
+    return {**custom_tool_specs(db, enterprise_id), **MCP_TOOL_SPECS}
+
+
+def registered_spec(db: Session, enterprise_id: uuid.UUID, tool_name: str) -> McpToolSpec | None:
+    return registered_specs(db, enterprise_id).get(tool_name)
+
+
 def effective_catalog(db: Session, enterprise_id: uuid.UUID) -> list[dict[str, Any]]:
     configured = configured_rows(db, enterprise_id)
     catalog: list[dict[str, Any]] = []
-    for spec in MCP_TOOL_SPECS.values():
+    for spec in registered_specs(db, enterprise_id).values():
         row = configured.get(spec.name)
         catalog.append(
             {
@@ -193,8 +266,13 @@ def effective_catalog(db: Session, enterprise_id: uuid.UUID) -> list[dict[str, A
                 "category": spec.category,
                 "domains": list(spec.domains),
                 "parameters": spec.parameters,
+                "source_type": spec.source_type,
+                "component_tools": list(spec.component_tools),
+                "definition_version": spec.definition_version,
                 "is_enabled": row.is_enabled if row else True,
-                "planner_enabled": row.planner_enabled if row else True,
+                "planner_enabled": (
+                    spec.planner_selectable and (row.planner_enabled if row else True)
+                ),
                 "timeout_seconds": row.timeout_seconds if row else spec.default_timeout_seconds,
                 "max_rows": row.max_rows if row else spec.default_limit,
                 "operator_note": row.operator_note if row else None,
@@ -213,9 +291,7 @@ def planner_catalog(db: Session, enterprise_id: uuid.UUID) -> list[dict[str, Any
     ]
 
 
-def effective_tool(
-    db: Session, enterprise_id: uuid.UUID, tool_name: str
-) -> dict[str, Any] | None:
+def effective_tool(db: Session, enterprise_id: uuid.UUID, tool_name: str) -> dict[str, Any] | None:
     return next(
         (item for item in effective_catalog(db, enterprise_id) if item["tool_name"] == tool_name),
         None,

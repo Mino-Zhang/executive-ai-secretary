@@ -19,6 +19,12 @@ SQL
 psql --set=ON_ERROR_STOP=1 --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" \
   --file /opt/executive-ai-source/standard-ods.sql
 
+# Keep the 2.0 schema during the controlled migration, while every newly
+# provisioned managed source database also receives the isolated 3.0 shadow
+# contract.  Runtime cut-over is performed separately after validation.
+psql --set=ON_ERROR_STOP=1 --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" \
+  --file /opt/executive-ai-source/standard-ods-v3.sql
+
 psql --set=ON_ERROR_STOP=1 --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" <<'SQL'
 REVOKE ALL ON SCHEMA executive_source FROM PUBLIC;
 GRANT USAGE ON SCHEMA executive_source TO source_reader, source_writer;
@@ -50,4 +56,35 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA executive_source TO source_writer
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA executive_source REVOKE ALL ON TABLES FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA executive_source REVOKE ALL ON SEQUENCES FROM PUBLIC;
+
+REVOKE ALL ON SCHEMA executive_source_v3 FROM PUBLIC;
+GRANT USAGE ON SCHEMA executive_source_v3 TO source_reader, source_writer;
+
+GRANT SELECT ON TABLE
+  executive_source_v3.ods_schema_version,
+  executive_source_v3.source_batches,
+  executive_source_v3.source_table_bindings,
+  executive_source_v3.source_validation_issues,
+  executive_source_v3.source_sync_checkpoints,
+  executive_source_v3.ods_opportunity,
+  executive_source_v3.ods_delivery,
+  executive_source_v3.ods_collection
+TO source_reader;
+
+GRANT SELECT, INSERT, UPDATE ON TABLE executive_source_v3.source_batches TO source_writer;
+GRANT SELECT, INSERT ON TABLE
+  executive_source_v3.source_table_bindings,
+  executive_source_v3.source_validation_issues,
+  executive_source_v3.ods_opportunity,
+  executive_source_v3.ods_delivery,
+  executive_source_v3.ods_collection
+TO source_writer;
+GRANT SELECT, INSERT, UPDATE ON TABLE
+  executive_source_v3.source_sync_checkpoints
+TO source_writer;
+GRANT SELECT ON TABLE executive_source_v3.ods_schema_version TO source_writer;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA executive_source_v3 TO source_writer;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA executive_source_v3 REVOKE ALL ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA executive_source_v3 REVOKE ALL ON SEQUENCES FROM PUBLIC;
 SQL

@@ -20,6 +20,13 @@ from .models import (
     User,
     UserCredential,
 )
+from .operating_data_reset import (
+    LOCAL_RESET_CONFIRMATION,
+    OperatingDataResetError,
+    inventory_operating_data,
+    render_inventory,
+    reset_local_demo_operating_data,
+)
 from .security import hash_password, utc_now, validate_new_password
 
 SOURCE_DATABASE_CONFIG_REFERENCE = "SOURCE_DATABASE_URL"
@@ -70,6 +77,14 @@ def parser() -> argparse.ArgumentParser:
     )
     trigger_sync.add_argument("--enterprise-slug", required=True)
     trigger_sync.add_argument("--source-key")
+    reset_data = commands.add_parser(
+        "reset-local-demo-operating-data-v3",
+        help="Clear simulated operating facts only after a verified encrypted backup",
+    )
+    reset_data.add_argument("--enterprise-slug", required=True)
+    reset_data.add_argument("--execute", action="store_true")
+    reset_data.add_argument("--confirmation", default="")
+    reset_data.add_argument("--backup-reference", default="")
     return root
 
 
@@ -214,8 +229,22 @@ def create_user(args: argparse.Namespace) -> None:
 
 def configure_source(args: argparse.Namespace) -> None:
     settings = get_settings()
+    live_feishu_configured = settings.app_env == "local-demo" and all(
+        (
+            settings.feishu_opportunity_app_token,
+            settings.feishu_opportunity_table_id,
+            settings.feishu_delivery_app_token,
+            settings.feishu_delivery_table_id,
+            settings.feishu_collection_app_token,
+            settings.feishu_collection_table_id,
+        )
+    )
     source_type = (
-        "simulated_generator" if settings.app_env == "local-demo" else "customer_sanitized_database"
+        "feishu_three_table"
+        if live_feishu_configured
+        else "simulated_generator"
+        if settings.app_env == "local-demo"
+        else "customer_sanitized_database"
     )
     source_key = (
         "demo-sanitized-source" if settings.app_env == "local-demo" else "customer-sanitized-source"
@@ -247,11 +276,35 @@ def configure_source(args: argparse.Namespace) -> None:
         source.configuration_json = {
             "schema": settings.source_schema,
             "connection_mode": settings.source_connection_mode,
+            **(
+                {
+                    "folder_token": settings.feishu_source_folder_token,
+                    "tables": {
+                        "opportunity": {
+                            "app_token": settings.feishu_opportunity_app_token,
+                            "table_id": settings.feishu_opportunity_table_id,
+                        },
+                        "delivery": {
+                            "app_token": settings.feishu_delivery_app_token,
+                            "table_id": settings.feishu_delivery_table_id,
+                        },
+                        "collection": {
+                            "app_token": settings.feishu_collection_app_token,
+                            "table_id": settings.feishu_collection_table_id,
+                        },
+                    },
+                    "activation_policy": "all_three_atomic",
+                    "experience_weights_percent": {"high": 20, "medium": 10, "low": 5},
+                    "source_contract": "3.0",
+                }
+                if live_feishu_configured
+                else {}
+            ),
         }
         source.secret_reference_key = args.secret_reference_key.strip()
         db.flush()
         require_isolated_data_source(db, source)
-        inspection = test_source_connection(source, db=db, settings=settings)
+        inspection = test_source_connection(source, db=db, settings=settings, allow_empty=True)
         source.configuration_json = {
             **source.configuration_json,
             "database_version": inspection["database_version"],
@@ -348,6 +401,31 @@ def trigger_sync(args: argparse.Namespace) -> None:
     print(f"Enqueued sanitized source sync {job_id}")
 
 
+def reset_operating_data_v3(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    if settings.app_env != "local-demo":
+        raise SystemExit("该命令只允许在 APP_ENV=local-demo 执行")
+    with SessionLocal.begin() as db:
+        enterprise = db.scalar(select(Enterprise).where(Enterprise.slug == args.enterprise_slug))
+        if enterprise is None:
+            raise SystemExit("Enterprise does not exist")
+        if not args.execute:
+            print(render_inventory(inventory_operating_data(db, enterprise.id)))
+            print(f"Dry run only. Execute with --confirmation {LOCAL_RESET_CONFIRMATION!r}")
+            return
+        try:
+            removed = reset_local_demo_operating_data(
+                db,
+                enterprise_id=enterprise.id,
+                confirmation=args.confirmation,
+                backup_reference=args.backup_reference,
+            )
+        except OperatingDataResetError as exc:
+            raise SystemExit(str(exc)) from exc
+    print(render_inventory(removed))
+    print("本机 Production 模拟经营数据已清理，等待 V3 三表批次原子激活")
+
+
 def main() -> None:
     args = parser().parse_args()
     if args.command == "create-admin":
@@ -358,6 +436,8 @@ def main() -> None:
         configure_source(args)
     elif args.command == "trigger-sync":
         trigger_sync(args)
+    elif args.command == "reset-local-demo-operating-data-v3":
+        reset_operating_data_v3(args)
 
 
 if __name__ == "__main__":

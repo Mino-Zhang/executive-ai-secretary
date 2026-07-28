@@ -14,7 +14,7 @@ from executive_ai_api.config import Settings
 from executive_ai_api.database import SessionLocal
 from executive_ai_api.harness_config import apply_glossary, match_fast_rule
 from executive_ai_api.hermes_client import HermesRuntimeError, parse_json_response, run_hermes
-from executive_ai_api.mcp_registry import MCP_TOOL_SPECS, planner_catalog
+from executive_ai_api.mcp_registry import planner_catalog
 from executive_ai_api.models import (
     Clarification,
     Conversation,
@@ -500,14 +500,14 @@ def _normalize_calls(
             if not isinstance(item, dict) or item.get("tool") not in by_name:
                 continue
             tool_name = str(item["tool"])
-            spec = MCP_TOOL_SPECS[tool_name]
+            parameter_schemas = by_name[tool_name]["parameters"]
             raw_arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
             arguments: dict[str, Any] = {}
             for key, value in raw_arguments.items():
-                if key not in spec.parameters:
+                if key not in parameter_schemas:
                     continue
                 try:
-                    arguments[key] = _normalize_argument(value, spec.parameters[key])
+                    arguments[key] = _normalize_argument(value, parameter_schemas[key])
                 except (TypeError, ValueError):
                     continue
             if "limit" in arguments:

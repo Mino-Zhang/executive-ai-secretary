@@ -258,6 +258,9 @@ export type McpTool = {
   category: string;
   domains: string[];
   parameters: Record<string, Record<string, unknown>>;
+  source_type: "built_in" | "composite";
+  component_tools: string[];
+  definition_version: number;
   is_enabled: boolean;
   planner_enabled: boolean;
   timeout_seconds: number;
@@ -269,11 +272,151 @@ export type McpTool = {
   updated_at: string | null;
 };
 
+export type McpCompositeToolCreate = {
+  tool_name: string;
+  display_name: string;
+  description: string;
+  category: string;
+  component_tools: string[];
+  operator_note?: string;
+};
+
 export type McpToolCatalog = {
   tools: McpTool[];
   enabled_count: number;
   planner_count: number;
   generated_at: string;
+};
+
+export type DataSource = {
+  id: string;
+  key: string;
+  display_name: string;
+  source_type: string;
+  schema_version: string;
+  is_enabled: boolean;
+  configuration_json: Record<string, unknown>;
+  last_tested_at: string | null;
+  last_test_status: "success" | "failed" | null;
+  last_test_error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DataSourceTest = {
+  ok: boolean;
+  schema_version: string;
+  database_version: string;
+  current_user: string;
+  read_only: boolean;
+  tls_active: boolean;
+  latest_batch_id: string;
+  source_data_as_of: string;
+  duration_ms: number;
+};
+
+export type DataSyncRun = {
+  id: string;
+  data_source_id: string;
+  job_id: string | null;
+  trigger_type: string;
+  status: string;
+  dataset_version: string | null;
+  source_schema_version: string | null;
+  source_batch_id: string | null;
+  source_data_as_of: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  records_read: number;
+  records_written: number;
+  records_rejected: number;
+  source_schema_hashes_json: Record<string, string>;
+  source_record_counts_json: Record<string, number>;
+  source_content_hashes_json: Record<string, string>;
+  cross_table_validation_json: Record<string, unknown>;
+  activation_mode: string;
+  atomic_activation_status: string;
+  experience_weight_policy_id: string | null;
+  activation_started_at: string | null;
+  activated_at: string | null;
+  domain_results_json: Record<string, unknown>;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+};
+
+export type FeishuFieldBindingStatus = {
+  field_id: string;
+  field_name: string;
+  field_type: number;
+  required: boolean;
+};
+
+export type FeishuTableBindingStatus = {
+  domain: "opportunity" | "delivery" | "collection";
+  display_name: string;
+  configured: boolean;
+  app_token_masked: string | null;
+  table_id: string | null;
+  fields: FeishuFieldBindingStatus[];
+  schema_hash: string | null;
+  content_hash: string | null;
+  record_count: number | null;
+  validation_status: "not_configured" | "configured" | "validated" | "rejected";
+  last_validated_at: string | null;
+  warnings: string[];
+};
+
+export type DataSourceOperationsStatus = {
+  source_id: string;
+  display_name: string;
+  source_type: string;
+  schema_version: string;
+  is_enabled: boolean;
+  activation_policy: string;
+  bindings: FeishuTableBindingStatus[];
+  latest_successful_run: DataSyncRun | null;
+  latest_rejected_run: DataSyncRun | null;
+};
+
+export type OpportunityExperienceWeightPolicy = {
+  id: string;
+  version: number;
+  label: string;
+  weights_json: { high: number; medium: number; low: number };
+  observation_windows_json: number[];
+  observation_window_days: number;
+  is_active: boolean;
+  activated_at: string;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DataOperationsV3Overview = {
+  sources: DataSourceOperationsStatus[];
+  experience_weight_policy: OpportunityExperienceWeightPolicy;
+  generated_at: string;
+};
+
+export type ScheduledTask = {
+  id: string;
+  data_source_id: string | null;
+  key: string;
+  task_type: string;
+  cron_expression: string;
+  timezone: string;
+  is_enabled: boolean;
+  next_run_at: string | null;
+  last_enqueued_at: string | null;
+  configuration_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ManualRun = {
+  job_id: string;
+  status: "queued";
 };
 
 export type MessageEvidence = {

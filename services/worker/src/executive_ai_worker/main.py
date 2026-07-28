@@ -13,7 +13,7 @@ from datetime import timedelta
 from executive_ai_api.authz import scope_snapshot_is_current_for_user
 from executive_ai_api.config import get_settings
 from executive_ai_api.database import SessionLocal
-from executive_ai_api.ingestion import run_data_sync_job
+from executive_ai_api.ingestion import IngestionError, run_data_sync_job
 from executive_ai_api.job_state import (
     ASSISTANT_NOT_CONFIGURED_CONTENT,
     close_assistant_placeholder,
@@ -413,7 +413,19 @@ def execute_job_handler(job: Job) -> dict:
     if job.job_type == "system.noop":
         return {"ok": True}
     if job.job_type == "data.sync":
-        return run_data_sync_job(job, settings)
+        try:
+            return run_data_sync_job(job, settings)
+        except IngestionError as exc:
+            if exc.code in {
+                "99991672",
+                "feishu_binding_incomplete",
+                "feishu_schema_drift",
+                "feishu_reliability_invalid",
+                "source_contract_invalid",
+                "source_schema_version_mismatch",
+            }:
+                raise PermanentJobError(exc.code, str(exc), "数据同步失败") from exc
+            raise
     if job.job_type == "assistant_response":
         try:
             return run_assistant_job(job, settings)
