@@ -361,7 +361,12 @@ def masked_api_key(config: ModelProviderConfig | None) -> str | None:
     return f"sk-••••••••{config.api_key_hint}"
 
 
-def runtime_provider_config(config: ModelProviderConfig, settings: Settings) -> dict[str, str]:
+def runtime_provider_config(
+    config: ModelProviderConfig,
+    settings: Settings,
+    *,
+    model_id: str | None = None,
+) -> dict[str, str]:
     if config.provider != ANSPIRE_PROVIDER or config.endpoint_url != ANSPIRE_ENDPOINT_URL:
         raise AnspireConfigurationError(
             "anspire_provider_invalid",
@@ -375,6 +380,6 @@ def runtime_provider_config(config: ModelProviderConfig, settings: Settings) -> 
     return {
         "provider": ANSPIRE_PROVIDER,
         "endpoint_url": ANSPIRE_ENDPOINT_URL,
-        "model_id": validate_anspire_model(config.model_id),
+        "model_id": validate_anspire_model(model_id or config.model_id),
         "api_key": decrypt_anspire_api_key(config, settings),
     }

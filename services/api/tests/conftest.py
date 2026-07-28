@@ -32,11 +32,13 @@ from executive_ai_api.main import app
 from executive_ai_api.models import (
     DataScopeGrant,
     Enterprise,
+    EnterpriseModelAuthorization,
+    ModelProviderConfig,
     OrganizationUnit,
     User,
     UserCredential,
 )
-from executive_ai_api.security import hash_password
+from executive_ai_api.security import hash_password, utc_now
 
 TEMP_PASSWORD = "TempStrong!23456"
 NEW_PASSWORD = "NewStrong!23456"
@@ -126,6 +128,44 @@ def seeded() -> dict:
             "pending_id": disconnected.id,
             "users": users,
         }
+
+
+@pytest.fixture
+def authorized_model(seeded) -> str:
+    """Provision the explicit model authorization required for message creation tests."""
+
+    model_id = "glm-5.2"
+    with SessionLocal.begin() as db:
+        db.add(
+            ModelProviderConfig(
+                enterprise_id=seeded["enterprise_id"],
+                provider="anspire",
+                endpoint_url="https://open-gateway.anspire.ai/v6",
+                model_id=model_id,
+                api_key_ciphertext="test-ciphertext",
+                api_key_nonce="test-nonce",
+                api_key_hint="test",
+                credential_version=1,
+                is_enabled=True,
+                last_tested_at=utc_now(),
+                last_test_status="success",
+            )
+        )
+        db.add(
+            EnterpriseModelAuthorization(
+                enterprise_id=seeded["enterprise_id"],
+                model_id=model_id,
+                display_name="GLM 5.2",
+                test_status="success",
+                tested_credential_version=1,
+                is_authorized=True,
+                is_default=True,
+                last_tested_at=utc_now(),
+                authorized_by_user_id=seeded["users"]["admin@example.com"],
+                authorized_at=utc_now(),
+            )
+        )
+    return model_id
 
 
 def login(client: TestClient, email: str, password: str = TEMP_PASSWORD) -> dict:

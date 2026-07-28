@@ -4,11 +4,11 @@ import asyncio
 import json
 import uuid
 from datetime import timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, Query, Request, status
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.orm import Session
 
 from ..audit import record_audit
@@ -27,6 +27,7 @@ from ..database import SessionLocal, get_db
 from ..errors import AppError
 from ..harness_config import active_harness_config
 from ..idempotency import replay, save_response
+from ..model_authorization import authorized_model_rows, resolve_authorized_model
 from ..models import (
     Clarification,
     Conversation,
@@ -44,6 +45,7 @@ from ..schemas import (
     ClarificationResolve,
     ConversationCreate,
     ConversationOut,
+    ConversationProjectUpdate,
     ConversationUpdate,
     DiagnosticShareOut,
     MessageCreate,
@@ -62,11 +64,18 @@ def conversation_out(
     principal: Principal,
     item: Conversation,
 ) -> ConversationOut:
+    project_id = db.scalar(
+        select(ProjectConversation.project_id).where(
+            ProjectConversation.conversation_id == item.id
+        )
+    )
     return ConversationOut(
         id=item.id,
         title=item.title,
         organization_unit_id=item.organization_unit_id,
         organization_scope=scope_out(db, principal, item),
+        project_id=project_id,
+        selected_model_id=item.selected_model_id,
         status=item.status,
         pinned_at=item.pinned_at,
         archived_at=item.archived_at,
@@ -105,8 +114,11 @@ def list_conversations(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     project_id: uuid.UUID | None = None,
+    placement: Literal["unassigned", "project", "all"] = "all",
     include_archived: bool = False,
 ) -> Page:
+    if project_id and placement == "unassigned":
+        raise AppError(422, "conversation_placement_conflict", "项目筛选不能与未归属筛选同时使用")
     cursor_id = decode_cursor(cursor)
     statement = select(Conversation).where(
         Conversation.enterprise_id == principal.enterprise_id,
@@ -117,6 +129,22 @@ def list_conversations(
             ProjectConversation,
             ProjectConversation.conversation_id == Conversation.id,
         ).where(ProjectConversation.project_id == project_id)
+    elif placement == "unassigned":
+        statement = statement.where(
+            ~exists(
+                select(ProjectConversation.id).where(
+                    ProjectConversation.conversation_id == Conversation.id
+                )
+            )
+        )
+    elif placement == "project":
+        statement = statement.where(
+            exists(
+                select(ProjectConversation.id).where(
+                    ProjectConversation.conversation_id == Conversation.id
+                )
+            )
+        )
     if not include_archived:
         statement = statement.where(Conversation.archived_at.is_(None))
     if cursor_id:
@@ -167,11 +195,21 @@ def create_conversation(
                 mode="all_authorized", organization_unit_ids=[]
             )
     normalized_scope, _ = normalize_scope(db, principal, requested_scope)
+    if payload.model_id:
+        selected_model_id = resolve_authorized_model(
+            db, principal.enterprise_id, payload.model_id
+        )
+    else:
+        model_rows = authorized_model_rows(db, principal.enterprise_id)
+        default_model = next((row for row in model_rows if row.is_default), None)
+        selected_model_id = (default_model or (model_rows[0] if model_rows else None))
+        selected_model_id = selected_model_id.model_id if selected_model_id else None
     item = Conversation(
         enterprise_id=principal.enterprise_id,
         owner_user_id=principal.user.id,
         organization_unit_id=None,
         scope_mode=normalized_scope.mode,
+        selected_model_id=selected_model_id,
         title=payload.title,
     )
     db.add(item)
@@ -188,7 +226,10 @@ def create_conversation(
         session=principal.session,
         target_type="conversation",
         target_id=item.id,
-        metadata={"project_id": str(project.id) if project else None},
+        metadata={
+            "project_id": str(project.id) if project else None,
+            "model_id": selected_model_id,
+        },
     )
     save_response(db, request, principal, payload, 201, output)
     db.commit()
@@ -214,6 +255,7 @@ def update_conversation(
 ) -> ConversationOut:
     item = owned_conversation(db, principal, conversation_id)
     changes = payload.model_dump(exclude_unset=True)
+    requested_model_id = changes.pop("model_id", None)
     requested_scope = changes.pop("organization_scope", None)
     if "organization_unit_id" in changes:
         requested_scope = legacy_scope(changes.pop("organization_unit_id"))
@@ -222,6 +264,10 @@ def update_conversation(
             requested_scope = OrganizationScopeInput.model_validate(requested_scope)
         normalized_scope, _ = normalize_scope(db, principal, requested_scope)
         set_conversation_scope(db, item, normalized_scope)
+    if requested_model_id is not None:
+        item.selected_model_id = resolve_authorized_model(
+            db, principal.enterprise_id, requested_model_id
+        )
     for key, value in changes.items():
         setattr(item, key, value)
     if changes.get("status") == "archived":
@@ -239,6 +285,56 @@ def update_conversation(
         metadata={
             "fields": sorted(changes),
             "scope_updated": requested_scope is not None,
+            "model_updated": requested_model_id is not None,
+        },
+    )
+    db.commit()
+    db.refresh(item)
+    return conversation_out(db, principal, item)
+
+
+@router.patch("/{conversation_id}/project", response_model=ConversationOut)
+def update_conversation_project(
+    conversation_id: uuid.UUID,
+    payload: ConversationProjectUpdate,
+    request: Request,
+    principal: Annotated[Principal, Depends(get_executive_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> ConversationOut:
+    item = owned_conversation(db, principal, conversation_id, lock=True)
+    previous_project_id = db.scalar(
+        select(ProjectConversation.project_id).where(
+            ProjectConversation.conversation_id == item.id
+        )
+    )
+    project = None
+    if payload.project_id is not None:
+        project = db.scalar(
+            select(Project).where(
+                Project.id == payload.project_id,
+                Project.enterprise_id == principal.enterprise_id,
+                Project.owner_user_id == principal.user.id,
+                Project.archived_at.is_(None),
+            )
+        )
+        if project is None:
+            raise AppError(404, "project_not_found", "项目不存在")
+    db.execute(
+        delete(ProjectConversation).where(ProjectConversation.conversation_id == item.id)
+    )
+    if project is not None:
+        db.add(ProjectConversation(project_id=project.id, conversation_id=item.id))
+    record_audit(
+        db,
+        request,
+        "conversation.project_updated",
+        actor=principal.user,
+        session=principal.session,
+        target_type="conversation",
+        target_id=item.id,
+        metadata={
+            "previous_project_id": str(previous_project_id) if previous_project_id else None,
+            "project_id": str(project.id) if project else None,
         },
     )
     db.commit()
@@ -571,6 +667,18 @@ def resolve_clarification(
         if source_job and source_job.harness_version_id
         else active_harness_config(db, principal.enterprise_id)
     )
+    requested_model_id = resolve_authorized_model(
+        db,
+        principal.enterprise_id,
+        (
+            str(source_job.payload_json.get("model_id"))
+            if source_job and source_job.payload_json.get("model_id")
+            else conversation.selected_model_id
+        ),
+    )
+    conversation.selected_model_id = requested_model_id
+    user_message.requested_model_id = requested_model_id
+    assistant_message.requested_model_id = requested_model_id
     db.add(
         Job(
             enterprise_id=principal.enterprise_id,
@@ -584,6 +692,7 @@ def resolve_clarification(
                 "clarification_id": str(clarification.id),
                 "organization_scope": normalized_scope.model_dump(mode="json"),
                 "harness_version_id": str(harness_version.id),
+                "model_id": requested_model_id,
             },
             scope_snapshot_json=message_scope_snapshot,
             status="queued",
@@ -655,6 +764,12 @@ def create_message(
     requested_scope = payload.organization_scope or current_scope
     normalized_scope, resolved_scope_ids = normalize_scope(db, principal, requested_scope)
     active_harness = active_harness_config(db, principal.enterprise_id)
+    requested_model_id = resolve_authorized_model(
+        db,
+        principal.enterprise_id,
+        payload.model_id or conversation.selected_model_id,
+    )
+    conversation.selected_model_id = requested_model_id
     sequence = (
         db.scalar(
             select(func.coalesce(func.max(Message.sequence), 0)).where(
@@ -690,6 +805,7 @@ def create_message(
         role="user",
         content=payload.content,
         content_json={"organization_scope_snapshot": message_scope_snapshot},
+        requested_model_id=requested_model_id,
         sequence=sequence,
         status="completed",
     )
@@ -700,6 +816,7 @@ def create_message(
         role="assistant",
         content="",
         content_json={},
+        requested_model_id=requested_model_id,
         sequence=sequence + 1,
         status="queued",
     )
@@ -716,6 +833,7 @@ def create_message(
             "assistant_message_id": str(assistant_message.id),
             "organization_scope": normalized_scope.model_dump(mode="json"),
             "harness_version_id": str(active_harness.id),
+            "model_id": requested_model_id,
         },
         scope_snapshot_json=message_scope_snapshot,
         status="queued",
@@ -740,6 +858,7 @@ def create_message(
             "scope_mode": normalized_scope.mode,
             "scope_count": len(resolved_scope_ids),
             "harness_version": active_harness.version,
+            "model_id": requested_model_id,
         },
     )
     save_response(db, request, principal, payload, 202, output)

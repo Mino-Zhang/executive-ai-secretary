@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -8,6 +9,23 @@ from typing import Any
 
 import httpx
 from executive_ai_api.anspire import AnspireConfigurationError, runtime_provider_config
+from executive_ai_api.answer_contract import (
+    ANSWER_CONTRACT_VERSION,
+    contract_prompt,
+    enrich_tool_results,
+    envelope_for_clarification,
+    envelope_for_data,
+    envelope_for_general,
+    extract_json_object,
+    fallback_chairman_answer,
+    fallback_general_answer,
+    plain_text_for_data,
+    plain_text_for_general,
+    select_data_template,
+    select_general_mode,
+    validate_chairman_answer,
+    validate_general_answer,
+)
 from executive_ai_api.authz import accessible_organization_unit_ids_for_user
 from executive_ai_api.capabilities import issue_capability_token
 from executive_ai_api.config import Settings
@@ -33,7 +51,10 @@ from executive_ai_api.models import (
 from executive_ai_api.personal_data import ensure_memory_encrypted
 from executive_ai_api.query_spec import normalize_query_spec
 from executive_ai_api.security import utc_now
+from pydantic import ValidationError
 from sqlalchemy import or_, select
+
+ANSWER_REPAIR_START_BUDGET_SECONDS = 30.0
 
 
 class OrchestrationPermanentError(RuntimeError):
@@ -435,8 +456,11 @@ def _create_scope_clarification(
                 "route": "clarification",
                 "clarification_id": str(clarification.id),
                 "options": options,
+                "assistant_output": envelope_for_clarification(question, options),
             }
             assistant.status = "completed"
+            assistant.output_contract_version = ANSWER_CONTRACT_VERSION
+            assistant.output_template_id = "clarification"
     return {"content": question, "route": "clarification"}
 
 
@@ -725,6 +749,14 @@ def _save_answer_with_evidence(
         assistant.content_json = content_json
         assistant.status = "completed"
         assistant.model_name = response.get("model")
+        assistant.output_contract_version = str(
+            content_json.get("assistant_output", {}).get("schema_version")
+            or ANSWER_CONTRACT_VERSION
+        )
+        body = content_json.get("assistant_output", {}).get("body", {})
+        assistant.output_template_id = str(
+            body.get("template_id") or body.get("mode") or content_json.get("route") or ""
+        )[:64] or None
         timestamps = [
             row.get("source_data_as_of")
             for row in content_json.get("freshness", [])
@@ -742,6 +774,7 @@ def _save_answer_with_evidence(
             db.add(message_run)
         message_run.status = "completed"
         message_run.provider = response.get("provider")
+        message_run.requested_model_id = assistant.requested_model_id
         message_run.model_name = response.get("model")
         message_run.input_tokens = response.get("usage", {}).get("input_tokens")
         message_run.output_tokens = response.get("usage", {}).get("output_tokens")
@@ -786,12 +819,22 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
                 "assistant_resource_forbidden", "会话或消息不属于当前用户", "请求权限已失效"
             )
         question = message.content
+        requested_model_id = str(
+            job.payload_json.get("model_id")
+            or message.requested_model_id
+            or conversation.selected_model_id
+            or (model_config.model_id if model_config else "")
+        ).strip()
         if model_config is None:
             raise OrchestrationPermanentError(
                 "anspire_not_configured", "企业尚未配置 Anspire 模型", "Anspire 模型尚未配置"
             )
         try:
-            provider_config = runtime_provider_config(model_config, settings)
+            provider_config = runtime_provider_config(
+                model_config,
+                settings,
+                model_id=requested_model_id or None,
+            )
         except AnspireConfigurationError as exc:
             raise OrchestrationPermanentError(
                 exc.code, str(exc), "Anspire 模型尚未配置或启用"
@@ -1086,6 +1129,19 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
         )
 
     profile = "data" if route["route"] == "data" else "general"
+    if route["route"] == "data":
+        tool_results = enrich_tool_results(tool_results)
+    expected_template = (
+        select_data_template(
+            query_spec,
+            [item["tool"] for item in tool_results],
+        )
+        if route["route"] == "data"
+        else None
+    )
+    expected_general_mode = (
+        select_general_mode(question) if route["route"] == "general" else None
+    )
     answer_payload = {
         "question": question,
         "rewritten_query": route["rewritten_query"],
@@ -1096,6 +1152,9 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
         "authorized_results": tool_results,
         "tool_errors": tool_errors,
         "execution_plan": plan,
+        "expected_template_id": expected_template,
+        "expected_general_mode": expected_general_mode,
+        "output_contract": contract_prompt(route["route"]),
         "harness_config": harness_config,
     }
     answer_started = monotonic()
@@ -1111,19 +1170,116 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
         if exc.permanent:
             raise OrchestrationPermanentError(exc.code, str(exc), "无法连接已配置模型") from exc
         raise
+    contract_error: str | None = None
+    repair_used_for_answer = False
+    repair_succeeded = False
+    assistant_output: dict[str, Any]
+    answer_content: str
+    try:
+        raw_answer = extract_json_object(answer_response["text"])
+        if route["route"] == "data":
+            contract_answer = validate_chairman_answer(
+                raw_answer,
+                expected_template=expected_template or "executive_pulse",
+                tool_results=tool_results,
+                organization_names=[item["name"] for item in organizations],
+            )
+            assistant_output = envelope_for_data(contract_answer)
+            answer_content = plain_text_for_data(contract_answer)
+        else:
+            general_answer = validate_general_answer(
+                raw_answer,
+                expected_mode=expected_general_mode or "direct_answer",
+            )
+            assistant_output = envelope_for_general(general_answer)
+            answer_content = plain_text_for_general(general_answer)
+    except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+        contract_error = str(exc)[:1200]
+        repair_payload = {
+            **answer_payload,
+            "contract_validation_errors": [contract_error],
+            "previous_output": answer_response["text"][:12000],
+            "repair_instruction": "只修复结构与证据引用，不得新增输入中不存在的事实。",
+        }
+        try:
+            if monotonic() - answer_started >= ANSWER_REPAIR_START_BUDGET_SECONDS:
+                raise TimeoutError("首轮回答已耗尽结构修复预算，直接使用受控降级答案")
+            repaired_response = run_hermes(
+                settings,
+                profile=profile,
+                payload=repair_payload,
+                request_id=f"{job.id}:answer-repair",
+                provider_config=provider_config,
+            )
+            repair_used_for_answer = True
+            repaired_raw = extract_json_object(repaired_response["text"])
+            if route["route"] == "data":
+                contract_answer = validate_chairman_answer(
+                    repaired_raw,
+                    expected_template=expected_template or "executive_pulse",
+                    tool_results=tool_results,
+                    organization_names=[item["name"] for item in organizations],
+                )
+                assistant_output = envelope_for_data(contract_answer)
+                answer_content = plain_text_for_data(contract_answer)
+            else:
+                general_answer = validate_general_answer(
+                    repaired_raw,
+                    expected_mode=expected_general_mode or "direct_answer",
+                )
+                assistant_output = envelope_for_general(general_answer)
+                answer_content = plain_text_for_general(general_answer)
+            answer_response = repaired_response
+            repair_succeeded = True
+        except (
+            HermesRuntimeError,
+            json.JSONDecodeError,
+            ValidationError,
+            ValueError,
+            TimeoutError,
+        ) as repair_exc:
+            contract_error = f"{contract_error}; repair: {str(repair_exc)[:800]}"
+            if route["route"] == "data":
+                contract_answer = fallback_chairman_answer(
+                    template_id=expected_template or "executive_pulse",
+                    tool_results=tool_results,
+                    organization_names=[item["name"] for item in organizations],
+                    reason=contract_error,
+                )
+                assistant_output = envelope_for_data(contract_answer)
+                answer_content = plain_text_for_data(contract_answer)
+            else:
+                general_answer = fallback_general_answer(
+                    contract_error,
+                    mode=expected_general_mode or "direct_answer",
+                )
+                assistant_output = envelope_for_general(general_answer)
+                answer_content = plain_text_for_general(general_answer)
     _record_stage(
         job,
         message_id,
         stage="answer",
-        status="completed",
+        status=(
+            "completed"
+            if contract_error is None
+            else "repaired"
+            if repair_succeeded
+            else "fallback"
+        ),
         started_at=answer_started,
         response=answer_response,
         tool_names=[item["tool"] for item in tool_results],
         summary={
             "route": route["route"],
+            "template_id": expected_template or expected_general_mode,
+            "contract_version": ANSWER_CONTRACT_VERSION,
+            "contract_valid_first_pass": contract_error is None,
+            "answer_repair_used": repair_used_for_answer,
+            "answer_repair_succeeded": repair_succeeded,
             "evidence_count": _valid_evidence_count(tool_results),
             "organization_unit_count": len(execution_scope),
         },
+        error_code="answer_contract_repaired" if contract_error else None,
     )
 
     freshness = [
@@ -1153,18 +1309,20 @@ def run_assistant_job(job: Job, settings: Settings) -> dict[str, Any]:
         "scope": {"organization_unit_ids": sorted(str(value) for value in execution_scope)},
         "tool_errors": tool_errors,
         "memory_used": bool(memory_enabled and memories),
+        "assistant_output": assistant_output,
+        "output_contract_version": ANSWER_CONTRACT_VERSION,
     }
     evidence_count = _save_answer_with_evidence(
         job_id=job.id,
         lease_token=job.lease_token,
         assistant_message_id=assistant_message_id,
-        content=answer_response["text"],
+        content=answer_content,
         response=answer_response,
         content_json=content_json,
         tool_results=tool_results,
     )
     return {
-        "content": answer_response["text"],
+        "content": answer_content,
         "route": route["route"],
         "tools": content_json["tools"],
         "evidence_count": evidence_count,

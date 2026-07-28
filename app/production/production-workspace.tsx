@@ -11,8 +11,10 @@ import {
   useState,
 } from "react";
 import { ApiError, humanizeApiError } from "./api-client";
+import { AssistantOutputRenderer, parseAssistantOutput } from "./assistant-output";
 import { loadProductionBootstrap, productionServices } from "./services";
 import type {
+  AuthorizedModel,
   AuthMe,
   Conversation,
   ConversationMessage,
@@ -32,6 +34,7 @@ type UiLanguage = "zh-CN" | "zh-TW" | "en";
 type WorkspacePanel = "daily" | "weekly" | "history" | "memory" | "scope";
 type PreferencesView = "profile" | "appearance" | "memory";
 type ProjectDialogState = { mode: "create" } | { mode: "edit"; projectId: string };
+type ConversationProjectDialogState = { conversationId: string };
 type SidebarMenuState =
   | { kind: "conversation"; conversationId: string; top: number }
   | { kind: "project"; projectId: string; top: number };
@@ -207,6 +210,14 @@ const domainLabels: Record<string, string> = {
   target: "目标",
 };
 
+function professionalSourceLabel(value: string | null | undefined) {
+  if (!value) return "经营数据源";
+  return value
+    .replaceAll("飞书经营三表", "飞书经营数据源")
+    .replaceAll("飞书三表", "飞书经营数据源")
+    .replaceAll("三表批次", "经营数据批次");
+}
+
 function dataStatusLabel(capabilities: DataCapabilities | null) {
   if (!capabilities) return "数据状态待确认";
   if (capabilities.overall_status === "fresh") return "经营数据已就绪";
@@ -271,6 +282,11 @@ export function ProductionWorkspace({
   const [messagesError, setMessagesError] = useState("");
   const [draft, setDraft] = useState("");
   const [selectedOrganizationScope, setSelectedOrganizationScope] = useState<OrganizationScope>(ALL_ORGANIZATIONS_SCOPE);
+  const [selectedModelId, setSelectedModelId] = useState(
+    initialBootstrap.authorizedModels.find((model) => model.is_default)?.model_id
+      ?? initialBootstrap.authorizedModels[0]?.model_id
+      ?? "",
+  );
   const [sending, setSending] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [toast, setToast] = useState("");
@@ -285,6 +301,7 @@ export function ProductionWorkspace({
   const [preferencesView, setPreferencesView] = useState<PreferencesView | null>(null);
   const [sidebarMenu, setSidebarMenu] = useState<SidebarMenuState | null>(null);
   const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
+  const [conversationProjectDialog, setConversationProjectDialog] = useState<ConversationProjectDialogState | null>(null);
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
   const [renameConversationId, setRenameConversationId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -338,7 +355,7 @@ export function ProductionWorkspace({
   );
   const recentConversations = useMemo(
     () => [...bootstrap.conversations]
-      .filter((item) => !item.pinned_at && !item.archived_at)
+      .filter((item) => !item.project_id && !item.pinned_at && !item.archived_at)
       .sort((first, second) => (second.last_message_at || second.updated_at).localeCompare(first.last_message_at || first.updated_at))
       .slice(0, 14),
     [bootstrap.conversations],
@@ -469,6 +486,12 @@ export function ProductionWorkspace({
     setActivePanel(null);
     setUnreadConversationIds((current) => current.filter((id) => id !== conversation.id));
     setSelectedOrganizationScope(scopeFromConversation(conversation));
+    setSelectedModelId(
+      conversation.selected_model_id
+        ?? bootstrap.authorizedModels.find((model) => model.is_default)?.model_id
+        ?? bootstrap.authorizedModels[0]?.model_id
+        ?? "",
+    );
     try {
       const result = await productionServices.conversations.messages(conversation.id);
       setMessages(result.items);
@@ -481,7 +504,7 @@ export function ProductionWorkspace({
     } finally {
       setMessagesLoading(false);
     }
-  }, [onSessionExpired]);
+  }, [bootstrap.authorizedModels, onSessionExpired]);
 
   useEffect(() => {
     if (deepLinkHandled.current) return;
@@ -506,6 +529,11 @@ export function ProductionWorkspace({
     setSelectedOrganizationScope(project?.organization_unit_id
       ? { mode: "selected", organization_unit_ids: [project.organization_unit_id] }
       : ALL_ORGANIZATIONS_SCOPE);
+    setSelectedModelId(
+      bootstrap.authorizedModels.find((model) => model.is_default)?.model_id
+        ?? bootstrap.authorizedModels[0]?.model_id
+        ?? "",
+    );
     window.history.replaceState(null, "", window.location.pathname);
   }
 
@@ -513,6 +541,12 @@ export function ProductionWorkspace({
     event.preventDefault();
     const content = draft.trim();
     if (!content || sending) return;
+    if (!selectedModelId || !bootstrap.authorizedModels.some((model) => model.model_id === selectedModelId)) {
+      setWorkspaceError(selectedModelId
+        ? "本会话原模型已取消授权，请先重新选择可用模型。"
+        : "管理员尚未授权可用模型，暂时无法发送消息。");
+      return;
+    }
     setSending(true);
     await runRequest(async () => {
       let conversationId = activeConversationId;
@@ -521,6 +555,7 @@ export function ProductionWorkspace({
           title: content.slice(0, 42),
           organization_scope: selectedOrganizationScope,
           project_id: activeProjectId ?? undefined,
+          model_id: selectedModelId,
         });
         conversationId = createdConversation.id;
         setActiveConversationId(conversationId);
@@ -535,7 +570,12 @@ export function ProductionWorkspace({
           }));
         }
       }
-      const message = await productionServices.conversations.sendMessage(conversationId, content, selectedOrganizationScope);
+      const message = await productionServices.conversations.sendMessage(
+        conversationId,
+        content,
+        selectedOrganizationScope,
+        selectedModelId,
+      );
       setMessages((current) => [...current, message]);
       setDraft("");
       window.history.replaceState(null, "", `${window.location.pathname}?conversation=${encodeURIComponent(conversationId)}`);
@@ -544,6 +584,50 @@ export function ProductionWorkspace({
       await refreshWorkspace();
     });
     setSending(false);
+  }
+
+  async function changeSelectedModel(modelId: string) {
+    if (modelId === selectedModelId) return;
+    const previous = selectedModelId;
+    setSelectedModelId(modelId);
+    if (!activeConversationId) return;
+    const updated = await runRequest(
+      () => productionServices.conversations.update(activeConversationId, { model_id: modelId }),
+    );
+    if (!updated) {
+      setSelectedModelId(previous);
+      return;
+    }
+    setBootstrap((current) => ({
+      ...current,
+      conversations: current.conversations.map((item) => item.id === updated.id ? updated : item),
+    }));
+    setToast(`本会话后续将使用${bootstrap.authorizedModels.find((item) => item.model_id === modelId)?.display_name ?? modelId}`);
+  }
+
+  async function moveConversationToProject(conversationId: string, projectId: string | null) {
+    const updated = await runRequest(
+      () => productionServices.conversations.setProject(conversationId, projectId),
+    );
+    if (!updated) return false;
+    setBootstrap((current) => ({
+      ...current,
+      conversations: current.conversations.map((item) => item.id === updated.id ? updated : item),
+    }));
+    setProjectConversations((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).map(([id, items]) => [
+          id,
+          items.filter((item) => item.id !== conversationId),
+        ]),
+      );
+      if (projectId) next[projectId] = [updated, ...(next[projectId] ?? [])];
+      return next;
+    });
+    setConversationProjectDialog(null);
+    setSidebarMenu(null);
+    setToast(projectId ? "会话已移入项目" : "会话已移出项目");
+    return true;
   }
 
   function answerJob(messageId: string) {
@@ -841,7 +925,15 @@ export function ProductionWorkspace({
         setBootstrap((current) => ({
           ...current,
           projects: current.projects.filter((item) => item.id !== project.id),
+          conversations: current.conversations.map((item) => (
+            item.project_id === project.id ? { ...item, project_id: null } : item
+          )),
         }));
+        setProjectConversations((current) => {
+          const next = { ...current };
+          delete next[project.id];
+          return next;
+        });
         setExpandedProjectIds((current) => current.filter((id) => id !== project.id));
         setActiveProjectId((current) => current === project.id ? null : current);
         setToast("项目已移除");
@@ -961,7 +1053,7 @@ export function ProductionWorkspace({
         </div>
 
         <footer className="sidebar-footer">
-          <button type="button" className="sidebar-data-status" onClick={() => setActivePanel("scope")}><span className={`status-dot ${dataCapabilities?.overall_status === "fresh" ? "positive" : dataCapabilities?.overall_status === "failed" ? "risk" : ""}`} aria-hidden="true" /><span className="sidebar-label"><strong>{businessDataReady ? dataStatusLabel(dataCapabilities) : c.dataMissing}</strong><small>{dataCapabilities ? `${dataCapabilities.source_label} · ${organizationUnits.length} 个事业部` : businessDataReady ? "等待首次数据同步" : "请联系企业管理员"}</small></span></button>
+          <button type="button" className="sidebar-data-status" onClick={() => setActivePanel("scope")}><span className="status-dot positive" aria-hidden="true" /><span className="sidebar-label"><strong>{businessDataReady ? "经营数据已接入" : c.dataMissing}</strong><small>{dataCapabilities ? `${professionalSourceLabel(dataCapabilities.source_label)} · ${organizationUnits.length} 个事业部` : businessDataReady ? "等待首次数据同步" : "请联系企业管理员"}</small></span></button>
           <div ref={accountRef} className="profile-control workspace-profile">
             <button className="profile-button" type="button" aria-label="打开个人菜单" aria-expanded={accountMenuOpen} onClick={() => { setAccountMenuOpen((current) => !current); setLanguageMenuOpen(false); }}><span className="profile-avatar" aria-hidden="true">{userInitials}</span><span className="sidebar-label"><strong>{preferredDisplayName(me)}</strong><small>{selectedScopeLabel}</small></span><span className="profile-menu-chevron sidebar-label" aria-hidden="true">{accountMenuOpen ? "⌄" : "›"}</span></button>
             {accountMenuOpen && <div className="profile-menu account-menu" role="menu" aria-label="个人菜单">
@@ -982,6 +1074,8 @@ export function ProductionWorkspace({
           <button type="button" role="menuitem" onClick={() => void toggleConversationPinned(sidebarMenuConversation)}>{sidebarMenuConversation.pinned_at ? "取消置顶" : "置顶"}</button>
           <button type="button" role="menuitem" onClick={() => toggleUnread(sidebarMenuConversation.id)}>{unreadConversationIds.includes(sidebarMenuConversation.id) ? "标记为已读" : "标记未读"}</button>
           <button type="button" role="menuitem" onClick={() => { setRenameConversationId(sidebarMenuConversation.id); setRenameDraft(sidebarMenuConversation.title); setSidebarMenu(null); }}>重命名</button>
+          <button type="button" role="menuitem" onClick={() => { setConversationProjectDialog({ conversationId: sidebarMenuConversation.id }); setSidebarMenu(null); }}>{sidebarMenuConversation.project_id ? "移动到其他项目" : "移到项目"}</button>
+          {sidebarMenuConversation.project_id && <button type="button" role="menuitem" onClick={() => void moveConversationToProject(sidebarMenuConversation.id, null)}>移出项目</button>}
           <button type="button" role="menuitem" onClick={() => requestArchiveConversation(sidebarMenuConversation)}>归档</button>
           <span className="sidebar-menu-divider" role="separator" />
           <button type="button" role="menuitem" onClick={() => void copyText(sidebarMenuConversation.id, "会话 ID 已复制")}>复制会话 ID</button>
@@ -1005,7 +1099,7 @@ export function ProductionWorkspace({
           <button className="mobile-sidebar-trigger" type="button" aria-label="打开侧栏" onClick={() => setSidebarOpen(true)}>☰</button>
           <div className="workspace-title-block"><strong>{activeConversation?.title || (activeProjectId ? bootstrap.projects.find((item) => item.id === activeProjectId)?.name : null) || c.newConversation}</strong><small>{environmentLabel(me)} · {selectedScopeLabel}</small></div>
           <time className="workspace-topbar-date" dateTime={new Date().toISOString()}>{localizedDate(languagePreference, me.user.timezone)}</time>
-          <div className="workspace-topbar-actions"><span className={`production-environment-badge data-${dataCapabilities?.overall_status ?? "unavailable"}`}>{dataStatusLabel(dataCapabilities)}</span><button className="topbar-scope-button" type="button" onClick={() => void refreshWorkspace()}>刷新状态</button><button className="topbar-new-button" type="button" aria-label="新建会话" onClick={() => newConversation()}>＋</button></div>
+          <div className="workspace-topbar-actions"><button className="topbar-scope-button" type="button" onClick={() => setActivePanel("scope")}>数据状态</button><button className="topbar-new-button" type="button" aria-label="新建会话" onClick={() => newConversation()}>＋</button></div>
         </header>
         <main id="main-content" className="workspace-main">
           {activeConversationId ? (
@@ -1022,6 +1116,9 @@ export function ProductionWorkspace({
               organizationUnits={organizationUnits}
               organizationScope={selectedOrganizationScope}
               setOrganizationScope={setSelectedOrganizationScope}
+              authorizedModels={bootstrap.authorizedModels}
+              selectedModelId={selectedModelId}
+              setSelectedModelId={(modelId) => void changeSelectedModel(modelId)}
               language={languagePreference}
               disclaimer={c.disclaimer}
               jobs={bootstrap.jobs}
@@ -1036,6 +1133,9 @@ export function ProductionWorkspace({
               organizationUnits={organizationUnits}
               organizationScope={selectedOrganizationScope}
               setOrganizationScope={setSelectedOrganizationScope}
+              authorizedModels={bootstrap.authorizedModels}
+              selectedModelId={selectedModelId}
+              setSelectedModelId={(modelId) => void changeSelectedModel(modelId)}
               latestReport={latestDailyReport}
               dataCapabilities={dataCapabilities}
               onOpenReport={() => void openReport("daily", latestDailyReport?.id)}
@@ -1117,6 +1217,12 @@ export function ProductionWorkspace({
         onClose={() => setProjectDialog(null)}
         onSave={(name, description, organizationUnitId) => saveProject(projectDialog, name, description, organizationUnitId)}
       />}
+      {conversationProjectDialog && <ConversationProjectDialog
+        conversation={bootstrap.conversations.find((item) => item.id === conversationProjectDialog.conversationId) ?? null}
+        projects={sortedProjects}
+        onClose={() => setConversationProjectDialog(null)}
+        onMove={(projectId) => moveConversationToProject(conversationProjectDialog.conversationId, projectId)}
+      />}
       {confirmState && <ConfirmDialog state={confirmState} onCancel={() => setConfirmState(null)} onConfirm={() => { const action = confirmState.action; setConfirmState(null); void action(); }} />}
       {toast && <Toast message={toast} />}
     </div>
@@ -1171,6 +1277,9 @@ function ProductionHome({
   organizationUnits,
   organizationScope,
   setOrganizationScope,
+  authorizedModels,
+  selectedModelId,
+  setSelectedModelId,
   latestReport,
   dataCapabilities,
   onOpenReport,
@@ -1187,6 +1296,9 @@ function ProductionHome({
   organizationUnits: OrganizationUnit[];
   organizationScope: OrganizationScope;
   setOrganizationScope: (value: OrganizationScope) => void;
+  authorizedModels: AuthorizedModel[];
+  selectedModelId: string;
+  setSelectedModelId: (value: string) => void;
   latestReport: Report | null;
   dataCapabilities: DataCapabilities | null;
   onOpenReport: () => void;
@@ -1215,9 +1327,7 @@ function ProductionHome({
               <span><strong>{latestReport.title}</strong><small>{latestReport.data_as_of ? `数据截至 ${formatTimestamp(latestReport.data_as_of, language)}` : "最新简报已生成"}</small></span>
               <span>查看晨间摘要 <b aria-hidden="true">›</b></span>
             </button>
-          ) : (
-            <div className={`morning-brief-trigger production-brief-trigger data-status ${dataCapabilities?.overall_status ?? "unavailable"}`} role="status"><span className="morning-brief-dot" aria-hidden="true" /><span><strong>{dataStatusLabel(dataCapabilities)}</strong><small>{dataCapabilities?.domains.length ? dataCapabilities.domains.map((domain) => `${domainLabels[domain.domain] ?? domain.domain}截至 ${formatTimestamp(domain.source_data_as_of, language)}`).join(" · ") : "完成首次同步后将在这里显示各数据域时间"}</small></span><span>{dataCapabilities?.source_label ?? "尚未配置"}</span></div>
-          )}
+          ) : null}
 
           <section className="workspace-greeting" aria-labelledby="production-greeting-title">
             <div className="greeting-title-line"><span className="service-mark" aria-hidden="true" /><h1 id="production-greeting-title">{greetingForCurrentHour(me.user.timezone, language)}，{salutation}</h1></div>
@@ -1235,12 +1345,15 @@ function ProductionHome({
             organizationUnits={organizationUnits}
             organizationScope={organizationScope}
             setOrganizationScope={setOrganizationScope}
+            authorizedModels={authorizedModels}
+            selectedModelId={selectedModelId}
+            setSelectedModelId={setSelectedModelId}
             onKeyDown={onKeyDown}
             onSubmit={onSubmit}
           />
 
           <section className="prompt-suggestions production-prompt-suggestions" aria-label={language === "en" ? "Suggested questions" : "建议问题"}><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>
-          <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? `数据来源：${dataCapabilities.source_label}。` : "当前尚未激活经营数据。"}{c.disclaimer}</p>
+          <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? `数据来源：${professionalSourceLabel(dataCapabilities.source_label)}。` : "当前尚未激活经营数据。"}{c.disclaimer}</p>
         </div>
       </div>
     </div>
@@ -1260,6 +1373,9 @@ function ProductionConversation({
   organizationUnits,
   organizationScope,
   setOrganizationScope,
+  authorizedModels,
+  selectedModelId,
+  setSelectedModelId,
   language,
   disclaimer,
   jobs,
@@ -1278,6 +1394,9 @@ function ProductionConversation({
   organizationUnits: OrganizationUnit[];
   organizationScope: OrganizationScope;
   setOrganizationScope: (value: OrganizationScope) => void;
+  authorizedModels: AuthorizedModel[];
+  selectedModelId: string;
+  setSelectedModelId: (value: string) => void;
   language: UiLanguage;
   disclaimer: string;
   jobs: Job[];
@@ -1297,8 +1416,11 @@ function ProductionConversation({
         ) : (
           <article className={`structured-answer production-answer ${message.status === "failed" ? "failed" : ""}`} key={message.id}>
             <div className="answer-meta"><span>{message.role === "assistant" ? "AI 秘书" : message.role === "tool" ? "数据工具" : "系统"}</span><time>{formatTimestamp(message.created_at, language)}</time></div>
-            <section className="answer-conclusion"><p>{message.content || "正在等待真实处理结果…"}</p></section>
-            <MessageDetails conversationId={conversation?.id ?? message.conversation_id} message={message} />
+            <AssistantMessageBody
+              conversationId={conversation?.id ?? message.conversation_id}
+              message={message}
+              onFollowUp={setDraft}
+            />
             {message.status && message.status !== "completed" && <small className={`message-status ${message.status}`}>状态：{messageStatusLabel(message.status)}</small>}
             <MessageJobActions
               message={message}
@@ -1321,12 +1443,39 @@ function ProductionConversation({
           organizationUnits={organizationUnits}
           organizationScope={organizationScope}
           setOrganizationScope={setOrganizationScope}
+          authorizedModels={authorizedModels}
+          selectedModelId={selectedModelId}
+          setSelectedModelId={setSelectedModelId}
           onKeyDown={onKeyDown}
           onSubmit={onSubmit}
         />
         <p>{disclaimer}</p>
       </div>
     </div>
+  );
+}
+
+function AssistantMessageBody({
+  conversationId,
+  message,
+  onFollowUp,
+}: {
+  conversationId: string;
+  message: ConversationMessage;
+  onFollowUp: (question: string) => void;
+}) {
+  const envelope = parseAssistantOutput(message.content_json?.assistant_output);
+  return (
+    <>
+      {envelope
+        ? <AssistantOutputRenderer envelope={envelope} onFollowUp={onFollowUp} />
+        : <section className="answer-conclusion"><p>{message.content || "正在等待真实处理结果…"}</p></section>}
+      <MessageDetails
+        conversationId={conversationId}
+        message={message}
+        contractRendered={Boolean(envelope)}
+      />
+    </>
   );
 }
 
@@ -1515,9 +1664,11 @@ function StructuredBarChart({
 function MessageDetails({
   conversationId,
   message,
+  contractRendered = false,
 }: {
   conversationId: string;
   message: ConversationMessage;
+  contractRendered?: boolean;
 }) {
   const content = message.content_json && typeof message.content_json === "object" ? message.content_json : {};
   const metrics = Array.isArray(content.metrics) ? content.metrics.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
@@ -1591,15 +1742,15 @@ function MessageDetails({
   if (!metrics.length && !sections.length && !structuredMetrics.length && !Array.isArray(structuredRows) && !citations.length && !freshness.length && !clarificationId && !message.source_data_as_of && !message.model_name && message.role !== "assistant") return null;
   return (
     <div className="production-message-details">
-      {metrics.length > 0 && <dl className="answer-metric-grid">{metrics.slice(0, 6).map((metric, index) => <div key={`${String(metric.label)}-${index}`}><dt>{String(metric.label ?? "指标")}</dt><dd>{String(metric.value ?? "—")}</dd>{metric.note ? <small>{String(metric.note)}</small> : null}</div>)}</dl>}
-      {structuredMetrics.length > 0 && <dl className="answer-metric-grid">{structuredMetrics.map(([key, value]) => <div key={key}><dt>{humanizeMetricKey(key)}</dt><dd>{formatStructuredValue(key, value)}</dd></div>)}</dl>}
-      {structuredChart && <StructuredBarChart metricKey={structuredChart.metricKey} items={structuredChart.items} />}
-      {Array.isArray(structuredRows) && structuredRows.length > 0 && <div className="answer-structured-table">{structuredRows.slice(0, 12).map((row, index) => { const record: Record<string, unknown> = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : { value: row }; return <article key={`${index}-${String(record.source_record_id ?? record.name ?? record.stage ?? record.bucket ?? record.organization_name ?? "row")}`}><span>{String(index + 1).padStart(2, "0")}</span><div>{visibleStructuredEntries(record).map(([key, value]) => <p key={key}><small>{humanizeMetricKey(key)}</small><strong>{formatStructuredValue(key, value)}</strong></p>)}</div></article>; })}</div>}
-      {sections.length > 0 && <div className="answer-section-list">{sections.slice(0, 8).map((section, index) => <section key={`${String(section.title)}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{String(section.title ?? "分析")}</strong>{section.content || section.detail ? <p>{String(section.content ?? section.detail)}</p> : null}</div></section>)}</div>}
+      {!contractRendered && metrics.length > 0 && <dl className="answer-metric-grid">{metrics.slice(0, 6).map((metric, index) => <div key={`${String(metric.label)}-${index}`}><dt>{String(metric.label ?? "指标")}</dt><dd>{String(metric.value ?? "—")}</dd>{metric.note ? <small>{String(metric.note)}</small> : null}</div>)}</dl>}
+      {!contractRendered && structuredMetrics.length > 0 && <dl className="answer-metric-grid">{structuredMetrics.map(([key, value]) => <div key={key}><dt>{humanizeMetricKey(key)}</dt><dd>{formatStructuredValue(key, value)}</dd></div>)}</dl>}
+      {!contractRendered && structuredChart && <StructuredBarChart metricKey={structuredChart.metricKey} items={structuredChart.items} />}
+      {!contractRendered && Array.isArray(structuredRows) && structuredRows.length > 0 && <div className="answer-structured-table">{structuredRows.slice(0, 12).map((row, index) => { const record: Record<string, unknown> = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : { value: row }; return <article key={`${index}-${String(record.source_record_id ?? record.name ?? record.stage ?? record.bucket ?? record.organization_name ?? "row")}`}><span>{String(index + 1).padStart(2, "0")}</span><div>{visibleStructuredEntries(record).map(([key, value]) => <p key={key}><small>{humanizeMetricKey(key)}</small><strong>{formatStructuredValue(key, value)}</strong></p>)}</div></article>; })}</div>}
+      {!contractRendered && sections.length > 0 && <div className="answer-section-list">{sections.slice(0, 8).map((section, index) => <section key={`${String(section.title)}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{String(section.title ?? "分析")}</strong>{section.content || section.detail ? <p>{String(section.content ?? section.detail)}</p> : null}</div></section>)}</div>}
       {clarificationId && !clarificationResolved && <section className="clarification-options"><small>请确认后继续</small><div>{clarificationOptions.map((option, index) => { const label = String(option.label ?? option.value ?? `选项 ${index + 1}`); const value = String(option.value ?? option.label ?? ""); return <button type="button" key={`${value}-${index}`} disabled={!value || clarificationLoading} onClick={() => void resolveClarification(value)}>{label}<span aria-hidden="true">›</span></button>; })}</div>{!clarificationOptions.length && <p>请在输入框中补充需要查询的事业部范围。</p>}</section>}
       {clarificationResolved && <p className="clarification-resolved">已确认范围，正在继续处理。</p>}
-      {(freshness.length > 0 || citations.length > 0 || message.source_data_as_of || message.model_name) && <details className="answer-evidence"><summary>来源与数据时间</summary><dl>{message.source_data_as_of && <div><dt>数据截至</dt><dd>{formatTimestamp(message.source_data_as_of)}</dd></div>}{freshness.map((item, index) => <div key={`${String(item.domain)}-${index}`}><dt>{domainLabels[String(item.domain)] ?? String(item.domain ?? "数据")}</dt><dd>{String(item.source_display_name ?? "未知来源")} · {formatTimestamp(typeof item.source_data_as_of === "string" ? item.source_data_as_of : null)} · {item.status === "fresh" ? "最新" : String(item.status ?? "")}</dd></div>)}{citations.map((citation, index) => <div key={`${citation.source}-${index}`}><dt>{citation.label}</dt><dd>{citation.source}{citation.as_of ? ` · ${citation.as_of}` : ""}</dd></div>)}{message.model_name && <div><dt>处理模型</dt><dd>{message.model_name}</dd></div>}</dl></details>}
-      {evidenceCount > 0 && <section className="numeric-evidence"><button type="button" onClick={() => void toggleEvidence()}><span>{evidenceOpen ? "收起数字依据" : `查看数字依据（${evidenceCount}）`}</span><i aria-hidden="true">{evidenceOpen ? "⌃" : "⌄"}</i></button>{evidenceOpen && <div>{evidenceLoading ? <small>正在读取受控证据…</small> : evidenceRows.map((evidence) => <article key={evidence.id}><header><strong>{domainLabels[evidence.domain] ?? evidence.domain}</strong><span>{evidence.source_display_name}</span></header><p>数据截至 {formatTimestamp(evidence.source_data_as_of)}{evidence.dataset_version ? ` · ${evidence.dataset_version}` : ""}</p><small>{evidence.row_references_json.length ? `${evidence.row_references_json.length} 条源记录引用` : "聚合结果来自当前激活数据版本"}</small></article>)}</div>}</section>}
+      {((!contractRendered && (freshness.length > 0 || citations.length > 0 || message.source_data_as_of)) || message.model_name) && <details className="answer-evidence"><summary>{contractRendered ? "处理信息" : "来源与数据时间"}</summary><dl>{!contractRendered && message.source_data_as_of && <div><dt>数据截至</dt><dd>{formatTimestamp(message.source_data_as_of)}</dd></div>}{!contractRendered && freshness.map((item, index) => <div key={`${String(item.domain)}-${index}`}><dt>{domainLabels[String(item.domain)] ?? String(item.domain ?? "数据")}</dt><dd>{professionalSourceLabel(String(item.source_display_name ?? "未知来源"))} · {formatTimestamp(typeof item.source_data_as_of === "string" ? item.source_data_as_of : null)} · {item.status === "fresh" ? "最新" : String(item.status ?? "")}</dd></div>)}{!contractRendered && citations.map((citation, index) => <div key={`${citation.source}-${index}`}><dt>{citation.label}</dt><dd>{citation.source}{citation.as_of ? ` · ${citation.as_of}` : ""}</dd></div>)}{message.model_name && <div><dt>处理模型</dt><dd>{message.model_name}</dd></div>}</dl></details>}
+      {evidenceCount > 0 && <section className="numeric-evidence"><button type="button" onClick={() => void toggleEvidence()}><span>{evidenceOpen ? "收起数字依据" : `查看数字依据（${evidenceCount}）`}</span><i aria-hidden="true">{evidenceOpen ? "⌃" : "⌄"}</i></button>{evidenceOpen && <div>{evidenceLoading ? <small>正在读取受控证据…</small> : evidenceRows.map((evidence) => <article key={evidence.id}><header><strong>{domainLabels[evidence.domain] ?? evidence.domain}</strong><span>{professionalSourceLabel(evidence.source_display_name)}</span></header><p>数据截至 {formatTimestamp(evidence.source_data_as_of)}{evidence.dataset_version ? ` · ${evidence.dataset_version}` : ""}</p><small>{evidence.row_references_json.length ? `${evidence.row_references_json.length} 条源记录引用` : "聚合结果来自当前激活数据版本"}</small></article>)}</div>}</section>}
       {message.role === "assistant" && message.status === "completed" && <section className="diagnostic-share-control">
         {shareExpiresAt ? <><span>本次诊断已临时共享至 {formatTimestamp(shareExpiresAt)}</span><button type="button" disabled={shareBusy} onClick={() => void revokeDiagnosticShare()}>提前撤销</button></> : <button type="button" onClick={() => setShareConfirmOpen(true)}>共享本次诊断</button>}
         {shareConfirmOpen && <div className="diagnostic-share-confirm" role="alertdialog" aria-label="确认共享本次诊断"><strong>向管理员共享 24 小时？</strong><p>仅共享这条问题、改写、执行计划与回答；不会共享长期记忆或其他会话。</p><div><button type="button" disabled={shareBusy} onClick={() => setShareConfirmOpen(false)}>取消</button><button type="button" disabled={shareBusy} onClick={() => void shareDiagnostic()}>{shareBusy ? "正在授权…" : "确认共享"}</button></div></div>}
@@ -1618,6 +1769,9 @@ function ProductionComposer({
   organizationUnits,
   organizationScope,
   setOrganizationScope,
+  authorizedModels,
+  selectedModelId,
+  setSelectedModelId,
   onKeyDown,
   onSubmit,
 }: {
@@ -1630,10 +1784,14 @@ function ProductionComposer({
   organizationUnits: OrganizationUnit[];
   organizationScope: OrganizationScope;
   setOrganizationScope: (value: OrganizationScope) => void;
+  authorizedModels: AuthorizedModel[];
+  selectedModelId: string;
+  setSelectedModelId: (value: string) => void;
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onSubmit: (event: FormEvent) => void;
 }) {
   const c = copy[language];
+  const selectedModelIsAuthorized = authorizedModels.some((model) => model.model_id === selectedModelId);
   return (
     <form className="composer workbench-composer home-primary-composer production-composer" onSubmit={onSubmit}>
       <label className="sr-only" htmlFor={id}>输入经营问题</label>
@@ -1641,10 +1799,27 @@ function ProductionComposer({
       <div className="composer-footer">
         <div className="composer-tools">
           <OrganizationPicker language={language} units={organizationUnits} value={organizationScope} onChange={setOrganizationScope} disabled={!organizationUnits.length} />
+          <label className="composer-model-picker">
+            <span className="sr-only">当前模型</span>
+            <select
+              value={selectedModelId}
+              disabled={!authorizedModels.length || sending}
+              onChange={(event) => setSelectedModelId(event.target.value)}
+              aria-label="选择本会话使用的模型"
+            >
+              {!authorizedModels.length && <option value="">管理员尚未授权模型</option>}
+              {selectedModelId && !selectedModelIsAuthorized && (
+                <option value={selectedModelId} disabled>原模型已取消授权，请重新选择</option>
+              )}
+              {authorizedModels.map((model) => (
+                <option key={model.model_id} value={model.model_id}>{model.display_name}</option>
+              ))}
+            </select>
+          </label>
         </div>
         <div className="composer-send">
           {draft.length >= COMPOSER_HINT_THRESHOLD && <span className="composer-character-count">{language === "en" ? `${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString("en")} characters remaining` : `还可输入 ${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString(language)} 字`}</span>}
-          <button className="composer-submit-button" type="submit" disabled={disabled || sending || !draft.trim()} aria-label="发送问题">↑</button>
+          <button className="composer-submit-button" type="submit" disabled={disabled || sending || !draft.trim() || !selectedModelIsAuthorized} aria-label="发送问题">↑</button>
         </div>
       </div>
     </form>
@@ -1927,7 +2102,7 @@ function ProductionScopePanel({
     <div className="page subpage production-scope-page">
       <section className="page-heading"><p className="eyebrow">服务端授权结果</p><h1>可查询范围</h1><p>这里仅展示已经接入数据、已启用分析并且当前账号获准访问的事业部。前端不能自行添加。</p></section>
       <section className={`data-capability-summary ${dataCapabilities?.overall_status ?? "unavailable"}`}>
-        <header><div><span className="status-dot" aria-hidden="true" /><div><strong>{dataStatusLabel(dataCapabilities)}</strong><small>{dataCapabilities?.source_label ?? "尚未配置数据源"}</small></div></div><time>{dataCapabilities ? `状态生成于 ${formatTimestamp(dataCapabilities.generated_at)}` : "—"}</time></header>
+        <header><div><span className="status-dot" aria-hidden="true" /><div><strong>{dataStatusLabel(dataCapabilities)}</strong><small>{dataCapabilities ? professionalSourceLabel(dataCapabilities.source_label) : "尚未配置数据源"}</small></div></div><time>{dataCapabilities ? `状态生成于 ${formatTimestamp(dataCapabilities.generated_at)}` : "—"}</time></header>
         {dataCapabilities?.domains.length ? <div className="data-domain-grid">{dataCapabilities.domains.map((domain) => <article key={domain.domain}><span>{domainLabels[domain.domain] ?? domain.domain}</span><strong>{domain.record_count.toLocaleString("zh-CN")} 条</strong><small>数据截至 {formatTimestamp(domain.source_data_as_of)}</small><i className={domain.status}>{domain.status === "fresh" ? "最新" : domain.status === "stale" ? "较旧" : domain.status === "failed" ? "失败" : "部分可用"}</i>{domain.last_error_message && <p>{domain.last_error_message}</p>}</article>)}</div> : <p className="data-capability-empty">首次数据同步完成后，将按商机、交付、回款和目标分别展示状态。</p>}
       </section>
       {organizationUnits.length ? <div className="scope-unit-list">{organizationUnits.map((unit) => <article key={unit.id}><span className="scope-unit-mark" aria-hidden="true" /><div><strong>{unit.name}</strong><small>{unit.code} · {unit.unit_type}</small></div><span className="scope-unit-status">数据可用</span></article>)}</div> : <EmptyState title="尚未配置可分析事业部" description="请由企业管理员完成数据连接、启用分析并授予当前账号访问范围。" />}
@@ -2198,6 +2373,60 @@ function ProjectDialog({
           {error && <p className="project-dialog-error" role="alert">{error}</p>}
           <footer><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={!name.trim() || submitting}>{submitting ? "保存中…" : editing ? "保存修改" : "创建项目"}</button></footer>
         </form>
+      </section>
+    </div>
+  );
+}
+
+function ConversationProjectDialog({
+  conversation,
+  projects,
+  onClose,
+  onMove,
+}: {
+  conversation: Conversation | null;
+  projects: Project[];
+  onClose: () => void;
+  onMove: (projectId: string | null) => Promise<boolean>;
+}) {
+  const [query, setQuery] = useState("");
+  const [submittingId, setSubmittingId] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLElement>(null);
+  const visibleProjects = projects.filter((project) => (
+    project.id !== conversation?.project_id
+    && project.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
+  ));
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    window.requestAnimationFrame(() => dialogRef.current?.querySelector<HTMLInputElement>("input")?.focus());
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => { window.removeEventListener("keydown", onKeyDown); previouslyFocused?.focus(); };
+  }, [onClose]);
+
+  async function move(projectId: string | null) {
+    setSubmittingId(projectId ?? "unassigned");
+    const moved = await onMove(projectId);
+    if (!moved) setSubmittingId(null);
+  }
+
+  return (
+    <div className="project-dialog-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section ref={dialogRef} className="project-dialog conversation-project-dialog" role="dialog" aria-modal="true" aria-labelledby="conversation-project-dialog-title">
+        <header><div><small>会话归属</small><h2 id="conversation-project-dialog-title">移到项目</h2></div><button type="button" aria-label="关闭" onClick={onClose}>×</button></header>
+        <div className="conversation-project-dialog-body">
+          <p>“{conversation?.title || "未命名会话"}”一次只归属一个项目，历史消息、模型和证据不会改变。</p>
+          <label><span className="sr-only">搜索项目</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目" /></label>
+          <div className="conversation-project-options">
+            {conversation?.project_id && <button type="button" disabled={Boolean(submittingId)} onClick={() => void move(null)}><UiIcon name="remove" /><span><strong>移出项目</strong><small>回到最近会话</small></span>{submittingId === "unassigned" && <i>处理中…</i>}</button>}
+            {visibleProjects.map((project) => <button type="button" key={project.id} disabled={Boolean(submittingId)} onClick={() => void move(project.id)}><UiIcon name="folder" /><span><strong>{project.name}</strong><small>{project.description || "项目会话"}</small></span>{submittingId === project.id && <i>处理中…</i>}</button>)}
+            {!visibleProjects.length && !conversation?.project_id && <small className="conversation-project-empty">没有可移动的项目。</small>}
+          </div>
+        </div>
+        <footer><button type="button" className="secondary-button" onClick={onClose}>取消</button></footer>
       </section>
     </div>
   );

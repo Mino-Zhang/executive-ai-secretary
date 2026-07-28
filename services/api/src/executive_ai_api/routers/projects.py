@@ -13,7 +13,7 @@ from ..authz import Principal, assert_org_scope, get_executive_principal
 from ..database import get_db
 from ..errors import AppError
 from ..idempotency import replay, save_response
-from ..models import Project
+from ..models import Conversation, Project, ProjectConversation
 from ..pagination import decode_cursor, encode_cursor
 from ..schemas import Page, ProjectCreate, ProjectOut, ProjectUpdate
 from ..security import utc_now
@@ -148,6 +148,18 @@ def archive_project(
 ) -> None:
     item = owned_project(db, principal, project_id)
     item.archived_at = utc_now()
+    detached_conversation_ids: list[str] = []
+    memberships = db.scalars(
+        select(ProjectConversation)
+        .join(Conversation, Conversation.id == ProjectConversation.conversation_id)
+        .where(
+            ProjectConversation.project_id == item.id,
+            Conversation.archived_at.is_(None),
+        )
+    ).all()
+    for membership in memberships:
+        detached_conversation_ids.append(str(membership.conversation_id))
+        db.delete(membership)
     record_audit(
         db,
         request,
@@ -156,6 +168,7 @@ def archive_project(
         session=principal.session,
         target_type="project",
         target_id=item.id,
+        metadata={"detached_conversation_ids": detached_conversation_ids},
     )
     db.commit()
 

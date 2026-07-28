@@ -35,6 +35,7 @@ from .routers import (
     health,
     jobs,
     memories,
+    models,
     organizations,
     projects,
     reports,
@@ -92,12 +93,14 @@ for api_router in (
     files.router,
     memories.router,
     reports.router,
+    models.router,
     jobs.router,
     admin.router,
     admin_data.router,
     admin_harness.router,
     admin_mcp.router,
     admin_models.router,
+    admin_models.models_router,
     data.router,
 ):
     app.include_router(

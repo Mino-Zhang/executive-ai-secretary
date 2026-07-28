@@ -44,7 +44,9 @@ def test_organization_scope_is_filtered_and_enforced(client, seeded) -> None:
     assert forbidden.json()["error"]["code"] == "data_scope_forbidden"
 
 
-def test_conversation_message_project_and_idempotency(client, seeded) -> None:
+def test_conversation_message_project_and_idempotency(
+    client, seeded, authorized_model
+) -> None:
     auth = login_and_change_password(client)
     headers = {"X-CSRF-Token": auth["csrf_token"], "Idempotency-Key": "project-001"}
     first = client.post(
@@ -301,7 +303,9 @@ def test_legacy_v1_audit_signature_remains_verifiable() -> None:
     assert verify_audit_event(event)
 
 
-def test_unscoped_conversation_allows_general_qa_without_a_data_grant(client, seeded) -> None:
+def test_unscoped_conversation_allows_general_qa_without_a_data_grant(
+    client, seeded, authorized_model
+) -> None:
     auth = login_and_change_password(client)
     with SessionLocal.begin() as db:
         for grant in db.scalars(
@@ -506,7 +510,9 @@ def test_cancel_running_job_closes_attempt_and_placeholder(client, seeded) -> No
         assert placeholder.content == "请求已取消"
 
 
-def test_failed_assistant_job_retries_as_a_new_auditable_attempt(client, seeded) -> None:
+def test_failed_assistant_job_retries_as_a_new_auditable_attempt(
+    client, seeded, authorized_model
+) -> None:
     auth = login_and_change_password(client)
     headers = {"X-CSRF-Token": auth["csrf_token"]}
     conversation = client.post(

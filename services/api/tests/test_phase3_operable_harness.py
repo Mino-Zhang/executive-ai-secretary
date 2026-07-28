@@ -25,7 +25,9 @@ def _csrf(session: dict) -> dict[str, str]:
     return {"X-CSRF-Token": session["csrf_token"]}
 
 
-def test_multi_organization_scope_is_atomic_and_snapshotted(client, seeded) -> None:
+def test_multi_organization_scope_is_atomic_and_snapshotted(
+    client, seeded, authorized_model
+) -> None:
     with SessionLocal.begin() as db:
         pending = db.get(OrganizationUnit, seeded["pending_id"])
         pending.data_connected = True
@@ -210,7 +212,9 @@ def test_executive_profile_and_memory_are_encrypted_at_rest(client, seeded) -> N
         assert admin_client.get("/api/v1/memories").status_code == 403
 
 
-def test_diagnostic_share_requires_owner_and_is_revocable(client, seeded) -> None:
+def test_diagnostic_share_requires_owner_and_is_revocable(
+    client, seeded, authorized_model
+) -> None:
     session = login(client, "other@example.com")
     conversation = client.post(
         "/api/v1/conversations",

@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://executive-ai.local/schemas/chairman-answer.schema.json",
+  "title": "ChairmanAnswer",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "template_id",
+    "decision_readiness",
+    "decision_line",
+    "confidence",
+    "metrics",
+    "risks_or_opportunities",
+    "actions",
+    "data_quality",
+    "sources"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "template_id": {
+      "enum": ["executive_pulse", "target_gap", "risk_action", "top_opportunities", "decision_memo"]
+    },
+    "decision_readiness": { "enum": ["ready", "conditional", "not_ready"] },
+    "decision_line": { "type": "string", "minLength": 8, "maxLength": 120 },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "reason"],
+      "properties": {
+        "level": { "enum": ["high", "medium", "low"] },
+        "reason": { "type": "string", "minLength": 4, "maxLength": 160 }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "value", "unit", "context", "evidence_refs"],
+        "properties": {
+          "label": { "type": "string", "maxLength": 24 },
+          "value": { "type": ["number", "string"] },
+          "unit": { "type": "string", "maxLength": 12 },
+          "context": { "type": "string", "maxLength": 80 },
+          "direction": { "enum": ["up", "down", "flat", "unknown"] },
+          "evidence_refs": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+        }
+      }
+    },
+    "primary_evidence": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "title", "dataset_ref", "reason"],
+          "properties": {
+            "kind": { "enum": ["progress", "bar", "ranked_bar", "waterfall", "timeline", "table", "comparison_matrix"] },
+            "title": { "type": "string", "maxLength": 60 },
+            "dataset_ref": { "type": "string" },
+            "reason": { "type": "string", "maxLength": 120 }
+          }
+        }
+      ]
+    },
+    "risks_or_opportunities": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "title", "impact", "evidence_refs"],
+        "properties": {
+          "type": { "enum": ["risk", "opportunity"] },
+          "title": { "type": "string", "maxLength": 50 },
+          "impact": { "type": "string", "maxLength": 160 },
+          "evidence_refs": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["owner", "action", "due_at", "success_metric"],
+        "properties": {
+          "owner": { "type": "string", "minLength": 1, "maxLength": 40 },
+          "action": { "type": "string", "minLength": 4, "maxLength": 120 },
+          "due_at": { "type": "string", "minLength": 1, "maxLength": 40 },
+          "success_metric": { "type": "string", "minLength": 2, "maxLength": 100 }
+        }
+      }
+    },
+    "data_quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["as_of", "scope", "readiness", "issues", "decision_impact"],
+      "properties": {
+        "as_of": { "type": "string" },
+        "scope": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "readiness": { "enum": ["ready", "conditional", "not_ready"] },
+        "issues": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["dimension", "severity", "detail"],
+            "properties": {
+              "dimension": { "enum": ["completeness", "uniqueness", "consistency", "timeliness", "validity", "accuracy", "definition"] },
+              "severity": { "enum": ["critical", "high", "medium", "low"] },
+              "detail": { "type": "string", "maxLength": 160 }
+            }
+          }
+        },
+        "decision_impact": { "type": "string", "maxLength": 180 }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "label", "as_of"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "as_of": { "type": "string" },
+          "dataset_version": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "follow_up_questions": {
+      "type": "array",
+      "maxItems": 3,
+      "items": { "type": "string", "maxLength": 80 }
+    }
+  }
+}

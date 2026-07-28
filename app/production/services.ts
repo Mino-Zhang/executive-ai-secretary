@@ -1,5 +1,8 @@
 import { ApiClient, apiClient, humanizeApiError } from "./api-client";
 import type {
+  AdminModelAuthorization,
+  AdminModelCatalog,
+  AuthorizedModel,
   AuthMe,
   AuthSession,
   Conversation,
@@ -109,23 +112,28 @@ export function createProductionServices(client: ApiClient = apiClient) {
   const conversations = {
     async list(
       cursor?: string | null,
-      options: { projectId?: string | null; includeArchived?: boolean } = {},
+      options: {
+        projectId?: string | null;
+        includeArchived?: boolean;
+        placement?: "unassigned" | "project" | "all";
+      } = {},
     ) {
       return client.request<CursorPage<Conversation>>(
         `/conversations${queryString({
           cursor,
           project_id: options.projectId,
           include_archived: options.includeArchived,
+          placement: options.placement,
         })}`,
       );
     },
     async get(id: string) {
       return client.request<Conversation>(`/conversations/${encodeURIComponent(id)}`);
     },
-    async create(values: { title?: string; organization_scope?: OrganizationScope; project_id?: string }) {
+    async create(values: { title?: string; organization_scope?: OrganizationScope; project_id?: string; model_id?: string }) {
       return client.request<Conversation>("/conversations", { method: "POST", headers: idempotencyHeaders(), body: values });
     },
-    async update(id: string, values: { title?: string; organization_scope?: OrganizationScope; status?: "active" | "archived" }) {
+    async update(id: string, values: { title?: string; organization_scope?: OrganizationScope; status?: "active" | "archived"; model_id?: string }) {
       return client.request<Conversation>(`/conversations/${encodeURIComponent(id)}`, { method: "PATCH", body: values });
     },
     async archive(id: string) {
@@ -141,10 +149,21 @@ export function createProductionServices(client: ApiClient = apiClient) {
         `/conversations/${encodeURIComponent(id)}/messages${queryString({ after_sequence: cursor })}`,
       );
     },
-    async sendMessage(id: string, content: string, organizationScope: OrganizationScope) {
+    async setProject(id: string, projectId: string | null) {
+      return client.request<Conversation>(
+        `/conversations/${encodeURIComponent(id)}/project`,
+        { method: "PATCH", body: { project_id: projectId } },
+      );
+    },
+    async sendMessage(
+      id: string,
+      content: string,
+      organizationScope: OrganizationScope,
+      modelId: string,
+    ) {
       return client.request<ConversationMessage>(
         `/conversations/${encodeURIComponent(id)}/messages`,
-        { method: "POST", headers: idempotencyHeaders(), body: { content, file_ids: [], organization_scope: organizationScope } },
+        { method: "POST", headers: idempotencyHeaders(), body: { content, file_ids: [], organization_scope: organizationScope, model_id: modelId } },
       );
     },
     async evidence(id: string, messageId: string) {
@@ -246,6 +265,12 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
   };
 
+  const models = {
+    async list() {
+      return client.request<AuthorizedModel[]>("/models");
+    },
+  };
+
   const adminModels = {
     async get() {
       return client.request<ModelProviderConfig>("/admin/model-provider");
@@ -260,6 +285,34 @@ export function createProductionServices(client: ApiClient = apiClient) {
       return client.request<ModelProviderTest>("/admin/model-provider/test", {
         method: "POST",
       });
+    },
+    async catalog() {
+      return client.request<AdminModelCatalog>("/admin/models");
+    },
+    async testModel(modelId: string) {
+      return client.request<ModelProviderTest>(
+        `/admin/models/${encodeURIComponent(modelId)}/test`,
+        { method: "POST" },
+      );
+    },
+    async authorize(
+      modelId: string,
+      isAuthorized: boolean,
+      displayName?: string,
+    ) {
+      return client.request<AdminModelAuthorization>(
+        `/admin/models/${encodeURIComponent(modelId)}/authorization`,
+        {
+          method: "PATCH",
+          body: { is_authorized: isAuthorized, display_name: displayName },
+        },
+      );
+    },
+    async setDefault(modelId: string) {
+      return client.request<AdminModelAuthorization>(
+        `/admin/models/${encodeURIComponent(modelId)}/default`,
+        { method: "PATCH", body: { is_default: true } },
+      );
     },
   };
 
@@ -367,7 +420,7 @@ export function createProductionServices(client: ApiClient = apiClient) {
     },
   };
 
-  return { auth, organizations, conversations, projects, memories, reports, jobs, data, adminModels, adminHarness, adminMcp, adminData };
+  return { auth, organizations, conversations, projects, memories, reports, jobs, data, models, adminModels, adminHarness, adminMcp, adminData };
 }
 
 export type ProductionServices = ReturnType<typeof createProductionServices>;
@@ -384,6 +437,7 @@ export async function loadProductionBootstrap(
       organizationUnits: [],
       conversations: [],
       projects: [],
+      authorizedModels: [],
       memories: [],
       reports: [],
       jobs: [],
@@ -401,6 +455,7 @@ export async function loadProductionBootstrap(
       organizationUnits: [],
       conversations: [],
       projects: [],
+      authorizedModels: [],
       memories: [],
       reports: [],
       jobs: [],
@@ -412,7 +467,7 @@ export async function loadProductionBootstrap(
 
   const [organizationsResult, conversationsResult, projectsResult] = await Promise.all([
     services.organizations.listAnalyzable(),
-    services.conversations.list(),
+    services.conversations.list(undefined, { placement: "all" }),
     services.projects.list(),
   ]);
 
@@ -422,10 +477,11 @@ export async function loadProductionBootstrap(
     services.jobs.list(),
     services.data.capabilities(),
     services.auth.personalProfile(),
+    services.models.list(),
   ] as const);
   const optionalErrors: ProductionBootstrap["optionalErrors"] = {};
   const authorizedOrganizationIds = new Set(me.scopes.map((scope) => scope.id));
-  const optionalKeys = ["memories", "reports", "jobs", "dataCapabilities", "personalProfile"] as const;
+  const optionalKeys = ["memories", "reports", "jobs", "dataCapabilities", "personalProfile", "authorizedModels"] as const;
   optional.forEach((result, index) => {
     if (result.status === "rejected") {
       optionalErrors[optionalKeys[index]] = humanizeApiError(result.reason);
@@ -439,6 +495,7 @@ export async function loadProductionBootstrap(
     ),
     conversations: conversationsResult.items,
     projects: projectsResult.items,
+    authorizedModels: optional[5].status === "fulfilled" ? optional[5].value : [],
     memories: optional[0].status === "fulfilled" ? optional[0].value.items : [],
     reports: optional[1].status === "fulfilled" ? optional[1].value.items : [],
     jobs: optional[2].status === "fulfilled" ? optional[2].value.items : [],

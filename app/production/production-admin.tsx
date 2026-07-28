@@ -4,6 +4,8 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { humanizeApiError } from "./api-client";
 import { productionServices } from "./services";
 import type {
+  AdminModelAuthorization,
+  AdminModelCatalog,
   AuthMe,
   DataOperationsV3Overview,
   DataSource,
@@ -68,7 +70,7 @@ export function ProductionAdmin({
           <button className={view === "models" ? "active" : ""} type="button" onClick={() => setView("models")}><span aria-hidden="true">模</span><strong>模型服务</strong></button>
           <button className={view === "harness" ? "active" : ""} type="button" onClick={() => setView("harness")}><span aria-hidden="true">编</span><strong>编排策略</strong></button>
           <button className={view === "mcp" ? "active" : ""} type="button" onClick={() => setView("mcp")}><span aria-hidden="true">工</span><strong>MCP 工具</strong></button>
-          <button className={view === "data" ? "active" : ""} type="button" onClick={() => setView("data")}><span aria-hidden="true">数</span><strong>数据运营</strong></button>
+          <button className={view === "data" ? "active" : ""} type="button" onClick={() => setView("data")}><span aria-hidden="true">数</span><strong>经营数据</strong></button>
         </nav>
         <div className="production-admin-account"><span aria-hidden="true">{me.user.display_name.slice(0, 1)}</span><div><strong>{me.user.display_name}</strong><small>{me.user.role === "fde" ? "实施与运维" : "企业管理员"}</small></div><button type="button" onClick={onLogout}>退出</button></div>
       </aside>
@@ -101,9 +103,9 @@ const guideContent: Record<AdminView, { eyebrow: string; title: string; summary:
   },
   data: {
     eyebrow: "运营说明",
-    title: "三张表只作为一个批次切换",
+    title: "经营数据按完整批次生效",
     summary: "商机、项目与回款必须同时通过字段、关联和金额校验；失败会继续使用上一完整成功批次。",
-    principles: ["连接测试只验证只读与结构契约", "可以先校验且不生效", "正式同步只能三表原子切换"],
+    principles: ["连接测试只验证只读与结构契约", "可以先校验且不生效", "正式同步只切换完整成功批次"],
   },
 };
 
@@ -139,9 +141,9 @@ function syncStatusLabel(status: string) {
 }
 
 function atomicStatusLabel(status: string) {
-  if (status === "activated") return "三表已原子切换";
-  if (status === "activating") return "正在原子切换";
-  if (status === "failed") return "原子切换失败";
+  if (status === "activated") return "完整批次已生效";
+  if (status === "activating") return "完整批次生效中";
+  if (status === "failed") return "批次生效失败";
   if (status === "rejected") return "批次已拒绝";
   if (status === "not_requested") return "仅校验，未生效";
   return status || "等待处理";
@@ -168,6 +170,18 @@ function fieldTypeLabel(value: number) {
     1002: "最后更新时间",
   };
   return labels[value] ?? `类型 ${value}`;
+}
+
+function dataSourceDisplayName(value: string) {
+  return value
+    .replaceAll("飞书经营三表", "飞书经营数据源")
+    .replaceAll("飞书三表", "飞书经营数据源");
+}
+
+function dataSourceTypeLabel(value: string) {
+  if (value === "feishu_three_table") return "飞书多维表格";
+  if (value === "postgres") return "标准 PostgreSQL";
+  return value;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -306,31 +320,31 @@ function DataOperationsPanel() {
   return (
     <main className="production-admin-main data-operations-main">
       <header className="production-admin-heading">
-        <div><p>数据运营</p><h1>数据源与同步任务</h1><span>集中检查只读源库、每日调度和同步批次，不在这里修改业务事实。</span></div>
-        <span className={`production-admin-status ${latestRun?.status === "failed" || latestRun?.status === "rejected" ? "risk" : latestSuccessful ? "positive" : "quiet"}`}><i aria-hidden="true" />{latestSuccessful ? "三表批次可用" : latestRun ? `最近${syncStatusLabel(latestRun.status)}` : "等待首次同步"}</span>
+        <div><p>经营数据</p><h1>经营数据接入与同步</h1><span>集中检查只读数据源、调度计划和同步批次，不在这里修改业务事实。</span></div>
+        <span className={`production-admin-status ${latestRun?.status === "failed" || latestRun?.status === "rejected" ? "risk" : latestSuccessful ? "positive" : "quiet"}`}><i aria-hidden="true" />{latestSuccessful ? "经营数据可用" : latestRun ? `最近${syncStatusLabel(latestRun.status)}` : "等待首次同步"}</span>
       </header>
 
       <div className="data-operations-console">
-        <aside className="data-operations-nav" aria-label="数据运营模块"><strong>运营模块</strong><button className={activeView === "sources" ? "active" : ""} type="button" onClick={() => setActiveView("sources")}><span>数据源</span><small>飞书三表绑定</small></button><button className={activeView === "runs" ? "active" : ""} type="button" onClick={() => setActiveView("runs")}><span>同步运行</span><small>原子批次与拒绝</small></button><button className={activeView === "schedule" ? "active" : ""} type="button" onClick={() => setActiveView("schedule")}><span>调度计划</span><small>每日执行时间</small></button><button className={activeView === "quality" ? "active" : ""} type="button" onClick={() => setActiveView("quality")}><span>数据质量</span><small>关系与金额校验</small></button><button className={activeView === "policy" ? "active" : ""} type="button" onClick={() => setActiveView("policy")}><span>指标口径</span><small>经验权重版本</small></button></aside>
+        <aside className="data-operations-nav" aria-label="经营数据模块"><strong>功能模块</strong><button className={activeView === "sources" ? "active" : ""} type="button" onClick={() => setActiveView("sources")}><span>数据接入</span><small>经营数据源</small></button><button className={activeView === "runs" ? "active" : ""} type="button" onClick={() => setActiveView("runs")}><span>同步运行</span><small>完整批次与拒绝</small></button><button className={activeView === "schedule" ? "active" : ""} type="button" onClick={() => setActiveView("schedule")}><span>调度计划</span><small>每日执行时间</small></button><button className={activeView === "quality" ? "active" : ""} type="button" onClick={() => setActiveView("quality")}><span>数据质量</span><small>关系与金额校验</small></button><button className={activeView === "policy" ? "active" : ""} type="button" onClick={() => setActiveView("policy")}><span>指标口径</span><small>经验权重版本</small></button></aside>
         <div className="data-operations-content">
 
-      <section className="data-operations-summary" aria-label="数据运营摘要">
-        <div><small>飞书三表</small><strong>{validatedBindings} / {tableBindings.length || 3}</strong><span>已完成字段与 Schema 校验</span></div>
-        <div><small>自动任务</small><strong>{enabledTasks}</strong><span>{tasks.length ? `共 ${tasks.length} 项` : "尚未配置"}</span></div>
-        <div><small>当前原子批次</small><strong>{latestSuccessful?.source_batch_id ? shortHash(latestSuccessful.source_batch_id) : "—"}</strong><span>{latestSuccessful ? atomicStatusLabel(latestSuccessful.atomic_activation_status) : "尚未激活"}</span></div>
-        <div><small>经验权重口径</small><strong>v{overview?.experience_weight_policy.version ?? "—"}</strong><span>高 {weightDraft.high}% · 中 {weightDraft.medium}% · 低 {weightDraft.low}%</span></div>
+      <section className="data-operations-summary" aria-label="经营数据摘要">
+        <div><small>已接入数据域</small><strong>{validatedBindings} / {tableBindings.length || 3}</strong><span>已完成字段与 Schema 校验</span></div>
+        <div><small>已启用调度</small><strong>{enabledTasks}</strong><span>{tasks.length ? `共 ${tasks.length} 项` : "尚未配置"}</span></div>
+        <div><small>当前数据批次</small><strong>{latestSuccessful?.source_batch_id ? shortHash(latestSuccessful.source_batch_id) : "—"}</strong><span>{latestSuccessful ? atomicStatusLabel(latestSuccessful.atomic_activation_status) : "尚未激活"}</span></div>
+        <div><small>指标口径版本</small><strong>v{overview?.experience_weight_policy.version ?? "—"}</strong><span>高 {weightDraft.high}% · 中 {weightDraft.medium}% · 低 {weightDraft.low}%</span></div>
       </section>
 
       {error && <p className="anspire-error" role="alert">{error}</p>}
       {notice && <p className="anspire-notice" role="status">{notice}</p>}
 
       {activeView === "sources" && <section className="data-operations-section data-source-v3-section">
-        <header><div><small>01</small><h2>飞书三表绑定</h2></div><p>一个完整批次，三表全部通过后才允许生效</p></header>
+        <header><div><h2>经营数据接入</h2></div><p>一个完整批次，全部数据域通过后才允许生效</p></header>
         <div className="data-source-v3-list">
           {sources.map((source) => {
             const operations = overview?.sources.find((item) => item.source_id === source.id);
             return <article className="data-source-v3-card" key={source.id}>
-              <header><div className="data-source-identity"><i className={source.last_test_status ?? "pending"} aria-hidden="true" /><span><strong>{source.display_name}</strong><small>{source.source_type} · ODS Schema {operations?.schema_version ?? source.schema_version}</small></span></div><div className="data-source-v3-policy"><small>切换策略</small><strong>三表原子切换</strong></div><label className="switch" title="启用数据源"><input type="checkbox" checked={source.is_enabled} disabled={Boolean(busy)} onChange={(event) => void perform(`source:${source.id}:toggle`, () => productionServices.adminData.updateSource(source.id, { is_enabled: event.target.checked }), event.target.checked ? "数据源已启用。" : "数据源已停用。")} /><span aria-hidden="true" /></label></header>
+              <header><div className="data-source-identity"><i className={source.last_test_status ?? "pending"} aria-hidden="true" /><span><strong>{dataSourceDisplayName(source.display_name)}</strong><small>{dataSourceTypeLabel(source.source_type)} · ODS Schema {operations?.schema_version ?? source.schema_version}</small></span></div><div className="data-source-v3-policy"><small>切换策略</small><strong>完整批次切换</strong></div><label className="switch" title="启用数据源"><input type="checkbox" checked={source.is_enabled} disabled={Boolean(busy)} onChange={(event) => void perform(`source:${source.id}:toggle`, () => productionServices.adminData.updateSource(source.id, { is_enabled: event.target.checked }), event.target.checked ? "数据源已启用。" : "数据源已停用。")} /><span aria-hidden="true" /></label></header>
               <div className="feishu-binding-list">
                 {operations?.bindings.map((binding) => <div className="feishu-binding-row" key={binding.domain}>
                   <div className="feishu-binding-heading"><span className={`binding-state ${binding.validation_status}`} aria-hidden="true" /><div><strong>{binding.display_name}</strong><small>{binding.configured ? `${binding.app_token_masked ?? "Base"} · ${binding.table_id ?? "Table ID 未返回"}` : "尚未绑定飞书表"}</small></div></div>
@@ -340,8 +354,8 @@ function DataOperationsPanel() {
                 </div>)}
                 {!operations && <p className="data-operations-empty">正在等待 ODS 3.0 绑定状态。</p>}
               </div>
-              <footer className="data-source-v3-footer"><span>最近连接测试：{formatAdminTime(source.last_tested_at)}</span><div><button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void perform(`source:${source.id}:test`, () => productionServices.adminData.testSource(source.id), "连接、只读权限与基础结构均已通过验证。")}>{busy === `source:${source.id}:test` ? "测试中…" : "测试连接"}</button><button className="secondary-button" type="button" disabled={Boolean(busy) || !source.is_enabled} onClick={() => void perform(`source:${source.id}:validate`, () => productionServices.adminData.validateSource(source.id), "已创建校验任务；本次不会切换当前经营数据。")}>{busy === `source:${source.id}:validate` ? "创建中…" : "校验但不生效"}</button><button className="primary-button" type="button" disabled={Boolean(busy) || !source.is_enabled} onClick={() => setConfirmSourceId(source.id)}>同步并原子切换</button></div></footer>
-              {confirmSourceId === source.id && <div className="atomic-sync-confirmation" role="alertdialog" aria-label="确认同步并原子切换"><div><strong>确认创建正式同步任务？</strong><span>系统将读取三张飞书表。只有字段、跨表关系与金额恒等式全部通过，才会一次性切换三个数据域。</span></div><div><button type="button" className="secondary-button" onClick={() => setConfirmSourceId("")}>取消</button><button type="button" className="primary-button" disabled={Boolean(busy)} onClick={() => void perform(`source:${source.id}:sync`, () => productionServices.adminData.syncSource(source.id), "已创建正式同步任务；三表校验通过后将原子切换。").then(() => setConfirmSourceId(""))}>{busy === `source:${source.id}:sync` ? "创建中…" : "确认执行"}</button></div></div>}
+              <footer className="data-source-v3-footer"><span>最近连接测试：{formatAdminTime(source.last_tested_at)}</span><div><button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void perform(`source:${source.id}:test`, () => productionServices.adminData.testSource(source.id), "连接、只读权限与基础结构均已通过验证。")}>{busy === `source:${source.id}:test` ? "测试中…" : "测试连接"}</button><button className="secondary-button" type="button" disabled={Boolean(busy) || !source.is_enabled} onClick={() => void perform(`source:${source.id}:validate`, () => productionServices.adminData.validateSource(source.id), "已创建校验任务；本次不会切换当前经营数据。")}>{busy === `source:${source.id}:validate` ? "创建中…" : "校验但不生效"}</button><button className="primary-button" type="button" disabled={Boolean(busy) || !source.is_enabled} onClick={() => setConfirmSourceId(source.id)}>同步并切换批次</button></div></footer>
+              {confirmSourceId === source.id && <div className="atomic-sync-confirmation" role="alertdialog" aria-label="确认同步并切换完整批次"><div><strong>确认创建正式同步任务？</strong><span>系统将读取当前经营数据源。只有字段、跨域关系与金额恒等式全部通过，才会一次性切换完整数据批次。</span></div><div><button type="button" className="secondary-button" onClick={() => setConfirmSourceId("")}>取消</button><button type="button" className="primary-button" disabled={Boolean(busy)} onClick={() => void perform(`source:${source.id}:sync`, () => productionServices.adminData.syncSource(source.id), "已创建正式同步任务；经营数据校验通过后将切换完整批次。").then(() => setConfirmSourceId(""))}>{busy === `source:${source.id}:sync` ? "创建中…" : "确认执行"}</button></div></div>}
               {source.last_test_error && <p className="data-source-error">{source.last_test_error}</p>}
             </article>;
           })}
@@ -350,16 +364,16 @@ function DataOperationsPanel() {
       </section>}
 
       {activeView === "schedule" && <section className="data-operations-section">
-        <header><div><small>02</small><h2>自动任务</h2></div><p>调度器只创建任务，数据由独立 Worker 处理</p></header>
+        <header><div><h2>调度计划</h2></div><p>调度器只创建任务，数据由独立 Worker 处理</p></header>
         <div className="scheduled-task-list">
           {tasks.map((task) => <article key={task.id}><span className={`task-state ${task.is_enabled ? "enabled" : ""}`} aria-hidden="true" /><div><strong>{task.key}</strong><small>{task.cron_expression} · {task.timezone}</small></div><dl><div><dt>下次执行</dt><dd>{formatAdminTime(task.next_run_at)}</dd></div><div><dt>上次入队</dt><dd>{formatAdminTime(task.last_enqueued_at)}</dd></div></dl><button className="secondary-button" type="button" disabled={Boolean(busy) || !task.is_enabled} onClick={() => void perform(`task:${task.id}`, () => productionServices.adminData.runScheduledTask(task.id), "已按当前任务配置创建一次立即运行。")}>{busy === `task:${task.id}` ? "创建中…" : "运行一次"}</button></article>)}
-          {!tasks.length && <p className="data-operations-empty">当前没有自动同步任务。</p>}
+          {!tasks.length && <p className="data-operations-empty">当前没有同步调度计划。</p>}
         </div>
       </section>}
 
       {activeView === "runs" && <section className="data-operations-section data-runs-v3-section">
-        <header><div><small>03</small><h2>同步运行</h2></div><p>批次不可变，可复核成功与拒绝原因</p></header>
-        <div className="batch-outcome-strip"><article><small>最近成功批次</small><strong>{latestSuccessful?.source_batch_id ? shortHash(latestSuccessful.source_batch_id) : "尚无"}</strong><span>{latestSuccessful ? `${formatAdminTime(latestSuccessful.activated_at)} · ${latestSuccessful.records_written} 条已激活` : "完成首次正式切换后显示"}</span></article><article className={latestRejected ? "risk" : ""}><small>最近拒绝批次</small><strong>{latestRejected?.source_batch_id ? shortHash(latestRejected.source_batch_id) : "无"}</strong><span>{latestRejected ? `${formatAdminTime(latestRejected.completed_at)} · ${latestRejected.error_code ?? "校验未通过"}` : "当前没有被拒绝的三表批次"}</span></article></div>
+        <header><div><h2>同步运行</h2></div><p>批次不可变，可复核成功与拒绝原因</p></header>
+        <div className="batch-outcome-strip"><article><small>最近成功批次</small><strong>{latestSuccessful?.source_batch_id ? shortHash(latestSuccessful.source_batch_id) : "尚无"}</strong><span>{latestSuccessful ? `${formatAdminTime(latestSuccessful.activated_at)} · ${latestSuccessful.records_written} 条已激活` : "完成首次正式切换后显示"}</span></article><article className={latestRejected ? "risk" : ""}><small>最近拒绝批次</small><strong>{latestRejected?.source_batch_id ? shortHash(latestRejected.source_batch_id) : "无"}</strong><span>{latestRejected ? `${formatAdminTime(latestRejected.completed_at)} · ${latestRejected.error_code ?? "校验未通过"}` : "当前没有被拒绝的经营数据批次"}</span></article></div>
         <div className="data-sync-table" role="table" aria-label="最近数据同步运行">
           <div role="row"><span role="columnheader">状态</span><span role="columnheader">运行方式</span><span role="columnheader">商机 / 项目 / 回款</span><span role="columnheader">数据时间</span><span role="columnheader">完成时间</span></div>
           {runs.slice(0, 16).map((run) => <button type="button" role="row" aria-selected={selectedRun?.id === run.id} key={run.id} onClick={() => setSelectedRunId(run.id)}><span role="cell"><i className={`sync-run-state ${run.status}`} aria-hidden="true" />{syncStatusLabel(run.status)}<small>{atomicStatusLabel(run.atomic_activation_status)}</small></span><span role="cell">{run.trigger_type === "manual_validation" ? "仅校验" : run.trigger_type === "manual" ? "人工同步" : run.trigger_type}</span><span role="cell">{run.source_record_counts_json.opportunity ?? "—"} / {run.source_record_counts_json.delivery ?? "—"} / {run.source_record_counts_json.collection ?? "—"}</span><span role="cell">{formatAdminTime(run.source_data_as_of)}</span><span role="cell">{formatAdminTime(run.completed_at)}</span></button>)}
@@ -368,14 +382,14 @@ function DataOperationsPanel() {
         {selectedRun && <div className="selected-run-detail"><div><small>批次 ID</small><code>{selectedRun.source_batch_id ?? selectedRun.id}</code></div><div><small>数据集版本</small><strong>{selectedRun.dataset_version ?? "—"}</strong></div><div><small>切换结果</small><strong>{atomicStatusLabel(selectedRun.atomic_activation_status)}</strong></div><div><small>经验权重版本</small><strong>{selectedRun.experience_weight_policy_id ? shortHash(selectedRun.experience_weight_policy_id) : "未记录"}</strong></div>{qualityWarnings.length > 0 && <p className="warning">{qualityWarnings.length} 项兼容或身份变化提示，请在数据质量中复核。</p>}{selectedRun.error_message && <p>{selectedRun.error_message}</p>}</div>}
       </section>}
 
-      {activeView === "quality" && <section className="data-operations-section data-quality-section data-quality-v3-section"><header><div><small>04</small><h2>数据质量</h2></div><p>逐项展示关系和金额校验，不折叠成单一分数</p></header>{qualityRun ? <>
-        <div className="data-quality-metrics"><article><small>商机记录</small><strong>{qualityRun.source_record_counts_json.opportunity ?? 0}</strong><span>业务主键必须唯一</span></article><article><small>项目记录</small><strong>{qualityRun.source_record_counts_json.delivery ?? 0}</strong><span>必须关联赢单商机</span></article><article><small>回款记录</small><strong>{qualityRun.source_record_counts_json.collection ?? 0}</strong><span>必须关联项目与商机</span></article><article className={qualityValidation.valid === false ? "risk" : ""}><small>三表校验</small><strong>{qualityValidation.valid === true ? "通过" : qualityValidation.valid === false ? "拒绝" : "待校验"}</strong><span>{atomicStatusLabel(qualityRun.atomic_activation_status)}</span></article></div>
+      {activeView === "quality" && <section className="data-operations-section data-quality-section data-quality-v3-section"><header><div><h2>数据质量</h2></div><p>逐项展示关系和金额校验，不折叠成单一分数</p></header>{qualityRun ? <>
+        <div className="data-quality-metrics"><article><small>商机记录</small><strong>{qualityRun.source_record_counts_json.opportunity ?? 0}</strong><span>业务主键必须唯一</span></article><article><small>项目记录</small><strong>{qualityRun.source_record_counts_json.delivery ?? 0}</strong><span>必须关联赢单商机</span></article><article><small>回款记录</small><strong>{qualityRun.source_record_counts_json.collection ?? 0}</strong><span>必须关联项目与商机</span></article><article className={qualityValidation.valid === false ? "risk" : ""}><small>经营数据校验</small><strong>{qualityValidation.valid === true ? "通过" : qualityValidation.valid === false ? "拒绝" : "待校验"}</strong><span>{atomicStatusLabel(qualityRun.atomic_activation_status)}</span></article></div>
         <div className="data-quality-detail-grid"><section><small>跨表关联检查</small><h3>关系完整性</h3><dl>{Object.entries(relationshipChecks).map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd className={value === "passed" ? "passed" : ""}>{value === "passed" ? "通过" : String(value)}</dd></div>)}</dl>{!Object.keys(relationshipChecks).length && <p>当前批次没有可展示的关系检查。</p>}</section><section><small>金额恒等式</small><h3>经营金额对账</h3><div className="financial-invariant-grid"><span><small>签约金额</small><strong>{formatValidationAmount(amountChecks.signed_amount)}</strong></span><span><small>项目合同额</small><strong>{formatValidationAmount(amountChecks.contract_amount)}</strong></span><span><small>回款应收额</small><strong>{formatValidationAmount(amountChecks.receivable_amount)}</strong></span><span><small>已回款</small><strong>{formatValidationAmount(amountChecks.collected_amount)}</strong></span><span><small>未回款</small><strong>{formatValidationAmount(amountChecks.outstanding_amount)}</strong></span></div><p>必须同时满足：签约额 = 合同额 = 应收额；应收额 = 已回款 + 未回款。</p></section></div>
         {qualityWarnings.length > 0 && <div className="data-quality-warning-list"><strong>需人工复核</strong><div>{qualityWarnings.map((warning, index) => <p key={`${String(warning.code ?? "warning")}-${index}`}><span>{String(warning.domain ?? "batch")}</span>{String(warning.message)}</p>)}</div></div>}
         <div className="hash-verification-list"><strong>批次哈希</strong>{(["opportunity", "delivery", "collection"] as const).map((domain) => <div key={domain}><span>{domain === "opportunity" ? "商机总览" : domain === "delivery" ? "项目交付" : "财务回款"}</span><code>Schema {shortHash(qualityRun.source_schema_hashes_json[domain])}</code><code>内容 {shortHash(qualityRun.source_content_hashes_json[domain])}</code></div>)}</div>
-      </> : <p className="data-operations-empty">完成首次校验后，这里会显示三表关系、金额与哈希。</p>}</section>}
+      </> : <p className="data-operations-empty">完成首次校验后，这里会显示跨域关系、金额与哈希。</p>}</section>}
 
-      {activeView === "policy" && <section className="data-operations-section experience-policy-section"><header><div><small>05</small><h2>经验权重口径</h2></div><p>独立于 Harness Prompt，由经营计算层强制执行</p></header>{overview ? <form onSubmit={(event) => void saveWeightPolicy(event)}><div className="experience-policy-heading"><div><small>当前版本</small><strong>v{overview.experience_weight_policy.version}</strong><span>{overview.experience_weight_policy.label}</span></div><div><small>观察窗口</small><strong>{overview.experience_weight_policy.observation_windows_json.join(" / ")} 天</strong><span>只报告偏差，不自动调权</span></div><div><small>生效时间</small><strong>{formatAdminTime(overview.experience_weight_policy.activated_at)}</strong><span>每次保存生成不可变新版本</span></div></div><div className="experience-policy-editor"><label><span>高靠谱度</span><div><input type="number" min={0} max={100} step={1} value={weightDraft.high} onChange={(event) => setWeightDraft((current) => ({ ...current, high: Number(event.target.value) }))} /><b>%</b></div><small>当前默认 20%</small></label><label><span>中靠谱度</span><div><input type="number" min={0} max={100} step={1} value={weightDraft.medium} onChange={(event) => setWeightDraft((current) => ({ ...current, medium: Number(event.target.value) }))} /><b>%</b></div><small>当前默认 10%</small></label><label><span>低靠谱度</span><div><input type="number" min={0} max={100} step={1} value={weightDraft.low} onChange={(event) => setWeightDraft((current) => ({ ...current, low: Number(event.target.value) }))} /><b>%</b></div><small>当前默认 5%</small></label></div><label className="experience-policy-notes"><span>版本备注</span><textarea rows={3} maxLength={1000} value={weightDraft.notes} onChange={(event) => setWeightDraft((current) => ({ ...current, notes: event.target.value }))} placeholder="记录本次调整依据；不要填写客户敏感信息。" /></label><div className="experience-policy-note"><strong>这不是赢单概率</strong><p>经验权重预测 = 在途商机预估金额 × 当前靠谱度权重。赢单使用实际签约金额，搁置与归档不进入预测；模型不能自行改变该口径。</p></div><footer><span>保存只影响后续新同步批次和回答，历史证据继续保留原口径版本。</span><button className="primary-button" type="submit" disabled={Boolean(busy)}>{busy === "policy:save" ? "正在生成新版本…" : "保存为新版本"}</button></footer></form> : <div className="anspire-loading">正在读取指标口径…</div>}</section>}
+      {activeView === "policy" && <section className="data-operations-section experience-policy-section"><header><div><h2>指标口径</h2></div><p>独立于 Harness Prompt，由经营计算层强制执行</p></header>{overview ? <form onSubmit={(event) => void saveWeightPolicy(event)}><div className="experience-policy-heading"><div><small>当前版本</small><strong>v{overview.experience_weight_policy.version}</strong><span>{overview.experience_weight_policy.label}</span></div><div><small>观察窗口</small><strong>{overview.experience_weight_policy.observation_windows_json.join(" / ")} 天</strong><span>只报告偏差，不自动调权</span></div><div><small>生效时间</small><strong>{formatAdminTime(overview.experience_weight_policy.activated_at)}</strong><span>每次保存生成不可变新版本</span></div></div><div className="experience-policy-editor"><label><span>高靠谱度</span><div><input type="number" min={0} max={100} step={1} value={weightDraft.high} onChange={(event) => setWeightDraft((current) => ({ ...current, high: Number(event.target.value) }))} /><b>%</b></div><small>当前默认 20%</small></label><label><span>中靠谱度</span><div><input type="number" min={0} max={100} step={1} value={weightDraft.medium} onChange={(event) => setWeightDraft((current) => ({ ...current, medium: Number(event.target.value) }))} /><b>%</b></div><small>当前默认 10%</small></label><label><span>低靠谱度</span><div><input type="number" min={0} max={100} step={1} value={weightDraft.low} onChange={(event) => setWeightDraft((current) => ({ ...current, low: Number(event.target.value) }))} /><b>%</b></div><small>当前默认 5%</small></label></div><label className="experience-policy-notes"><span>版本备注</span><textarea rows={3} maxLength={1000} value={weightDraft.notes} onChange={(event) => setWeightDraft((current) => ({ ...current, notes: event.target.value }))} placeholder="记录本次调整依据；不要填写客户敏感信息。" /></label><div className="experience-policy-note"><strong>这不是赢单概率</strong><p>经验权重预测 = 在途商机预估金额 × 当前靠谱度权重。赢单使用实际签约金额，搁置与归档不进入预测；模型不能自行改变该口径。</p></div><footer><span>保存只影响后续新同步批次和回答，历史证据继续保留原口径版本。</span><button className="primary-button" type="submit" disabled={Boolean(busy)}>{busy === "policy:save" ? "正在生成新版本…" : "保存为新版本"}</button></footer></form> : <div className="anspire-loading">正在读取指标口径…</div>}</section>}
         </div>
       </div>
     </main>
@@ -384,19 +398,24 @@ function DataOperationsPanel() {
 
 function ModelProviderPanel() {
   const [config, setConfig] = useState<ModelProviderConfig | null>(null);
-  const [modelId, setModelId] = useState("");
+  const [catalog, setCatalog] = useState<AdminModelCatalog | null>(null);
   const [apiKey, setApiKey] = useState("");
-  const [busy, setBusy] = useState<"save" | "test" | "toggle" | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [modelSearch, setModelSearch] = useState("");
+  const [modelView, setModelView] = useState<"all" | "authorized" | "pending">("all");
 
   useEffect(() => {
     let active = true;
-    productionServices.adminModels.get()
-      .then((result) => {
+    Promise.all([
+      productionServices.adminModels.get(),
+      productionServices.adminModels.catalog(),
+    ])
+      .then(([result, catalogResult]) => {
         if (!active) return;
         setConfig(result);
-        setModelId(result.model_id);
+        setCatalog(catalogResult);
       })
       .catch((loadError: unknown) => {
         if (active) setError(humanizeApiError(loadError));
@@ -405,24 +424,13 @@ function ModelProviderPanel() {
   }, []);
 
   async function reload() {
-    const result = await productionServices.adminModels.get();
+    const [result, catalogResult] = await Promise.all([
+      productionServices.adminModels.get(),
+      productionServices.adminModels.catalog(),
+    ]);
     setConfig(result);
-    setModelId(result.model_id);
+    setCatalog(catalogResult);
   }
-
-  const selectedModel = useMemo(
-    () => config?.models.find((item) => item.id === modelId) ?? null,
-    [config, modelId],
-  );
-  const modelFamilies = useMemo(() => {
-    const groups = new Map<string, NonNullable<typeof config>["models"]>();
-    for (const model of config?.models.filter((item) => item.selectable) ?? []) {
-      const items = groups.get(model.family) ?? [];
-      items.push(model);
-      groups.set(model.family, items);
-    }
-    return [...groups.entries()];
-  }, [config]);
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -432,13 +440,13 @@ function ModelProviderPanel() {
     setNotice("");
     try {
       const next = await productionServices.adminModels.update({
-        model_id: modelId,
+        model_id: config.model_id,
         ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
       });
       setConfig(next);
-      setModelId(next.model_id);
       setApiKey("");
-      setNotice("配置已加密保存。请完成连接测试后启用。");
+      await reload();
+      setNotice("网关凭证已加密保存。凭证发生变化后，各模型需要重新测试与授权。");
     } catch (saveError) {
       setError(humanizeApiError(saveError));
     } finally {
@@ -446,15 +454,15 @@ function ModelProviderPanel() {
     }
   }
 
-  async function testConnection() {
+  async function testModel(model: AdminModelAuthorization) {
     if (!config || busy) return;
-    setBusy("test");
+    setBusy(`test:${model.model_id}`);
     setError("");
     setNotice("");
     try {
-      const result = await productionServices.adminModels.test();
+      const result = await productionServices.adminModels.testModel(model.model_id);
       await reload();
-      setNotice(`连接测试通过，${result.latency_ms} ms。现在可以启用模型服务。`);
+      setNotice(`${model.display_name} 测试通过，${result.latency_ms} ms。现在可以授权给董事长。`);
     } catch (testError) {
       setError(humanizeApiError(testError));
       await reload();
@@ -463,18 +471,19 @@ function ModelProviderPanel() {
     }
   }
 
-  async function toggle() {
+  async function toggleAuthorization(model: AdminModelAuthorization) {
     if (!config || busy) return;
-    setBusy("toggle");
+    setBusy(`authorize:${model.model_id}`);
     setError("");
     setNotice("");
     try {
-      const next = await productionServices.adminModels.update({
-        model_id: config.model_id,
-        is_enabled: !config.is_enabled,
-      });
-      setConfig(next);
-      setNotice(next.is_enabled ? "Anspire 已成为当前唯一生成模型通道。" : "Anspire 生成服务已停用。");
+      await productionServices.adminModels.authorize(
+        model.model_id,
+        !model.is_authorized,
+        model.display_name,
+      );
+      await reload();
+      setNotice(model.is_authorized ? `${model.display_name} 已取消授权。` : `${model.display_name} 已授权给董事长。`);
     } catch (toggleError) {
       setError(humanizeApiError(toggleError));
     } finally {
@@ -482,15 +491,36 @@ function ModelProviderPanel() {
     }
   }
 
+  async function setDefault(model: AdminModelAuthorization) {
+    if (busy || model.is_default) return;
+    setBusy(`default:${model.model_id}`);
+    setError("");
+    setNotice("");
+    try {
+      await productionServices.adminModels.setDefault(model.model_id);
+      await reload();
+      setNotice(`${model.display_name} 已设为新会话默认模型。`);
+    } catch (defaultError) {
+      setError(humanizeApiError(defaultError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const status = !config?.is_configured
     ? { label: "未配置", tone: "quiet" }
-    : config.last_test_status === "failed"
-      ? { label: "测试失败", tone: "risk" }
-      : config.is_enabled
-        ? { label: "已启用", tone: "positive" }
-        : config.last_test_status === "success"
-          ? { label: "待启用", tone: "attention" }
-          : { label: "等待测试", tone: "quiet" };
+    : catalog?.models.some((item) => item.is_authorized)
+      ? { label: `${catalog.models.filter((item) => item.is_authorized).length} 个模型已授权`, tone: "positive" }
+      : { label: "等待模型授权", tone: "attention" };
+  const visibleModels = (catalog?.models ?? [])
+    .filter((model) => model.selectable)
+    .filter((model) => modelView === "all"
+      || (modelView === "authorized" ? model.is_authorized : !model.is_authorized))
+    .filter((model) => {
+      const query = modelSearch.trim().toLocaleLowerCase("zh-CN");
+      return !query || [model.display_name, model.name, model.family, model.model_id]
+        .some((value) => value.toLocaleLowerCase("zh-CN").includes(query));
+    });
 
   return (
     <main className="production-admin-main">
@@ -505,24 +535,27 @@ function ModelProviderPanel() {
         <a href={config?.documentation_url ?? "https://llm.anspire.ai/?tab=models"} target="_blank" rel="noreferrer">查看官方模型列表 <span aria-hidden="true">↗</span></a>
       </section>
       <form className="anspire-settings-card" onSubmit={save}>
-        <header><div><p>当前配置</p><h2>经营研究主模型</h2></div><span>{selectedModel?.profile ?? "选择适合经营分析的模型"}</span></header>
+        <header><div><p>企业共享网关</p><h2>Anspire 凭证</h2></div><span>模型授权与凭证分离管理</span></header>
         {!config ? <div className="anspire-loading" aria-live="polite">正在读取企业模型配置…</div> : <>
           <div className="anspire-settings-grid">
-            <label><span>模型</span><select value={modelId} onChange={(event) => setModelId(event.target.value)}>{modelFamilies.map(([family, models]) => <optgroup key={family} label={family}>{models.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.id}</option>)}</optgroup>)}</select><small>后台已接入 Anspire 全量模型目录；只允许聊天与推理模型进入问答 Harness。</small></label>
             <label><span>API Key</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={config.api_key_masked ?? "输入 Anspire API Key"} autoComplete="off" spellCheck={false} /><small>{config.is_configured ? `已保存 ${config.api_key_masked}；留空不会替换。` : "保存后以企业独立密钥加密，页面不会再次返回明文。"}</small></label>
             <label className="wide"><span>API 接口</span><input value={config.endpoint_url} readOnly aria-readonly="true" /><small>地址由系统锁定，管理员不能改成其他兼容网关。</small></label>
-          </div>
-          <div className="anspire-flow">
-            <div className={config.is_configured ? "done" : ""}><span>01</span><strong>保存凭证</strong><small>企业级加密存储</small></div>
-            <div className={config.last_test_status === "success" ? "done" : config.last_test_status === "failed" ? "failed" : ""}><span>02</span><strong>连接测试</strong><small>{config.last_test_status === "success" ? `${config.last_test_latency_ms ?? "—"} ms` : config.last_test_status === "failed" ? "需要重新检查" : "尚未测试"}</small></div>
-            <div className={config.is_enabled ? "done" : ""}><span>03</span><strong>启用服务</strong><small>{config.is_enabled ? "已作用于真实问答" : "不会提前生效"}</small></div>
+            <label className="wide"><span>授权策略</span><input value="逐模型测试通过后，由管理员加入授权" readOnly aria-readonly="true" /><small>凭证只定义企业共享网关；默认模型和董事长可选范围在下方单独管理。</small></label>
           </div>
           {config.last_test_error && <p className="anspire-error" role="alert">{config.last_test_error}</p>}
           {error && <p className="anspire-error" role="alert">{error}</p>}
           {notice && <p className="anspire-notice" role="status">{notice}</p>}
-          <footer><p>密钥不会写入浏览器存储、日志或回答证据；模型运行请求由内部签名保护。</p><div><button className="secondary-button" type="submit" disabled={Boolean(busy) || !modelId}>{busy === "save" ? "正在保存…" : "保存配置"}</button><button className="secondary-button" type="button" onClick={() => void testConnection()} disabled={Boolean(busy) || !config.is_configured}>{busy === "test" ? "正在测试…" : "测试连接"}</button><button className="primary-button" type="button" onClick={() => void toggle()} disabled={Boolean(busy) || (!config.is_enabled && config.last_test_status !== "success")}>{busy === "toggle" ? "正在更新…" : config.is_enabled ? "停用" : "启用 Anspire"}</button></div></footer>
+          <footer><p>密钥不会写入浏览器存储、日志或回答证据；更换凭证会自动撤销旧测试结论。</p><div><button className="primary-button" type="submit" disabled={Boolean(busy)}>{busy === "save" ? "正在保存…" : "保存网关配置"}</button></div></footer>
         </>}
       </form>
+      <section className="admin-model-authorization">
+        <header><div><small>董事长可用模型</small><h2>测试与授权</h2><p>只有使用当前凭证测试成功的模型，才允许出现在董事长工作台。</p></div><span>{catalog?.credential_version ? `凭证版本 v${catalog.credential_version}` : "等待配置"}</span></header>
+        {catalog && <div className="admin-model-directory-controls"><label><span className="sr-only">搜索模型</span><input type="search" value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="搜索模型名称、系列或 ID" /></label><div role="group" aria-label="模型目录筛选"><button type="button" className={modelView === "all" ? "active" : ""} onClick={() => setModelView("all")}>全部</button><button type="button" className={modelView === "authorized" ? "active" : ""} onClick={() => setModelView("authorized")}>已授权</button><button type="button" className={modelView === "pending" ? "active" : ""} onClick={() => setModelView("pending")}>待评估</button></div><span>{visibleModels.length} 个模型</span></div>}
+        {!catalog ? <div className="anspire-loading">正在读取模型授权目录…</div> : <div className="admin-model-list">{visibleModels.map((model) => {
+          const testCurrent = model.test_status === "success" && model.tested_credential_version === model.current_credential_version;
+          return <article key={model.model_id} className={model.is_authorized ? "authorized" : ""}><div className="admin-model-identity"><span className={`model-test-dot ${testCurrent ? "success" : model.test_status}`} aria-hidden="true" /><div><strong>{model.display_name}</strong><small>{model.family} · {model.model_id}</small></div></div><p>{model.profile}</p><div className="admin-model-state"><span>{testCurrent ? `${model.last_test_latency_ms ?? "—"} ms` : model.test_status === "failed" ? "测试失败" : model.tested_credential_version ? "凭证变更，需复测" : "尚未测试"}</span>{model.is_default && <b>默认</b>}{model.is_authorized && !model.is_default && <button type="button" disabled={Boolean(busy)} onClick={() => void setDefault(model)}>{busy === `default:${model.model_id}` ? "设置中…" : "设为默认"}</button>}</div><div className="admin-model-actions"><button className="secondary-button" type="button" disabled={Boolean(busy) || !config?.is_configured} onClick={() => void testModel(model)}>{busy === `test:${model.model_id}` ? "测试中…" : testCurrent ? "重新测试" : "测试模型"}</button><button className={model.is_authorized ? "secondary-button" : "primary-button"} type="button" disabled={Boolean(busy) || (!model.is_authorized && !testCurrent)} onClick={() => void toggleAuthorization(model)}>{busy === `authorize:${model.model_id}` ? "更新中…" : model.is_authorized ? "取消授权" : "加入授权"}</button></div></article>;
+        })}{!visibleModels.length && <p className="data-operations-empty">没有符合当前筛选条件的模型。</p>}</div>}
+      </section>
     </main>
   );
 }

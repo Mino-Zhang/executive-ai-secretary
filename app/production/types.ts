@@ -62,6 +62,8 @@ export type Conversation = {
   title: string;
   organization_unit_id: string | null;
   organization_scope: OrganizationScope;
+  project_id: string | null;
+  selected_model_id: string | null;
   status: string;
   pinned_at: string | null;
   last_message_at: string | null;
@@ -177,12 +179,45 @@ export type ConversationMessage = {
   content: string;
   content_json: Record<string, unknown>;
   sequence: number;
+  requested_model_id: string | null;
   model_name: string | null;
+  output_contract_version: string | null;
+  output_template_id: string | null;
   source_data_as_of: string | null;
   created_at: string;
   status?: "queued" | "running" | "completed" | "failed";
   request_id?: string | null;
   citations?: Array<{ label: string; source: string; as_of?: string | null }>;
+};
+
+export type AuthorizedModel = {
+  model_id: string;
+  name: string;
+  family: string;
+  profile: string;
+  display_name: string;
+  is_default: boolean;
+};
+
+export type AdminModelAuthorization = AuthorizedModel & {
+  capability: string;
+  selectable: boolean;
+  test_status: "pending" | "success" | "failed";
+  tested_credential_version: number | null;
+  current_credential_version: number;
+  is_authorized: boolean;
+  last_tested_at: string | null;
+  last_test_latency_ms: number | null;
+  last_test_error: string | null;
+  authorized_at: string | null;
+};
+
+export type AdminModelCatalog = {
+  provider: "anspire";
+  credential_version: number;
+  is_configured: boolean;
+  is_enabled: boolean;
+  models: AdminModelAuthorization[];
 };
 
 export type Project = {
@@ -236,6 +271,7 @@ export type ModelProviderConfig = {
   is_enabled: boolean;
   is_configured: boolean;
   api_key_masked: string | null;
+  credential_version: number;
   last_tested_at: string | null;
   last_test_status: "pending" | "success" | "failed" | null;
   last_test_latency_ms: number | null;
@@ -243,6 +279,79 @@ export type ModelProviderConfig = {
   models: AnspireModelOption[];
   updated_at: string | null;
 };
+
+export type ChairmanAnswerMetric = {
+  label: string;
+  value: string | number;
+  unit: string;
+  context: string;
+  direction: "up" | "down" | "flat" | "unknown";
+  evidence_refs: string[];
+};
+
+export type ChairmanAnswer = {
+  template_id:
+    | "executive_pulse"
+    | "target_gap"
+    | "risk_action"
+    | "top_opportunities"
+    | "decision_memo";
+  schema_version: "1.0";
+  decision_readiness: "ready" | "conditional" | "not_ready";
+  decision_line: string;
+  confidence: { level: "high" | "medium" | "low"; reason: string };
+  metrics: ChairmanAnswerMetric[];
+  primary_evidence?: {
+    kind: "progress" | "bar" | "ranked_bar" | "waterfall" | "timeline" | "table" | "comparison_matrix";
+    title: string;
+    dataset_ref: string;
+    reason: string;
+  } | null;
+  risks_or_opportunities: Array<{
+    type: "risk" | "opportunity";
+    title: string;
+    impact: string;
+    evidence_refs: string[];
+  }>;
+  actions: Array<{
+    owner: string;
+    action: string;
+    due_at: string;
+    success_metric: string;
+  }>;
+  data_quality: {
+    readiness: "ready" | "conditional" | "not_ready";
+    as_of: string;
+    scope: string;
+    issues: Array<{ dimension: string; severity: string; detail: string }>;
+    decision_impact: string;
+  };
+  sources: Array<{
+    id: string;
+    label: string;
+    as_of: string;
+    dataset_version?: string | null;
+  }>;
+  follow_up_questions: string[];
+};
+
+export type ExecutiveGeneralAnswer = {
+  schema_version: "1.0";
+  mode: "direct_answer" | "analysis_memo" | "action_plan" | "writing_draft";
+  headline: string;
+  direct_answer: string;
+  sections: Array<{ title: string; content: string }>;
+  action_items: Array<{ action: string; rationale: string }>;
+  caveats: string[];
+  draft_markdown?: string | null;
+  capability_notice?: string | null;
+  follow_up_questions: string[];
+};
+
+export type AssistantOutputEnvelope =
+  | { schema_version: "1.0"; kind: "data"; body: ChairmanAnswer }
+  | { schema_version: "1.0"; kind: "general"; body: ExecutiveGeneralAnswer }
+  | { schema_version: "1.0"; kind: "clarification"; body: { question: string; options?: Array<Record<string, unknown>> } };
 
 export type ModelProviderTest = {
   status: "success";
@@ -487,12 +596,13 @@ export type ProductionBootstrap = {
   organizationUnits: OrganizationUnit[];
   conversations: Conversation[];
   projects: Project[];
+  authorizedModels: AuthorizedModel[];
   memories: Memory[];
   reports: Report[];
   jobs: Job[];
   dataCapabilities: DataCapabilities | null;
   personalProfile: ExecutivePersonalProfile | null;
-  optionalErrors: Partial<Record<"memories" | "reports" | "jobs" | "dataCapabilities" | "personalProfile", string>>;
+  optionalErrors: Partial<Record<"memories" | "reports" | "jobs" | "dataCapabilities" | "personalProfile" | "authorizedModels", string>>;
 };
 
 export type ApiErrorPayload = {

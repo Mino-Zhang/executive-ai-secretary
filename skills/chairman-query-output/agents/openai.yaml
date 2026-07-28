@@ -1,0 +1,4 @@
+interface:
+  display_name: "董事长问数输出"
+  short_description: "将经营问数转成克制、可验证、可行动的董事长决策回答"
+  default_prompt: "Use $chairman-query-output to turn this经营问题和证据 into a董事长可直接决策的回答。"

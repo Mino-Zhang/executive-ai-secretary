@@ -236,6 +236,11 @@ def retry_job(
         content_json={"retry_of_job_id": str(previous.id)},
         sequence=sequence,
         status="queued",
+        requested_model_id=(
+            str(previous.payload_json.get("model_id"))
+            if previous.payload_json.get("model_id")
+            else source_message.requested_model_id
+        ),
     )
     db.add(assistant_message)
     db.flush()

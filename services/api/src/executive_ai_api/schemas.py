@@ -35,6 +35,7 @@ class ModelProviderOut(BaseModel):
     is_enabled: bool
     is_configured: bool
     api_key_masked: str | None
+    credential_version: int
     last_tested_at: datetime | None
     last_test_status: str | None
     last_test_latency_ms: int | None
@@ -56,6 +57,49 @@ class ModelProviderTestOut(BaseModel):
     model: str
     latency_ms: int
     tested_at: datetime
+
+
+class AuthorizedModelOut(BaseModel):
+    model_id: str
+    name: str
+    family: str
+    profile: str
+    display_name: str
+    is_default: bool
+
+
+class AdminModelAuthorizationOut(AuthorizedModelOut):
+    capability: str
+    selectable: bool
+    test_status: Literal["pending", "success", "failed"]
+    tested_credential_version: int | None
+    current_credential_version: int
+    is_authorized: bool
+    last_tested_at: datetime | None
+    last_test_latency_ms: int | None
+    last_test_error: str | None
+    authorized_at: datetime | None
+
+
+class AdminModelCatalogOut(BaseModel):
+    provider: Literal["anspire"] = "anspire"
+    credential_version: int
+    is_configured: bool
+    is_enabled: bool
+    models: list[AdminModelAuthorizationOut]
+
+
+class ModelAuthorizationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_authorized: bool
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class DefaultModelUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_default: Literal[True] = True
 
 
 class McpToolOut(BaseModel):
@@ -359,6 +403,7 @@ class ConversationCreate(BaseModel):
     organization_unit_id: uuid.UUID | None = None
     organization_scope: OrganizationScopeInput | None = None
     project_id: uuid.UUID | None = None
+    model_id: str | None = Field(default=None, min_length=1, max_length=100)
 
     @model_validator(mode="before")
     @classmethod
@@ -377,6 +422,7 @@ class ConversationUpdate(BaseModel):
     organization_unit_id: uuid.UUID | None = None
     organization_scope: OrganizationScopeInput | None = None
     status: Literal["active", "archived"] | None = None
+    model_id: str | None = Field(default=None, min_length=1, max_length=100)
 
     @model_validator(mode="before")
     @classmethod
@@ -395,6 +441,8 @@ class ConversationOut(ORMModel):
     title: str
     organization_unit_id: uuid.UUID | None
     organization_scope: OrganizationScopeOut
+    project_id: uuid.UUID | None = None
+    selected_model_id: str | None = None
     status: str
     pinned_at: datetime | None
     archived_at: datetime | None
@@ -407,6 +455,7 @@ class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
     file_ids: list[uuid.UUID] = Field(default_factory=list, max_length=20)
     organization_scope: OrganizationScopeInput | None = None
+    model_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class MessageOut(ORMModel):
@@ -417,9 +466,18 @@ class MessageOut(ORMModel):
     content_json: dict[str, Any]
     sequence: int
     status: str
+    requested_model_id: str | None
     model_name: str | None
+    output_contract_version: str | None
+    output_template_id: str | None
     source_data_as_of: datetime | None
     created_at: datetime
+
+
+class ConversationProjectUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: uuid.UUID | None
 
 
 class FileOut(ORMModel):

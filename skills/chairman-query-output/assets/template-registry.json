@@ -1,0 +1,45 @@
+{
+  "version": "1.0",
+  "templates": [
+    {
+      "id": "executive_pulse",
+      "label": "经营结论快报",
+      "intents": ["overall_status", "target_completion", "daily_change", "weekly_change"],
+      "preferred_tools": ["get_overall_business", "get_target_completion", "get_daily_changes"],
+      "primary_evidence": ["progress", "bar", "ranked_bar"],
+      "required_context": ["current_value", "comparison_or_target", "scope", "as_of"]
+    },
+    {
+      "id": "target_gap",
+      "label": "目标差距与兑现路径",
+      "intents": ["goal_risk", "forecast", "gap_coverage", "pipeline_coverage"],
+      "preferred_tools": ["get_target_completion", "get_sales_forecast", "get_opportunity_funnel"],
+      "primary_evidence": ["progress", "waterfall", "table"],
+      "required_context": ["target", "actual", "period", "candidate_coverage", "approved_probability_basis"]
+    },
+    {
+      "id": "risk_action",
+      "label": "异常风险作战卡",
+      "intents": ["delivery_risk", "collection_risk", "margin_risk", "customer_risk", "data_quality_risk"],
+      "preferred_tools": ["get_delivery_status", "get_collection_aging", "get_finance_margin", "get_customer_status"],
+      "primary_evidence": ["ranked_bar", "timeline", "table"],
+      "required_context": ["risk_object", "exposure", "owner", "next_milestone", "as_of"]
+    },
+    {
+      "id": "top_opportunities",
+      "label": "Top 机会与客户清单",
+      "intents": ["top_opportunities", "key_customers", "concentration", "chairman_attention"],
+      "preferred_tools": ["get_opportunity_funnel", "get_customer_status", "get_sales_forecast"],
+      "primary_evidence": ["table", "ranked_bar"],
+      "required_context": ["ranking_metric", "stage", "confidence", "owner", "next_action"]
+    },
+    {
+      "id": "decision_memo",
+      "label": "对比与决策备忘录",
+      "intents": ["organization_comparison", "owner_comparison", "option_comparison", "resource_allocation"],
+      "preferred_tools": ["get_organization_performance", "get_overall_business", "get_finance_margin", "get_sales_forecast"],
+      "primary_evidence": ["comparison_matrix", "bar", "table"],
+      "required_context": ["common_period", "common_definition", "scale_base", "decision_criteria"]
+    }
+  ]
+}
