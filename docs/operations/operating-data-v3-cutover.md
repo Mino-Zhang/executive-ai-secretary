@@ -6,7 +6,7 @@
 ## 安全边界
 
 - 三张飞书表作为一个完整批次读取、校验和激活。
-- 源库 ODS 事实只追加，不覆盖或删除历史批次。
+- 日常同步中的源库 ODS 事实只追加，不覆盖历史批次；切换期旧模拟批次的受控清理必须停掉 Worker、持有数据库锁并留下签名审计。
 - 未获得 `valid=true` 的实时三表批次前，禁止执行模拟数据清理。
 - 清理命令只允许 `APP_ENV=local-demo`，并且要求精确确认文本与已校验备份引用。
 - 产品对脱敏源库使用只读账号；本机飞书导入器单独使用最小写入账号。
@@ -14,12 +14,14 @@
 ## 切换顺序
 
 1. 生成并验证 Product 与 Source PostgreSQL 加密备份。
-2. 只读预检并建立影子源库：
+2. 对仍只有 V2 的历史源库，先只读预检并建立 V3 Schema：
 
    ```bash
    ./scripts/upgrade-source-v3.sh local-demo --check
    ./scripts/upgrade-source-v3.sh local-demo
    ```
+
+   全新部署已经直接安装 ODS 3.0，不执行该历史迁移脚本。
 
 3. 迁移业务库到 Alembic `72e1b4c8a903`。
 4. 将 DataSource 切换为 `executive_source_v3` / `3.0`。

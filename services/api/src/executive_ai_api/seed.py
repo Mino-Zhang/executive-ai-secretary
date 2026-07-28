@@ -53,14 +53,15 @@ def seed(enterprise_slug: str) -> None:
                 DataSource(
                     enterprise_id=enterprise.id,
                     key="demo-sanitized-source",
-                    display_name="演示模拟数据",
-                    source_type="simulated_generator",
-                    schema_version="2.0",
+                    display_name="演示脱敏经营数据",
+                    source_type="feishu_three_table",
+                    schema_version="3.0",
                     is_enabled=True,
                     configuration_json={
                         "database": "source-postgres",
-                        "schema": "executive_source",
+                        "schema": "executive_source_v3",
                         "classification": "synthetic",
+                        "activation_policy": "all_three_atomic",
                     },
                     secret_reference_key=SOURCE_DATABASE_CONFIG_REFERENCE,
                 )

@@ -64,6 +64,18 @@ done
 
 local_config="$(compose local-demo config)"
 customer_config="$(compose customer-template config)"
+source_init_script="${REPO_ROOT}/deploy/source-postgres/01-init-source.sh"
+grep -q '/standard-ods-v3.sql' "${source_init_script}" \
+  || die "managed source initialization does not install ODS 3.0"
+if grep -q '/standard-ods.sql' "${source_init_script}"; then
+  die "managed source initialization still installs legacy ODS 2.0"
+fi
+if grep -Eq 'executive_source[.]ods_|SCHEMA executive_source([ ;]|$)' "${source_init_script}"; then
+  die "managed source initialization still grants legacy ODS 2.0 objects"
+fi
+if grep -q '/standard-ods.sql' <<< "${local_config}${customer_config}"; then
+  die "runtime compose still mounts the legacy ODS 2.0 contract"
+fi
 bootstrap_config="$(
   BOOTSTRAP_ADMIN_EMAIL=admin@example.com \
   BOOTSTRAP_ADMIN_DISPLAY_NAME=Admin \
@@ -614,6 +626,9 @@ grep -q 'mode_or_backup="${2:-}"' "${reset_v3_script}" \
 grep -q 'export DATABASE_URL="postgresql+psycopg://${POSTGRES_API_USER}:${DB_PASSWORD}@postgres:5432/${POSTGRES_DB}"' \
   "${reset_v3_script}" \
   || die "V3 reset wrapper does not construct the in-container database URL"
+grep -q 'export AUDIT_HMAC_KEY="$(cat /run/secrets/audit_hmac_key)"' \
+  "${reset_v3_script}" \
+  || die "V3 reset wrapper does not load the runtime audit signing key"
 grep -q "local-demo --dry-run" "${REPO_ROOT}/docs/operations/operating-data-v3-cutover.md" \
   || die "V3 cutover runbook does not use the protected dry-run wrapper"
 

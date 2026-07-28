@@ -6,7 +6,14 @@ from sqlalchemy import func, select
 
 from executive_ai_api import seed as seed_module
 from executive_ai_api.database import SessionLocal
-from executive_ai_api.models import AppConfig, Conversation, Message, Report, UserCredential
+from executive_ai_api.models import (
+    AppConfig,
+    Conversation,
+    DataSource,
+    Message,
+    Report,
+    UserCredential,
+)
 
 
 def test_demo_seed_requires_existing_identity_and_is_idempotent(monkeypatch, seeded) -> None:
@@ -28,7 +35,14 @@ def test_demo_seed_requires_existing_identity_and_is_idempotent(monkeypatch, see
         credentials_after = db.scalar(select(func.count()).select_from(UserCredential))
         conversations_after_first = db.scalar(select(func.count()).select_from(Conversation))
         marker = db.scalar(select(AppConfig).where(AppConfig.key == "demo.seed"))
+        data_source = db.scalar(
+            select(DataSource).where(DataSource.key == "demo-sanitized-source")
+        )
         assert marker.value_json["classification"] == "synthetic"
+        assert data_source is not None
+        assert data_source.source_type == "feishu_three_table"
+        assert data_source.schema_version == "3.0"
+        assert data_source.configuration_json["schema"] == "executive_source_v3"
         assert db.scalar(select(Report.status)) == "published"
         assert set(db.scalars(select(Message.status)).all()) == {"completed"}
     seed_module.seed("local-demo")

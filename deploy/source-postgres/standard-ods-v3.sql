@@ -1,8 +1,8 @@
 -- Executive AI Researcher sanitized source contract 3.0.
 --
--- This schema is deliberately separate from executive_source (2.0).  It is a
--- shadow contract used to validate complete Feishu snapshots before the
--- product database performs its own atomic activation.  ODS rows are
+-- This is the production contract for complete Feishu snapshots.  It remains
+-- deliberately separate from the retired executive_source (2.0) schema so
+-- legacy installations can be migrated without an in-place rewrite. ODS rows are
 -- append-only: a record that disappears upstream is simply absent from the
 -- next load_batch_id.
 

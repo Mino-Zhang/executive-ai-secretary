@@ -691,7 +691,7 @@ class DataSource(UUIDMixin, TimestampMixin, Base):
     key: Mapped[str] = mapped_column(String(100), nullable=False)
     display_name: Mapped[str] = mapped_column(String(200), nullable=False)
     source_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    schema_version: Mapped[str] = mapped_column(String(32), default="2.0", nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), default="3.0", nullable=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     configuration_json: Mapped[dict[str, Any]] = mapped_column(
         JSONType, default=dict, nullable=False

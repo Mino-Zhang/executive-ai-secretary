@@ -19,6 +19,7 @@ run_reset_cli() {
   compose "${environment}" exec -T api sh -ec '
     DB_PASSWORD="$(cat /run/secrets/postgres_api_password)"
     export DATABASE_URL="postgresql+psycopg://${POSTGRES_API_USER}:${DB_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+    export AUDIT_HMAC_KEY="$(cat /run/secrets/audit_hmac_key)"
     exec python -m executive_ai_api.cli reset-local-demo-operating-data-v3 "$@"
   ' reset-local-demo-operating-data-v3 "$@"
 }

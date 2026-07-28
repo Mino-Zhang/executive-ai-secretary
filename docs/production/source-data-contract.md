@@ -1,90 +1,110 @@
-# 标准脱敏源库数据契约 2.0
+# 标准脱敏源库数据契约 3.0
 
-第二阶段只接入 PostgreSQL 15 至 17 的固定 ODS 结构。正式 DDL 位于 `deploy/source-postgres/standard-ods.sql`，该文件是机器可执行的唯一事实来源；本文解释交付边界和字段含义。
+当前生产链只接入 PostgreSQL 15 至 17 的固定 ODS 3.0 结构。正式 DDL 位于
+`deploy/source-postgres/standard-ods-v3.sql`，该文件是机器可执行的唯一事实来源；
+本文说明客户交付边界、三表快照语义和验收规则。`standard-ods.sql` 与
+`executive_source` 仅用于历史 V2 环境迁移，不会由新部署安装或挂载。
 
 ## 安全边界
 
 - 客户从 CRM、项目和财务系统抽取并完成脱敏，产品永远不连接原始 CRM。
 - 客户删除电话、邮箱、身份证、地址、银行账号等问数不需要的字段，并提供稳定的脱敏业务 ID 与认可的展示名称。
-- 产品连接账号必须是非超级用户、无建库/建角色/复制权限，并处于只读事务模式。
-- 外部连接必须启用 TLS，连接串必须使用 `sslmode=verify-full`。
-- 产品只执行本文白名单列的显式 `SELECT`，从不执行 `SELECT *`；客户新增字段不会被读取。
+- 产品运行期使用非超级、无建库、无建角色、无复制权限的只读账号。
+- 外部连接必须启用 TLS，默认要求 `sslmode=verify-full`。
+- 产品只读取固定白名单列，从不执行 `SELECT *`；客户新增字段不会被产品读取。
 - 产品不保存真实 ID 与脱敏 ID 的反查关系。
+- 本机飞书导入使用独立最小写账号；客户外部脱敏库不向产品提供写权限。
 
-## 公共字段
+## 快照与批次语义
 
-除 `ods_schema_version` 和 `source_batches` 外，每张 ODS 表必须包含：
+ODS 3.0 只接受商机、项目交付和财务回款三个数据域。每次导入形成一个完整、
+不可变的三表全量快照：
 
-| 字段 | 类型 | 规则 |
-|---|---|---|
-| `source_system` | `varchar(80)` | 客户认可的来源标识 |
-| `source_record_id` | `varchar(160)` | 来源内稳定且已脱敏的业务 ID |
-| `source_updated_at` | `timestamptz` | 源记录最近更新时间 |
-| `load_batch_id` | `varchar(160)` | 关联成功或准备中的 `source_batches.batch_id` |
-| `is_deleted` | `boolean` | 软删除标志；删除时保留稳定 ID |
-| `organization_code` | `varchar(80)` | 关联 `ods_organization_unit.organization_code` |
+- 业务主键分别为 `商机ID`、`项目ID`、`回款记录ID`，写入 `source_record_id`。
+- 飞书 `record_id` 单独保存为 `source_native_record_id`，不作为业务主键。
+- 行唯一键为 `load_batch_id + source_record_id`。
+- 同一批次内三表全部读取、校验通过后才可进入 `ready`，随后由业务库原子激活。
+- 任一表读取失败、主键重复、关联孤立或金额不平，整个批次拒绝生效。
+- 日常同步只追加新快照，不覆盖旧事实；上游消失的记录在新全量快照中自然失效。
+- 相同业务内容重复同步会复用同一源批次，不产生重复事实。
 
-`source_system + source_record_id` 在每张表内唯一。所有时间写入带时区值，所有金额使用人民币元与 `numeric(18,2)`，概率使用 0 至 100 的整数。
+所有金额使用人民币元与 `numeric(18,2)`，所有时间使用带时区值。
 
 ## 控制表
 
-### `ods_schema_version`
-
-单行记录，`singleton=true`，`schema_version` 必须为 `2.0`。版本不匹配时产品拒绝同步。
-
-### `source_batches`
-
-| 必填字段 | 用途 |
+| 表 | 用途 |
 |---|---|
-| `batch_id` | 全局稳定的导入批次标识 |
-| `source_system` | 本批次来源 |
-| `dataset_version` | 数据集或客户 ETL 版本 |
-| `reference_date` | 经营参考日期 |
-| `source_data_as_of` | 本批次数据截止时间 |
-| `status` | `preparing`、`ready` 或 `failed`；产品只读取 `ready` |
-| `record_counts` | 各域记录数 JSON |
-| `content_sha256` | 可重复对账的数据内容哈希 |
-| `validation_result` | 客户侧校验结果 JSON |
+| `ods_schema_version` | 单行契约版本；`schema_version` 必须为 `3.0` |
+| `source_batches` | 三表记录数、分表 Schema/内容哈希、总哈希、校验结果及激活状态 |
+| `source_table_bindings` | 三个飞书 App Token、Table ID、稳定 Field ID 映射与 Schema 哈希 |
+| `source_validation_issues` | 失败域、业务记录 ID、字段、错误码和详情 |
+| `source_sync_checkpoints` | 每个数据域最近批次、分页游标、内容哈希和同步时间 |
 
-客户应先以 `preparing` 写批次和 ODS 行，完成内部校验后在同一事务中切换为 `ready`。失败批次不得标为 `ready`。
+`source_batches.status` 允许：`building`、`validated`、`ready`、`rejected`、
+`activated`、`superseded`。产品只读取经过完整验证的 `ready` 或当前
+`activated` 批次。
 
-## 业务表白名单
+## 三张业务表
 
-| 表 | 业务字段（公共字段之外） |
-|---|---|
-| `ods_organization_unit` | `organization_code`, `parent_organization_code`, `display_name`, `unit_type`, `sort_order` |
-| `ods_person` | `display_name`, `role_title`, `is_active` |
-| `ods_customer` | `owner_person_record_id`, `display_name`, `industry`, `region`, `customer_since` |
-| `ods_opportunity` | `customer_record_id`, `owner_person_record_id`, `opportunity_code`, `title`, `stage`, `status`, `probability`, `expected_amount`, `expected_gross_profit`, `created_date`, `expected_close_date`, `closed_date` |
-| `ods_delivery` | `opportunity_record_id`, `customer_record_id`, `manager_person_record_id`, `project_code`, `project_name`, `status`, `risk_level`, `completion_percent`, `contract_amount`, `gross_margin_rate`, `planned_start_date`, `planned_end_date`, `actual_end_date`, `current_milestone`, `delay_days` |
-| `ods_collection` | `project_record_id`, `customer_record_id`, `invoice_amount`, `receivable_amount`, `collected_amount`, `planned_collection_date`, `actual_collection_date`, `overdue_days`, `aging_bucket`, `status` |
-| `ods_target` | `metric_code`, `metric_name`, `period_type`, `period_start`, `period_end`, `target_value`, `unit` |
+### `ods_opportunity`
 
-## 关系与恒等式
+承接商机 ID、事业部、商机与客户名称、客户价值等级、销售和售前负责人、
+靠谱度、阶段与标准状态、预估/签约金额、预计签单与进单日期、产品服务、
+最近进展、行业及归档状态。
 
-- 人员、客户、商机、交付、回款和目标的事业部必须存在且编码稳定。
-- 商机关联的客户和负责人必须存在。
-- 交付必须关联赢单商机、客户和项目负责人。
-- 回款必须关联交付项目与同一客户、事业部。
-- `0 <= collected_amount <= receivable_amount <= invoice_amount`。
-- `expected_gross_profit <= expected_amount`，`0 <= gross_margin_rate <= 1`。
-- 逾期天数由计划回款日和数据参考日期计算；未逾期记录不得伪造正逾期天数。
-- 目标必须关联事业部、指标与完整周期，`period_end >= period_start`。
+约束：
+
+- 靠谱度只允许 `high`、`medium`、`low`。
+- 状态只允许 `won`、`active`、`paused`、`archived`。
+- 赢单必须有签约金额；经验权重不反写源表事实。
+
+### `ods_delivery`
+
+承接项目与关联商机 ID、客户、事业部、项目经理、交付负责人、项目状态、
+风险、合同额、已确认收入、毛利率、计划/实际日期、里程碑、完成度、延期天数、
+最近进展和数据更新时间。
+
+约束：项目必须关联同批次赢单商机；已确认收入不得大于合同额。
+
+### `ods_collection`
+
+承接回款记录、商机与项目 ID、客户、事业部、款项类型、付款节点、应收、
+已回款、未回款、计划/实际回款日、逾期与账龄、开票信息、责任人和最近跟进。
+
+核心恒等式：
+
+```text
+应收金额 = 已回款金额 + 未回款金额
+```
+
+每个项目当前演示契约要求三个付款节点，三节点应收合计必须等于项目合同额。
+
+## 原子激活与经营口径
+
+- 商机、项目和回款必须指向同一 `source_batch_id` 和同一业务库同步运行。
+- 单表失败时三个数据域均不切换，继续使用上一完整成功版本。
+- 目标域当前为 `not_configured`，不允许规划器主动调用目标完成工具。
+- 商机靠谱度是经验判断，不称为真实赢单概率。当前经验权重版本为：高 20%、中 10%、低 5%。
+- 关键数字必须携带来源类型、源数据截止时间、批次 ID 和经营口径版本。
 
 ## 客户交付方式
 
 ### 连接客户已有脱敏 PostgreSQL
 
-1. 客户 DBA 执行标准 DDL。
-2. 客户 ETL 用自有写账号写入脱敏数据。
-3. 客户创建只读账号，只授予 `executive_source` Schema 的 `USAGE` 与白名单表 `SELECT`。
-4. 把只读 URL 写入 `runtime/customer-template/secrets/source_database_url`，URL 必须含 `sslmode=verify-full`。
-5. 执行 `configure-source.sh`；返回缺失表、缺失列、版本、账号权限和 TLS 结果。
+1. 客户 DBA 执行 `standard-ods-v3.sql`。
+2. 客户 ETL 用自有写账号按完整批次写入脱敏三表。
+3. 客户创建只读账号，只授予 `executive_source_v3` Schema 的 `USAGE` 与白名单表 `SELECT`。
+4. 将只读 URL 写入客户运行时 Secret；URL 必须含 `sslmode=verify-full`。
+5. 执行连接与契约校验；缺表、缺列、类型、权限、TLS 或 Schema 版本不合格时拒绝同步。
 
 ### 使用可选托管 Source 容器
 
-在客户 `.env` 设置 `MANAGED_SOURCE_DB=true` 后启动。客户 ETL 通过仅绑定 `127.0.0.1:${MANAGED_SOURCE_HOST_PORT}` 的 `source_writer` 写入；产品仍只使用 `source_reader`。Source 卷与产品数据库卷分离，客户仍负责其备份与保留策略。
+设置 `MANAGED_SOURCE_DB=true` 后启动。客户 ETL 通过仅绑定本机地址的
+`source_writer` 写入；产品仍只使用 `source_reader`。Source 卷与产品数据库卷
+物理分离，客户仍负责其备份与保留策略。
 
 ## 变更规则
 
-二阶段不自动适配任意客户表。新增可选字段必须先升级契约版本、DDL、白名单读取代码、数据字典和兼容测试；删除或改变现有字段属于不兼容变更。实施人员不得用高权限账号或临时 `SELECT *` 绕过校验。
+产品不自动适配任意客户表。新增字段必须先升级契约版本、DDL、白名单读取代码、
+数据字典和兼容测试；删除或改变现有字段属于不兼容变更。实施人员不得使用高权限
+账号或临时 `SELECT *` 绕过校验。
