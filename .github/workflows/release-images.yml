@@ -1,0 +1,501 @@
+name: Publish production images
+
+on:
+  push:
+    tags:
+      - production-v*
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable image version (for example 1.0.0-rc.1)
+        required: true
+        type: string
+
+# Every non-publishing job is read-only. `actions: read` is used only to inspect
+# the production-images Environment through GitHub's deployment API. The
+# protected publish job receives its two write capabilities only after both the
+# fail-closed authorization job and the Environment approval gate succeed.
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: production-images-${{ github.event_name }}-${{ github.ref }}-${{ inputs.version || 'tag' }}
+  cancel-in-progress: false
+
+jobs:
+  release_authorization:
+    name: Verify production publishing is explicitly enabled
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      authorized: ${{ steps.gate.outputs.authorized }}
+    steps:
+      - name: Fail closed unless the repository and Environment gates are configured
+        id: gate
+        shell: bash
+        env:
+          RELEASES_ENABLED: ${{ vars.PRODUCTION_IMAGE_RELEASES_ENABLED }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "${RELEASES_ENABLED}" = "true" ] || {
+            echo 'Production image publishing is disabled. A repository administrator must set PRODUCTION_IMAGE_RELEASES_ENABLED=true.' >&2
+            exit 1
+          }
+
+          api_get() {
+            curl --fail-with-body --silent --show-error --location \
+              --retry 2 --retry-all-errors \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              "$1"
+          }
+
+          environment_url="${GH_API_URL}/repos/${GH_REPOSITORY}/environments/production-images"
+          environment_json="$(api_get "${environment_url}")" || {
+            echo 'The production-images Environment is absent or cannot be inspected; refusing to publish.' >&2
+            exit 1
+          }
+          jq -e '
+            (.name == "production-images") and
+            (any(.protection_rules[]?;
+              .type == "required_reviewers" and
+              .prevent_self_review == true and
+              ((.reviewers // []) | length > 0)
+            )) and
+            (.deployment_branch_policy.custom_branch_policies == true)
+          ' <<<"${environment_json}" >/dev/null || {
+            echo 'production-images must require a non-empty reviewer set, prevent self-review, and use custom deployment branch policies.' >&2
+            exit 1
+          }
+
+          policies_json="$(api_get "${environment_url}/deployment-branch-policies?per_page=100")" || {
+            echo 'The production-images deployment branch policies cannot be inspected; refusing to publish.' >&2
+            exit 1
+          }
+          jq -e '
+            (.total_count == 2) and
+            ((.branch_policies // []) | length == 2) and
+            any(.branch_policies[]?; .name == "main" and .type == "branch") and
+            any(.branch_policies[]?; .name == "production-v*" and .type == "tag")
+          ' <<<"${policies_json}" >/dev/null || {
+            echo 'production-images must contain exactly main as a branch policy and production-v* as a tag policy.' >&2
+            exit 1
+          }
+
+          printf 'authorized=true\n' >> "${GITHUB_OUTPUT}"
+
+  verify:
+    name: Release quality gate
+    needs: [release_authorization]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: docker.io/library/postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_USER: executive_ai_ci
+          POSTGRES_PASSWORD: ci_ephemeral_password
+          POSTGRES_DB: executive_ai_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U executive_ai_ci -d executive_ai_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: test
+      APP_MODE: production
+      DATABASE_URL: postgresql+psycopg://executive_ai_ci:ci_ephemeral_password@127.0.0.1:5432/executive_ai_ci
+      POSTGRES_TEST_DATABASE_URL: postgresql+psycopg://executive_ai_ci:ci_ephemeral_password@127.0.0.1:5432/executive_ai_ci
+      FILE_STORAGE_ROOT: /tmp/executive-ai-files
+      STORAGE_ROOT: /tmp/executive-ai-files
+      SESSION_COOKIE_SECURE: "false"
+      SEED_DEMO_DATA: "false"
+      ALLOWED_ORIGINS: http://127.0.0.1:8080
+      TRUSTED_HOSTS: 127.0.0.1,localhost
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.14.0
+          cache: npm
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/api/pyproject.toml
+      - name: Generate ephemeral test secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'SESSION_SECRET=%s\n' "$(openssl rand -hex 32)" >> "${GITHUB_ENV}"
+          printf 'CSRF_SECRET=%s\n' "$(openssl rand -hex 32)" >> "${GITHUB_ENV}"
+          printf 'FILE_ENCRYPTION_KEY=%s\n' "$(openssl rand -base64 32 | tr -d '\n')" >> "${GITHUB_ENV}"
+          printf 'AUDIT_HMAC_KEY=%s\n' "$(openssl rand -hex 32)" >> "${GITHUB_ENV}"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build:production
+      - run: npm audit --omit=dev --omit=optional --audit-level=high
+      - run: python -m pip install uv==0.10.5
+      - run: uv sync --frozen --extra dev
+        working-directory: services/api
+      - run: uv run --frozen --extra dev ruff check src tests
+        working-directory: services/api
+      - run: uv run --frozen --extra dev pytest -m "not postgres"
+        working-directory: services/api
+      - name: PostgreSQL API concurrency and key-rotation tests
+        run: >-
+          uv run --frozen --extra dev pytest -m postgres
+          tests/test_postgres_idempotency.py
+          tests/test_postgres_admin_safety.py
+          tests/test_postgres_key_rotation.py
+        working-directory: services/api
+      - run: uv run --frozen alembic upgrade head
+        working-directory: services/api
+      - run: uv sync --frozen --extra dev
+        working-directory: services/worker
+      - run: uv run --frozen --extra dev ruff check src tests
+        working-directory: services/worker
+      - run: uv run --frozen --extra dev pytest -m "not postgres"
+        working-directory: services/worker
+      - name: PostgreSQL worker lease concurrency test
+        run: uv run --frozen --extra dev pytest -m postgres tests/test_postgres_leases.py
+        working-directory: services/worker
+      - run: ./scripts/ci-recovery-drill.sh
+      - run: ./scripts/test-infra.sh
+
+  secret-scan:
+    name: Release secret scan
+    needs: [release_authorization]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  preflight:
+    name: Bind release to main and reviewed baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [verify, secret-scan]
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      registry_owner: ${{ steps.identity.outputs.registry_owner }}
+      commit: ${{ steps.identity.outputs.commit }}
+      source_ref: ${{ steps.identity.outputs.source_ref }}
+      trigger: ${{ steps.identity.outputs.trigger }}
+      alembic_head: ${{ steps.identity.outputs.alembic_head }}
+      postgres_image: ${{ steps.identity.outputs.postgres_image }}
+      nginx_image: ${{ steps.identity.outputs.nginx_image }}
+      file_tool_image: ${{ steps.identity.outputs.file_tool_image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Resolve trusted release identity
+        id: identity
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.ref }}
+          COMMIT: ${{ github.sha }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          [[ "${COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          [ "$(git rev-parse HEAD)" = "${COMMIT}" ]
+          git show-ref --verify --quiet refs/remotes/origin/main || {
+            echo 'Fresh checkout did not contain origin/main.' >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "${COMMIT}" refs/remotes/origin/main || {
+            echo 'Release commit is not an ancestor of origin/main.' >&2
+            exit 1
+          }
+
+          case "${EVENT_NAME}" in
+            push)
+              [[ "${SOURCE_REF}" == refs/tags/production-v* ]] || exit 1
+              version="${SOURCE_REF#refs/tags/production-v}"
+              [ "${SOURCE_REF}" = "refs/tags/production-v${version}" ]
+              ;;
+            workflow_dispatch)
+              [ "${SOURCE_REF}" = "refs/heads/main" ] || {
+                echo 'Manual production release must be dispatched from main.' >&2
+                exit 1
+              }
+              version="${INPUT_VERSION}"
+              ;;
+            *) echo "Unapproved release trigger: ${EVENT_NAME}" >&2; exit 1 ;;
+          esac
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || {
+            echo 'Version must be an immutable semantic version.' >&2
+            exit 1
+          }
+
+          baseline=deploy/release-baseline.json
+          jq -e '
+            (keys == ["alembicHead", "infrastructureImages", "schemaVersion"]) and
+            (.schemaVersion == "executive-ai.release-baseline/v1") and
+            (.infrastructureImages | keys == ["fileTool", "nginx", "postgres"])
+          ' "${baseline}" >/dev/null
+          alembic_head="$(python3 scripts/resolve-alembic-head.py)"
+          [ "${alembic_head}" = "$(jq -er '.alembicHead' "${baseline}")" ] || {
+            echo 'Reviewed release baseline does not match the single Alembic head.' >&2
+            exit 1
+          }
+          require_digest() {
+            [[ "$2" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || {
+              echo "$1 in the release baseline is not digest pinned." >&2
+              exit 1
+            }
+          }
+          postgres_image="$(jq -er '.infrastructureImages.postgres' "${baseline}")"
+          nginx_image="$(jq -er '.infrastructureImages.nginx' "${baseline}")"
+          file_tool_image="$(jq -er '.infrastructureImages.fileTool' "${baseline}")"
+          require_digest postgres "${postgres_image}"
+          require_digest nginx "${nginx_image}"
+          require_digest fileTool "${file_tool_image}"
+
+          registry_owner="$(printf '%s' "${REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          {
+            printf 'version=%s\n' "${version}"
+            printf 'registry_owner=%s\n' "${registry_owner}"
+            printf 'commit=%s\n' "${COMMIT}"
+            printf 'source_ref=%s\n' "${SOURCE_REF}"
+            printf 'trigger=%s\n' "${EVENT_NAME}"
+            printf 'alembic_head=%s\n' "${alembic_head}"
+            printf 'postgres_image=%s\n' "${postgres_image}"
+            printf 'nginx_image=%s\n' "${nginx_image}"
+            printf 'file_tool_image=%s\n' "${file_tool_image}"
+          } >> "${GITHUB_OUTPUT}"
+
+  publish:
+    name: Publish one signed release bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [preflight, release_authorization]
+    if: >-
+      ${{
+        needs.release_authorization.result == 'success' &&
+        needs.release_authorization.outputs.authorized == 'true'
+      }}
+    environment: production-images
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: Refuse an already published semantic version
+        shell: bash
+        env:
+          OWNER: ${{ needs.preflight.outputs.registry_owner }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          for component in web api worker; do
+            image="ghcr.io/${OWNER}/executive-ai-${component}:${VERSION}"
+            if docker manifest inspect "${image}" >/dev/null 2>&1; then
+              echo "Immutable image tag already exists: ${image}" >&2
+              exit 1
+            fi
+          done
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build-web
+        with:
+          context: .
+          file: Dockerfile.web
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-web:${{ needs.preflight.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-web
+          cache-to: type=gha,mode=max,scope=release-web
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build-api
+        with:
+          context: services/api
+          file: services/api/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-api:${{ needs.preflight.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-api
+          cache-to: type=gha,mode=max,scope=release-api
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build-worker
+        with:
+          context: .
+          file: services/worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-worker:${{ needs.preflight.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-worker
+          cache-to: type=gha,mode=max,scope=release-worker
+      - name: Sign application image digests with release identity
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          WEB_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-web@${{ steps.build-web.outputs.digest }}
+          API_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-api@${{ steps.build-api.outputs.digest }}
+          WORKER_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-worker@${{ steps.build-worker.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for component in web api worker; do
+            case "${component}" in
+              web) image="${WEB_IMAGE}" ;;
+              api) image="${API_IMAGE}" ;;
+              worker) image="${WORKER_IMAGE}" ;;
+            esac
+            cosign sign --yes \
+              --annotations "release.version=${VERSION}" \
+              --annotations "release.git-commit=${COMMIT}" \
+              --annotations "release.component=${component}" \
+              "${image}"
+          done
+      - name: Generate and sign the release bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          SOURCE_REF: ${{ needs.preflight.outputs.source_ref }}
+          TRIGGER: ${{ needs.preflight.outputs.trigger }}
+          ALEMBIC_HEAD: ${{ needs.preflight.outputs.alembic_head }}
+          WEB_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-web@${{ steps.build-web.outputs.digest }}
+          API_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-api@${{ steps.build-api.outputs.digest }}
+          WORKER_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-worker@${{ steps.build-worker.outputs.digest }}
+          POSTGRES_IMAGE: ${{ needs.preflight.outputs.postgres_image }}
+          NGINX_IMAGE: ${{ needs.preflight.outputs.nginx_image }}
+          FILE_TOOL_IMAGE: ${{ needs.preflight.outputs.file_tool_image }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-evidence
+          generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          jq -nS \
+            --arg schemaVersion 'executive-ai.release-bundle/v1' \
+            --arg version "${VERSION}" \
+            --arg gitCommit "${COMMIT}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg sourceRef "${SOURCE_REF}" \
+            --arg trigger "${TRIGGER}" \
+            --arg workflow '.github/workflows/release-images.yml' \
+            --arg generatedAt "${generated_at}" \
+            --argjson workflowRunId "${GITHUB_RUN_ID}" \
+            --arg alembicHead "${ALEMBIC_HEAD}" \
+            --arg web "${WEB_IMAGE}" \
+            --arg api "${API_IMAGE}" \
+            --arg worker "${WORKER_IMAGE}" \
+            --arg postgres "${POSTGRES_IMAGE}" \
+            --arg nginx "${NGINX_IMAGE}" \
+            --arg fileTool "${FILE_TOOL_IMAGE}" \
+            '{
+              schemaVersion: $schemaVersion,
+              release: {
+                version: $version,
+                gitCommit: $gitCommit,
+                repository: $repository,
+                sourceRef: $sourceRef,
+                trigger: $trigger,
+                workflow: $workflow,
+                workflowRunId: $workflowRunId,
+                generatedAt: $generatedAt
+              },
+              database: {alembicHead: $alembicHead},
+              images: {
+                web: $web,
+                api: $api,
+                worker: $worker,
+                postgres: $postgres,
+                nginx: $nginx,
+                fileTool: $fileTool
+              }
+            }' > release-evidence/release-bundle.json
+          cosign sign-blob --yes \
+            --bundle release-evidence/release-bundle.sigstore.json \
+            release-evidence/release-bundle.json
+      - name: Self-verify signed release evidence
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_GIT_COMMIT: ${{ needs.preflight.outputs.commit }}
+          EXPECTED_ALEMBIC_HEAD: ${{ needs.preflight.outputs.alembic_head }}
+          RELEASE_GITHUB_REPOSITORY: ${{ github.repository }}
+          WEB_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-web@${{ steps.build-web.outputs.digest }}
+          API_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-api@${{ steps.build-api.outputs.digest }}
+          WORKER_IMAGE: ghcr.io/${{ needs.preflight.outputs.registry_owner }}/executive-ai-worker@${{ steps.build-worker.outputs.digest }}
+          POSTGRES_IMAGE: ${{ needs.preflight.outputs.postgres_image }}
+          NGINX_IMAGE: ${{ needs.preflight.outputs.nginx_image }}
+          FILE_TOOL_IMAGE: ${{ needs.preflight.outputs.file_tool_image }}
+        run: >-
+          ./scripts/verify-release-bundle.sh
+          release-evidence/release-bundle.json
+          release-evidence/release-bundle.sigstore.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executive-ai-release-${{ needs.preflight.outputs.version }}-${{ needs.preflight.outputs.commit }}-${{ github.run_id }}
+          path: release-evidence/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Publish release evidence summary
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          ALEMBIC_HEAD: ${{ needs.preflight.outputs.alembic_head }}
+        run: |
+          {
+            printf '## Signed production release\n\n'
+            printf -- '- Version: `%s`\n' "${VERSION}"
+            printf -- '- Commit: `%s`\n' "${COMMIT}"
+            printf -- '- Alembic head: `%s`\n' "${ALEMBIC_HEAD}"
+            printf -- '- Evidence artifact: `executive-ai-release-%s-%s-%s`\n' "${VERSION}" "${COMMIT}" "${GITHUB_RUN_ID}"
+            printf '\nThe signed bundle binds all six deployment image digests.\n'
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,552 @@
+name: ${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME must be set by scripts/compose.sh}
+
+x-json-logging: &json-logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: ${LOG_MAX_FILES:-5}
+    compress: "true"
+
+x-backend-environment: &backend-environment
+  APP_ENV: ${APP_ENV:?APP_ENV is required}
+  APP_MODE: ${APP_MODE:?APP_MODE is required}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: json
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
+  POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+  STORAGE_ROOT: /data/files
+  FILE_STORAGE_ROOT: /data/files
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  SESSION_COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  SESSION_COOKIE_SAMESITE: strict
+  SEED_DEMO_DATA: ${SEED_DEMO_DATA:-false}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}
+  TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,api}
+  BEHIND_TRUSTED_PROXY: "true"
+  FILE_ENCRYPTION_KEY_VERSION: ${FILE_ENCRYPTION_KEY_VERSION:-v1}
+  FILE_ENCRYPTION_KEY_RING_FILE: /run/secrets/file_encryption_key_ring
+  AUDIT_HMAC_KEY_VERSION: ${AUDIT_HMAC_KEY_VERSION:-v1}
+  AUDIT_HMAC_LEGACY_KEY_VERSION: ${AUDIT_HMAC_LEGACY_KEY_VERSION:-v1}
+  AUDIT_HMAC_KEY_RING_FILE: /run/secrets/audit_hmac_key_ring
+  WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-2}
+  WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-60}
+  WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-15}
+  WORKER_JOB_MAX_ATTEMPTS: ${WORKER_JOB_MAX_ATTEMPTS:-3}
+  WORKER_RETRY_BASE_SECONDS: ${WORKER_RETRY_BASE_SECONDS:-2}
+  WORKER_RETRY_MAX_SECONDS: ${WORKER_RETRY_MAX_SECONDS:-60}
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    logging: *json-logging
+
+  db-role-init:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_MIGRATOR_USER: ${POSTGRES_MIGRATOR_USER:-executive_ai_migrator}
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
+      POSTGRES_BACKUP_USER: ${POSTGRES_BACKUP_USER:-executive_ai_backup}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_OWNER_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_MIGRATOR_PASSWORD_FILE: /run/secrets/postgres_migrator_password
+      POSTGRES_RUNTIME_PASSWORD_FILE: /run/secrets/postgres_runtime_password
+      POSTGRES_BACKUP_PASSWORD_FILE: /run/secrets/postgres_backup_password
+    secrets:
+      - postgres_password
+      - postgres_migrator_password
+      - postgres_runtime_password
+      - postgres_backup_password
+    volumes:
+      - ./deploy/postgres/ensure-runtime-role.sh:/usr/local/bin/ensure-runtime-role:ro
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["/usr/local/bin/ensure-runtime-role"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  migrate:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    image: ${API_IMAGE:-executive-ai-api:local}
+    restart: "no"
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: migration
+      POSTGRES_MIGRATOR_USER: ${POSTGRES_MIGRATOR_USER:-executive_ai_migrator}
+    secrets:
+      - postgres_migrator_password
+    networks:
+      - backend
+    depends_on:
+      db-role-init:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_migrator_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_MIGRATOR_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        exec alembic upgrade head
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  db-permissions:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_MIGRATOR_USER: ${POSTGRES_MIGRATOR_USER:-executive_ai_migrator}
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-executive_ai_runtime}
+      POSTGRES_BACKUP_USER: ${POSTGRES_BACKUP_USER:-executive_ai_backup}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_OWNER_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_MIGRATOR_PASSWORD_FILE: /run/secrets/postgres_migrator_password
+      POSTGRES_RUNTIME_PASSWORD_FILE: /run/secrets/postgres_runtime_password
+      POSTGRES_BACKUP_PASSWORD_FILE: /run/secrets/postgres_backup_password
+    secrets:
+      - postgres_password
+      - postgres_migrator_password
+      - postgres_runtime_password
+      - postgres_backup_password
+    volumes:
+      - ./deploy/postgres/ensure-runtime-role.sh:/usr/local/bin/ensure-runtime-role:ro
+    networks:
+      - backend
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["/usr/local/bin/ensure-runtime-role"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    image: ${API_IMAGE:-executive-ai-api:local}
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: api
+    secrets:
+      - postgres_runtime_password
+      - session_secret
+      - csrf_secret
+      - file_encryption_key
+      - file_encryption_key_ring
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    volumes:
+      - file_data:/data/files
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export SESSION_SECRET="$$(cat /run/secrets/session_secret)"
+        export CSRF_SECRET="$$(cat /run/secrets/csrf_secret)"
+        export FILE_ENCRYPTION_KEY="$$(cat /run/secrets/file_encryption_key)"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        exec uvicorn executive_ai_api.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips="*"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    image: ${WORKER_IMAGE:-executive-ai-worker:local}
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: worker
+    secrets:
+      - postgres_runtime_password
+      - file_encryption_key
+      - file_encryption_key_ring
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    volumes:
+      - file_data:/data/files
+    networks:
+      - backend
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export FILE_ENCRYPTION_KEY="$$(cat /run/secrets/file_encryption_key)"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        exec python -m executive_ai_worker.main
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_APP_MODE: production
+        NEXT_PUBLIC_API_BASE_URL: /api/v1
+    image: ${WEB_IMAGE:-executive-ai-web:local}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      NEXT_PUBLIC_APP_MODE: production
+      NEXT_PUBLIC_API_BASE_URL: /api/v1
+    networks:
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  nginx:
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    restart: unless-stopped
+    ports:
+      - "${HOST_BIND:?HOST_BIND is required}:${HTTP_PORT:?HTTP_PORT is required}:8080"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - frontend
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/_gateway/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /var/cache/nginx:size=64m,mode=0755
+      - /var/run:size=8m,mode=0755
+    security_opt:
+      - no-new-privileges:true
+    logging: *json-logging
+
+  seed-demo:
+    profiles: ["demo-seed"]
+    image: ${API_IMAGE:-executive-ai-api:local}
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: seed
+      SEED_DEMO_DATA: "true"
+      DEMO_ENTERPRISE_SLUG: ${DEMO_ENTERPRISE_SLUG:-}
+    secrets:
+      - postgres_runtime_password
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    networks:
+      - backend
+    depends_on:
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ "$${APP_ENV}" != "local-demo" ] || [ "$${APP_MODE}" != "demo" ]; then
+          echo "Demo seed is only permitted in local-demo mode" >&2
+          exit 64
+        fi
+        if [ -z "$${DEMO_ENTERPRISE_SLUG}" ]; then
+          echo "DEMO_ENTERPRISE_SLUG is required" >&2
+          exit 64
+        fi
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        exec python -m executive_ai_api.seed --enterprise-slug "$${DEMO_ENTERPRISE_SLUG}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  bootstrap-admin:
+    profiles: ["bootstrap"]
+    image: ${API_IMAGE:-executive-ai-api:local}
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: bootstrap
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_DISPLAY_NAME: ${BOOTSTRAP_ADMIN_DISPLAY_NAME:-}
+      BOOTSTRAP_ENTERPRISE_NAME: ${BOOTSTRAP_ENTERPRISE_NAME:-}
+      BOOTSTRAP_ENTERPRISE_SLUG: ${BOOTSTRAP_ENTERPRISE_SLUG:-}
+    secrets:
+      - postgres_runtime_password
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    networks:
+      - backend
+    depends_on:
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        if [ -z "$${BOOTSTRAP_ADMIN_EMAIL}" ] || \
+           [ -z "$${BOOTSTRAP_ADMIN_DISPLAY_NAME}" ] || \
+           [ -z "$${BOOTSTRAP_ENTERPRISE_NAME}" ] || \
+           [ -z "$${BOOTSTRAP_ENTERPRISE_SLUG}" ]; then
+          echo "all bootstrap identity and enterprise fields are required" >&2
+          exit 64
+        fi
+        exec python -m executive_ai_api.cli create-admin \
+          --email "$${BOOTSTRAP_ADMIN_EMAIL}" \
+          --display-name "$${BOOTSTRAP_ADMIN_DISPLAY_NAME}" \
+          --enterprise-name "$${BOOTSTRAP_ENTERPRISE_NAME}" \
+          --enterprise-slug "$${BOOTSTRAP_ENTERPRISE_SLUG}" \
+          --password-stdin \
+          --force-password-change
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  create-executive:
+    profiles: ["bootstrap"]
+    image: ${API_IMAGE:-executive-ai-api:local}
+    environment:
+      <<: *backend-environment
+      SERVICE_ROLE: bootstrap
+      EXECUTIVE_EMAIL: ${EXECUTIVE_EMAIL:-}
+      EXECUTIVE_DISPLAY_NAME: ${EXECUTIVE_DISPLAY_NAME:-}
+      EXECUTIVE_ENTERPRISE_SLUG: ${EXECUTIVE_ENTERPRISE_SLUG:-}
+      EXECUTIVE_SCOPE_MODE: ${EXECUTIVE_SCOPE_MODE:-}
+      EXECUTIVE_ORGANIZATION_UNIT_CODES: ${EXECUTIVE_ORGANIZATION_UNIT_CODES:-}
+    secrets:
+      - postgres_runtime_password
+      - audit_hmac_key
+      - audit_hmac_key_ring
+    networks:
+      - backend
+    depends_on:
+      db-permissions:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        DB_PASSWORD="$$(cat /run/secrets/postgres_runtime_password)"
+        export DATABASE_URL="postgresql+psycopg://$${POSTGRES_RUNTIME_USER}:$${DB_PASSWORD}@postgres:5432/$${POSTGRES_DB}"
+        export AUDIT_HMAC_KEY="$$(cat /run/secrets/audit_hmac_key)"
+        if [ -z "$${EXECUTIVE_EMAIL}" ] || \
+           [ -z "$${EXECUTIVE_DISPLAY_NAME}" ] || \
+           [ -z "$${EXECUTIVE_ENTERPRISE_SLUG}" ]; then
+          echo "executive identity and enterprise fields are required" >&2
+          exit 64
+        fi
+        set -- python -m executive_ai_api.cli create-user \
+          --enterprise-slug "$${EXECUTIVE_ENTERPRISE_SLUG}" \
+          --email "$${EXECUTIVE_EMAIL}" \
+          --display-name "$${EXECUTIVE_DISPLAY_NAME}" \
+          --role executive \
+          --password-stdin \
+          --force-password-change
+        if [ "$${EXECUTIVE_SCOPE_MODE}" = "enterprise" ]; then
+          set -- "$$@" --enterprise-wide-scope
+        elif [ "$${EXECUTIVE_SCOPE_MODE}" = "organization-units" ] && \
+             [ -n "$${EXECUTIVE_ORGANIZATION_UNIT_CODES}" ]; then
+          old_ifs="$${IFS}"
+          IFS=','
+          for unit_code in $${EXECUTIVE_ORGANIZATION_UNIT_CODES}; do
+            set -- "$$@" --organization-unit-code "$${unit_code}"
+          done
+          IFS="$${old_ifs}"
+        else
+          echo "scope must be enterprise or a non-empty organization-unit list" >&2
+          exit 64
+        fi
+        exec "$$@"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  file-tool:
+    profiles: ["tools"]
+    image: ${FILE_TOOL_IMAGE:-alpine:3.20}
+    # The API creates a private 0700 encrypted-storage tree as uid/gid 999.
+    # Using the same unprivileged identity avoids granting DAC override merely
+    # so backups can read files and restores can replace them.
+    user: "999:999"
+    network_mode: none
+    volumes:
+      - file_data:/data/files
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+  db-backup-tool:
+    profiles: ["tools"]
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    environment:
+      POSTGRES_BACKUP_USER: ${POSTGRES_BACKUP_USER:-executive_ai_backup}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_BACKUP_PASSWORD_FILE: /run/secrets/postgres_backup_password
+    secrets:
+      - postgres_backup_password
+    volumes:
+      - ./deploy/postgres/backup-entrypoint.sh:/usr/local/bin/backup-entrypoint:ro
+    networks:
+      - backend
+    entrypoint: ["/usr/local/bin/backup-entrypoint"]
+    command: ["psql", "--version"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *json-logging
+
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  postgres_data:
+  file_data:
+
+secrets:
+  postgres_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_password
+  postgres_migrator_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_migrator_password
+  postgres_runtime_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_runtime_password
+  postgres_backup_password:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/postgres_backup_password
+  session_secret:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/session_secret
+  csrf_secret:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/csrf_secret
+  file_encryption_key:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/file_encryption_key
+  file_encryption_key_ring:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/file_encryption_key_ring
+  audit_hmac_key:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/audit_hmac_key
+  audit_hmac_key_ring:
+    file: ${RUNTIME_DIR:?RUNTIME_DIR is required}/secrets/audit_hmac_key_ring

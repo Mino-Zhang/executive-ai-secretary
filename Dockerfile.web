@@ -1,0 +1,36 @@
+# Official Node.js 22.23.1 on Alpine 3.24. The reviewed manifest-list digest
+# contains both linux/amd64 and linux/arm64 images.
+FROM public.ecr.aws/docker/library/node:22.23.1-alpine3.24@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS dependencies
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+
+FROM dependencies AS build
+ARG NEXT_PUBLIC_APP_MODE=production
+ARG NEXT_PUBLIC_API_BASE_URL=/api/v1
+ENV NEXT_PUBLIC_APP_MODE=${NEXT_PUBLIC_APP_MODE}
+ENV NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}
+ENV NODE_ENV=production
+COPY . .
+RUN if [ "${NEXT_PUBLIC_APP_MODE}" != "production" ]; then \
+      echo "Dockerfile.web only builds the production entrypoint" >&2; exit 64; \
+    fi \
+    && cp app/page.production.tsx app/page.tsx \
+    && npm run build \
+    && node scripts/assert-production-artifact.mjs dist
+
+FROM public.ecr.aws/docker/library/node:22.23.1-alpine3.24@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS runtime
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=3000
+WORKDIR /app
+COPY --from=build --chown=node:node /app/dist ./dist
+# vinext's production HTTP adapter is the only build-tool code kept at runtime.
+# The 700+ MB development dependency tree is deliberately excluded.
+COPY --from=build --chown=node:node /app/node_modules/vinext ./node_modules/vinext
+COPY --chown=node:node deploy/web-server.mjs ./web-server.mjs
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=12 \
+  CMD wget --quiet --tries=1 --spider http://127.0.0.1:3000/ || exit 1
+CMD ["node", "/app/web-server.mjs"]

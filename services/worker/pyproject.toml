@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "executive-ai-worker"
+version = "0.1.0"
+description = "Background job worker for the Executive AI Researcher workspace"
+requires-python = ">=3.12"
+dependencies = [
+  "executive-ai-api==0.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9", "ruff>=0.9,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/executive_ai_worker"]
+
+[tool.uv.sources]
+executive-ai-api = { path = "../api" }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E402", "S101"]
+
+[tool.pytest.ini_options]
+markers = [
+  "postgres: requires a real PostgreSQL database and exercises worker lease concurrency",
+]
