@@ -4658,8 +4658,17 @@ tbody tr:last-child td {
   flex: 0 0 auto;
   align-items: center;
   gap: 5px;
-  min-width: 158px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 7px;
+  border-radius: 8px;
+  cursor: pointer;
   white-space: nowrap;
+}
+
+.composer-model-picker:hover {
+  color: var(--theme-ink);
+  background: var(--theme-soft);
 }
 
 .composer-model-picker::before {
@@ -4670,24 +4679,41 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
-.composer-model-picker select {
-  width: 100%;
+.composer-model-value {
   max-width: 190px;
-  min-height: 34px;
-  padding: 0 22px 0 7px;
-  border: 0;
+  overflow: hidden;
   color: var(--theme-ink-soft);
-  background: transparent;
-  font: inherit;
   font-size: 12px;
   font-weight: 560;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.composer-model-picker select:focus-visible {
-  border-radius: 7px;
+.composer-model-chevron {
+  margin-left: 1px;
+  color: var(--theme-muted);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.composer-model-picker select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.composer-model-picker:focus-within {
   outline: 2px solid color-mix(in srgb, var(--theme-accent) 46%, transparent);
   outline-offset: 2px;
+}
+
+.composer-model-picker select:disabled {
+  cursor: not-allowed;
 }
 
 .chairman-answer,
@@ -12015,4 +12041,69 @@ html[data-theme="dark"] .production-admin-shell {
   .admin-model-authorization > header { flex-direction: column; }
   .admin-model-directory-controls { grid-template-columns: 1fr; }
   .admin-model-directory-controls > span { display: none; }
+}
+
+/* Targeted workbench balance: keep the welcome cluster optically centered and
+   keep the selected model adjacent to the submit action at every label width. */
+.production-workbench-v2 .home-empty-inner {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.production-workbench-v2 .home-focus-group {
+  width: 100%;
+  align-self: center;
+}
+
+.production-workbench-v2 .home-service-note {
+  margin: 0;
+}
+
+.production-workbench-v2 .composer-footer {
+  gap: 10px;
+}
+
+.production-workbench-v2 .composer-send {
+  margin-left: auto;
+  gap: 4px;
+}
+
+.production-workbench-v2 .composer-model-picker {
+  margin-left: auto;
+}
+
+@media (max-width: 680px) {
+  .production-workbench-v2 .home-empty-inner {
+    display: flex;
+  }
+
+  .production-workbench-v2 .home-focus-group {
+    transform: none;
+  }
+
+  .production-workbench-v2 .home-service-note {
+    margin-top: auto;
+  }
+
+  .production-workbench-v2 .composer-model-picker::before {
+    content: none;
+  }
+
+  .production-workbench-v2 .composer-model-value {
+    max-width: 122px;
+  }
+}
+
+@media (max-width: 420px) {
+  .production-workbench-v2 .composer-footer {
+    grid-template-columns: minmax(0, 1fr);
+    justify-content: stretch;
+  }
+
+  .production-workbench-v2 .composer-send {
+    width: 100%;
+    justify-content: flex-end;
+    justify-self: stretch;
+    margin-left: 0;
+  }
 }

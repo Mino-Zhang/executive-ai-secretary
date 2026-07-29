@@ -1321,38 +1321,40 @@ function ProductionHome({
     <div className="workspace-home">
       <div className="home-empty-stage">
         <div className="home-empty-inner">
-          {latestReport ? (
-            <button className="morning-brief-trigger production-brief-trigger" type="button" onClick={onOpenReport}>
-              <span className="morning-brief-dot" aria-hidden="true" />
-              <span><strong>{latestReport.title}</strong><small>{latestReport.data_as_of ? `数据截至 ${formatTimestamp(latestReport.data_as_of, language)}` : "最新简报已生成"}</small></span>
-              <span>查看晨间摘要 <b aria-hidden="true">›</b></span>
-            </button>
-          ) : null}
+          <div className="home-focus-group">
+            {latestReport ? (
+              <button className="morning-brief-trigger production-brief-trigger" type="button" onClick={onOpenReport}>
+                <span className="morning-brief-dot" aria-hidden="true" />
+                <span><strong>{latestReport.title}</strong><small>{latestReport.data_as_of ? `数据截至 ${formatTimestamp(latestReport.data_as_of, language)}` : "最新简报已生成"}</small></span>
+                <span>查看晨间摘要 <b aria-hidden="true">›</b></span>
+              </button>
+            ) : null}
 
-          <section className="workspace-greeting" aria-labelledby="production-greeting-title">
-            <div className="greeting-title-line"><span className="service-mark" aria-hidden="true" /><h1 id="production-greeting-title">{greetingForCurrentHour(me.user.timezone, language)}，{salutation}</h1></div>
-            {!hasScope && <small className="active-project-context">经营数据尚未配置，仍可进行泛化问答。</small>}
-            {activeProjectName && <small className="active-project-context">当前会话将归入项目：{activeProjectName}</small>}
-          </section>
+            <section className="workspace-greeting" aria-labelledby="production-greeting-title">
+              <div className="greeting-title-line"><span className="service-mark" aria-hidden="true" /><h1 id="production-greeting-title">{greetingForCurrentHour(me.user.timezone, language)}，{salutation}</h1></div>
+              {!hasScope && <small className="active-project-context">经营数据尚未配置，仍可进行泛化问答。</small>}
+              {activeProjectName && <small className="active-project-context">当前会话将归入项目：{activeProjectName}</small>}
+            </section>
 
-          <ProductionComposer
-            id="production-home-question"
-            language={language}
-            draft={draft}
-            setDraft={setDraft}
-            sending={sending}
-            disabled={false}
-            organizationUnits={organizationUnits}
-            organizationScope={organizationScope}
-            setOrganizationScope={setOrganizationScope}
-            authorizedModels={authorizedModels}
-            selectedModelId={selectedModelId}
-            setSelectedModelId={setSelectedModelId}
-            onKeyDown={onKeyDown}
-            onSubmit={onSubmit}
-          />
+            <ProductionComposer
+              id="production-home-question"
+              language={language}
+              draft={draft}
+              setDraft={setDraft}
+              sending={sending}
+              disabled={false}
+              organizationUnits={organizationUnits}
+              organizationScope={organizationScope}
+              setOrganizationScope={setOrganizationScope}
+              authorizedModels={authorizedModels}
+              selectedModelId={selectedModelId}
+              setSelectedModelId={setSelectedModelId}
+              onKeyDown={onKeyDown}
+              onSubmit={onSubmit}
+            />
 
-          <section className="prompt-suggestions production-prompt-suggestions" aria-label={language === "en" ? "Suggested questions" : "建议问题"}><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>
+            <section className="prompt-suggestions production-prompt-suggestions" aria-label={language === "en" ? "Suggested questions" : "建议问题"}><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>
+          </div>
           <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? `数据来源：${professionalSourceLabel(dataCapabilities.source_label)}。` : "当前尚未激活经营数据。"}{c.disclaimer}</p>
         </div>
       </div>
@@ -1792,6 +1794,8 @@ function ProductionComposer({
 }) {
   const c = copy[language];
   const selectedModelIsAuthorized = authorizedModels.some((model) => model.model_id === selectedModelId);
+  const selectedModelLabel = authorizedModels.find((model) => model.model_id === selectedModelId)?.display_name
+    ?? (selectedModelId ? "原模型已取消授权" : "暂无可用模型");
   return (
     <form className="composer workbench-composer home-primary-composer production-composer" onSubmit={onSubmit}>
       <label className="sr-only" htmlFor={id}>输入经营问题</label>
@@ -1799,8 +1803,13 @@ function ProductionComposer({
       <div className="composer-footer">
         <div className="composer-tools">
           <OrganizationPicker language={language} units={organizationUnits} value={organizationScope} onChange={setOrganizationScope} disabled={!organizationUnits.length} />
+        </div>
+        <div className="composer-send">
+          {draft.length >= COMPOSER_HINT_THRESHOLD && <span className="composer-character-count">{language === "en" ? `${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString("en")} characters remaining` : `还可输入 ${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString(language)} 字`}</span>}
           <label className="composer-model-picker">
             <span className="sr-only">当前模型</span>
+            <span className="composer-model-value" aria-hidden="true">{selectedModelLabel}</span>
+            <span className="composer-model-chevron" aria-hidden="true">⌄</span>
             <select
               value={selectedModelId}
               disabled={!authorizedModels.length || sending}
@@ -1816,9 +1825,6 @@ function ProductionComposer({
               ))}
             </select>
           </label>
-        </div>
-        <div className="composer-send">
-          {draft.length >= COMPOSER_HINT_THRESHOLD && <span className="composer-character-count">{language === "en" ? `${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString("en")} characters remaining` : `还可输入 ${(COMPOSER_MAX_LENGTH - draft.length).toLocaleString(language)} 字`}</span>}
           <button className="composer-submit-button" type="submit" disabled={disabled || sending || !draft.trim() || !selectedModelIsAuthorized} aria-label="发送问题">↑</button>
         </div>
       </div>
