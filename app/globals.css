@@ -12053,7 +12053,7 @@ html[data-theme="dark"] .production-admin-shell {
 .production-workbench-v2 .home-focus-group {
   width: 100%;
   align-self: center;
-  transform: translateY(-14px);
+  transform: translateY(-32px);
 }
 
 .production-workbench-v2 .home-service-note {
