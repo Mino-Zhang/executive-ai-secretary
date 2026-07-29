@@ -19,6 +19,7 @@ import type {
   Conversation,
   ConversationMessage,
   DataCapabilities,
+  DailyBrief,
   ExecutivePersonalProfile,
   Job,
   Memory,
@@ -49,6 +50,11 @@ type ProfilePreferences = {
   salutation: string;
   amountUnit: ExecutivePersonalProfile["amount_unit"];
   responseStyle: ExecutivePersonalProfile["response_style"];
+};
+type DailyBriefLoadState = {
+  scopeKey: string;
+  status: "ready" | "loading" | "error";
+  data: DailyBrief | null;
 };
 
 const ALL_SCOPE_ID = "all";
@@ -152,37 +158,189 @@ function environmentLabel(me: AuthMe) {
 
 function localizedDate(locale: string, timezone: string) {
   try {
-    return new Intl.DateTimeFormat(locale || "zh-CN", {
-      dateStyle: "full",
+    const resolvedLocale = locale || "zh-CN";
+    const formatter = new Intl.DateTimeFormat(resolvedLocale, {
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      weekday: "long",
       timeZone: timezone || "Asia/Shanghai",
-    }).format(new Date());
+    });
+    if (!resolvedLocale.startsWith("zh")) return formatter.format(new Date());
+    const values = Object.fromEntries(formatter.formatToParts(new Date()).map((part) => [part.type, part.value]));
+    return `${values.year}年${values.month}月${values.day}日，${values.weekday}`;
   } catch {
     return new Intl.DateTimeFormat("zh-CN", { dateStyle: "full" }).format(new Date());
   }
 }
 
-function greetingForCurrentHour(timezone: string, language: UiLanguage) {
-  let hour = new Date().getHours();
+type GreetingContext = "time" | "return" | "idle";
+type GreetingState = { context: GreetingContext; seed: string; observedAt: number };
+type PresenceRecord = { dateKey: string; lastSeenAt: number; returnCount: number };
+
+function zonedClock(timezone: string, now: Date = new Date()) {
+  let hour = now.getHours();
+  let dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   try {
-    const part = new Intl.DateTimeFormat("en-US", {
-      hour: "2-digit",
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "numeric",
       hour12: false,
       timeZone: timezone || "Asia/Shanghai",
-    }).formatToParts(new Date()).find((item) => item.type === "hour")?.value;
-    if (part) hour = Number(part) % 24;
+    }).formatToParts(now);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    if (values.hour) hour = Number(values.hour) % 24;
+    if (values.year && values.month && values.day) dateKey = `${values.year}-${values.month}-${values.day}`;
   } catch {
     // Browser time is a safe display-only fallback.
   }
+  return { hour, dateKey };
+}
+
+function stableGreetingIndex(seed: string, size: number) {
+  let hash = 0;
+  for (const character of seed) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return Math.abs(hash) % Math.max(size, 1);
+}
+
+function timeGreeting(hour: number, language: UiLanguage, salutation: string) {
   if (language === "en") {
-    if (hour < 6) return "Good evening";
-    if (hour < 12) return "Good morning";
-    if (hour < 18) return "Good afternoon";
-    return "Good evening";
+    if (hour < 5 || hour >= 23) return `It is late, take care, ${salutation}`;
+    if (hour < 12) return `Good morning, ${salutation}`;
+    if (hour < 18) return `Good afternoon, ${salutation}`;
+    return `Good evening, ${salutation}`;
   }
-  if (hour < 6) return language === "zh-TW" ? "夜深了" : "夜深了";
-  if (hour < 12) return "早上好";
-  if (hour < 18) return "下午好";
-  return "晚上好";
+  if (hour < 5 || hour >= 23) return language === "zh-TW" ? `夜深了，${salutation}` : `夜深了，${salutation}`;
+  if (hour < 10) return language === "zh-TW" ? `早上好，${salutation}` : `早上好，${salutation}`;
+  if (hour < 13) return language === "zh-TW" ? `中午好，${salutation}` : `中午好，${salutation}`;
+  if (hour < 18) return language === "zh-TW" ? `下午好，${salutation}` : `下午好，${salutation}`;
+  return language === "zh-TW" ? `晚上好，${salutation}` : `晚上好，${salutation}`;
+}
+
+function contextualGreeting(state: GreetingState, timezone: string, language: UiLanguage, salutation: string) {
+  const { hour } = zonedClock(timezone, new Date(state.observedAt));
+  if (state.context === "time") return timeGreeting(hour, language, salutation);
+  if (language === "en") {
+    if (hour < 5 || hour >= 23) return `It is late, remember to rest, ${salutation}`;
+    const values = state.context === "idle"
+      ? [`You have worked hard, ${salutation}.`, `Take a moment to breathe, ${salutation}.`]
+      : [`Welcome back, ${salutation}.`, `Good to see you again, ${salutation}.`, `I missed you, ${salutation}.`];
+    return values[stableGreetingIndex(state.seed, values.length)];
+  }
+  const traditional = language === "zh-TW";
+  if (hour < 5 || hour >= 23) return traditional ? `夜深了，注意休息，${salutation}` : `夜深了，注意休息，${salutation}`;
+  const values = state.context === "idle"
+      ? traditional
+      ? [`工作辛苦了，${salutation}。`, `放鬆一下吧，${salutation}。`]
+      : [`工作辛苦了，${salutation}。`, `放松一下吧，${salutation}。`]
+    : traditional
+      ? [`歡迎回來，${salutation}！`, `${salutation} 回來了！`, `${salutation}，我很想你！`]
+      : [`欢迎回来，${salutation}！`, `${salutation} 回来了！`, `${salutation}，我很想你！`];
+  return values[stableGreetingIndex(state.seed, values.length)];
+}
+
+function readPresenceRecord(key: string): PresenceRecord | null {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(key) || "null") as Partial<PresenceRecord> | null;
+    if (!value || typeof value.dateKey !== "string" || typeof value.lastSeenAt !== "number" || typeof value.returnCount !== "number") return null;
+    return { dateKey: value.dateKey, lastSeenAt: value.lastSeenAt, returnCount: value.returnCount };
+  } catch {
+    return null;
+  }
+}
+
+function useHumanGreeting(me: AuthMe, language: UiLanguage, salutation: string) {
+  const timezone = me.user.timezone || "Asia/Shanghai";
+  const [state, setState] = useState<GreetingState>(() => {
+    const now = Date.now();
+    if (typeof window === "undefined") return { context: "time", seed: "initial", observedAt: now };
+    const { dateKey } = zonedClock(timezone, new Date(now));
+    const previous = readPresenceRecord(`executive-workbench-presence:${me.user.id}`);
+    const returningToday = previous?.dateKey === dateKey;
+    const returnCount = returningToday ? previous.returnCount + 1 : 0;
+    return {
+      context: returningToday ? "return" : "time",
+      seed: `${me.user.id}:${dateKey}:${returnCount}`,
+      observedAt: now,
+    };
+  });
+  const stateRef = useRef(state);
+  const lastActivityAt = useRef<number | null>(null);
+  const hiddenAt = useRef<number | null>(null);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  useEffect(() => {
+    const userKey = me.user.id;
+    const presenceKey = `executive-workbench-presence:${userKey}`;
+    const now = Date.now();
+    const { dateKey } = zonedClock(timezone, new Date(now));
+    const previous = readPresenceRecord(presenceKey);
+    let returnCount = previous?.dateKey === dateKey ? previous.returnCount : 0;
+    if (previous?.dateKey === dateKey) returnCount += 1;
+    lastActivityAt.current = now;
+    window.localStorage.setItem(presenceKey, JSON.stringify({ dateKey, lastSeenAt: now, returnCount } satisfies PresenceRecord));
+
+    const rememberPresence = () => {
+      const timestamp = Date.now();
+      const currentDateKey = zonedClock(timezone, new Date(timestamp)).dateKey;
+      const current = readPresenceRecord(presenceKey);
+      window.localStorage.setItem(presenceKey, JSON.stringify({
+        dateKey: currentDateKey,
+        lastSeenAt: timestamp,
+        returnCount: current?.dateKey === currentDateKey ? current.returnCount : 0,
+      } satisfies PresenceRecord));
+    };
+    const showContext = (context: GreetingContext, timestamp: number) => {
+      const nextDateKey = zonedClock(timezone, new Date(timestamp)).dateKey;
+      const nextState: GreetingState = { context, seed: `${userKey}:${nextDateKey}:${context}:${Math.floor(timestamp / 300_000)}`, observedAt: timestamp };
+      stateRef.current = nextState;
+      setState(nextState);
+    };
+    const onVisibilityChange = () => {
+      const timestamp = Date.now();
+      if (document.visibilityState === "hidden") {
+        hiddenAt.current = timestamp;
+        rememberPresence();
+        return;
+      }
+      const elapsed = hiddenAt.current ? timestamp - hiddenAt.current : 0;
+      hiddenAt.current = null;
+      if (elapsed >= 45 * 60_000) showContext("idle", timestamp);
+      else if (elapsed >= 5 * 60_000) showContext("return", timestamp);
+      lastActivityAt.current = timestamp;
+    };
+    const onActivity = () => {
+      const timestamp = Date.now();
+      if (lastActivityAt.current !== null && timestamp - lastActivityAt.current >= 45 * 60_000) showContext("idle", timestamp);
+      lastActivityAt.current = timestamp;
+    };
+    const timer = window.setInterval(() => {
+      const timestamp = Date.now();
+      const currentDateKey = zonedClock(timezone, new Date(timestamp)).dateKey;
+      if (currentDateKey !== zonedClock(timezone, new Date(stateRef.current.observedAt)).dateKey) showContext("time", timestamp);
+      else if (document.visibilityState === "visible" && lastActivityAt.current !== null && timestamp - lastActivityAt.current >= 45 * 60_000 && stateRef.current.context !== "idle") showContext("idle", timestamp);
+      else setState((current) => ({ ...current, observedAt: timestamp }));
+    }, 60_000);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pointerdown", onActivity);
+    window.addEventListener("keydown", onActivity);
+    window.addEventListener("pagehide", rememberPresence);
+    return () => {
+      rememberPresence();
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pointerdown", onActivity);
+      window.removeEventListener("keydown", onActivity);
+      window.removeEventListener("pagehide", rememberPresence);
+    };
+  }, [me.user.id, timezone]);
+
+  return contextualGreeting(state, timezone, language, salutation);
 }
 
 function formatTimestamp(value: string | null | undefined, locale: string = "zh-CN") {
@@ -201,6 +359,33 @@ function formatDate(value: string, locale: string = "zh-CN") {
   const date = new Date(`${value}T00:00:00`);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat(locale, { year: "numeric", month: "short", day: "numeric" }).format(date);
+}
+
+function dailyBriefDataAsOf(brief: DailyBrief | null) {
+  return brief?.data_as_of ?? null;
+}
+
+function dailyBriefHeadline(brief: DailyBrief, language: UiLanguage) {
+  const uncertain = brief.readiness === "partial" || brief.readiness === "unavailable";
+  if (language === "en") {
+    if (uncertain && brief.attention_count === 0) return "There is not enough current data to make a determination";
+    if (uncertain) return `${brief.attention_count} item${brief.attention_count === 1 ? "" : "s"} identified for confirmation so far`;
+    return brief.attention_count > 0
+      ? `${brief.attention_count} item${brief.attention_count === 1 ? "" : "s"} need your attention today`
+      : "Nothing needs your confirmation today";
+  }
+  if (language === "zh-TW") {
+    if (uncertain && brief.attention_count === 0) return "目前數據不足，暫不能判斷";
+    if (uncertain) return `目前已識別 ${brief.attention_count} 項需要確認`;
+    return brief.attention_count > 0
+      ? `今日有 ${brief.attention_count} 項需要確認`
+      : "今日暫無需要確認的事項";
+  }
+  if (uncertain && brief.attention_count === 0) return "当前数据不足，暂不能判断";
+  if (uncertain) return `当前已识别 ${brief.attention_count} 项需要确认`;
+  return brief.attention_count > 0
+    ? `今日有 ${brief.attention_count} 项需要确认`
+    : "今日暂无需要确认的事项";
 }
 
 const domainLabels: Record<string, string> = {
@@ -266,6 +451,19 @@ function scopeFromConversation(conversation: Conversation): OrganizationScope {
   };
 }
 
+function organizationScopeKey(scope: OrganizationScope) {
+  return scope.mode === "all_authorized"
+    ? "all_authorized"
+    : [...scope.organization_unit_ids].sort().join(",");
+}
+
+function resolvedDailyBriefScopeKey(brief: DailyBrief | null) {
+  if (!brief) return "all_authorized";
+  return brief.uses_enterprise_snapshot
+    ? "all_authorized"
+    : [...brief.organization_unit_ids].sort().join(",");
+}
+
 export function ProductionWorkspace({
   initialBootstrap,
   onSessionExpired,
@@ -282,6 +480,11 @@ export function ProductionWorkspace({
   const [messagesError, setMessagesError] = useState("");
   const [draft, setDraft] = useState("");
   const [selectedOrganizationScope, setSelectedOrganizationScope] = useState<OrganizationScope>(ALL_ORGANIZATIONS_SCOPE);
+  const [dailyBriefState, setDailyBriefState] = useState<DailyBriefLoadState>(() => ({
+    scopeKey: resolvedDailyBriefScopeKey(initialBootstrap.dailyBrief),
+    status: initialBootstrap.dailyBrief ? "ready" : "error",
+    data: initialBootstrap.dailyBrief,
+  }));
   const [selectedModelId, setSelectedModelId] = useState(
     initialBootstrap.authorizedModels.find((model) => model.is_default)?.model_id
       ?? initialBootstrap.authorizedModels[0]?.model_id
@@ -346,6 +549,13 @@ export function ProductionWorkspace({
   const organizationUnits = bootstrap.organizationUnits;
   const businessDataReady = organizationUnits.length > 0;
   const dataCapabilities = bootstrap.dataCapabilities;
+  const dailyBriefScopeRequestKey = organizationScopeKey(selectedOrganizationScope);
+  const dailyBrief = dailyBriefState.scopeKey === dailyBriefScopeRequestKey && dailyBriefState.status === "ready"
+    ? dailyBriefState.data
+    : null;
+  const dailyBriefStatus: DailyBriefLoadState["status"] = dailyBriefState.scopeKey === dailyBriefScopeRequestKey
+    ? dailyBriefState.status
+    : "loading";
   const activeConversation = bootstrap.conversations.find((item) => item.id === activeConversationId) ?? null;
   const selectedScopeLabel = scopeLabel(selectedOrganizationScope, organizationUnits, languagePreference);
   const sortedProjects = useMemo(() => sortByPinnedAndRecent(bootstrap.projects), [bootstrap.projects]);
@@ -368,6 +578,21 @@ export function ProductionWorkspace({
   );
   const optionalWarning = Object.values(bootstrap.optionalErrors)[0];
   const userInitials = makeInitials(preferredDisplayName(me)).toUpperCase();
+  useEffect(() => {
+    if (dailyBriefState.scopeKey === dailyBriefScopeRequestKey) return;
+    let cancelled = false;
+    const requestedScopeKey = dailyBriefScopeRequestKey;
+    const organizationUnitIds = requestedScopeKey === "all_authorized" ? [] : requestedScopeKey.split(",").filter(Boolean);
+    void productionServices.data.dailyBrief(organizationUnitIds).then((nextBrief) => {
+      if (cancelled) return;
+      setBootstrap((current) => ({ ...current, dailyBrief: nextBrief }));
+      setDailyBriefState({ scopeKey: requestedScopeKey, status: "ready", data: nextBrief });
+    }).catch(() => {
+      if (cancelled) return;
+      setDailyBriefState({ scopeKey: requestedScopeKey, status: "error", data: null });
+    });
+    return () => { cancelled = true; };
+  }, [dailyBriefScopeRequestKey, dailyBriefState.scopeKey]);
 
   useEffect(() => {
     if (!activeConversationId) return;
@@ -1136,7 +1361,8 @@ export function ProductionWorkspace({
               authorizedModels={bootstrap.authorizedModels}
               selectedModelId={selectedModelId}
               setSelectedModelId={(modelId) => void changeSelectedModel(modelId)}
-              latestReport={latestDailyReport}
+              dailyBrief={dailyBrief}
+              dailyBriefStatus={dailyBriefStatus}
               dataCapabilities={dataCapabilities}
               onOpenReport={() => void openReport("daily", latestDailyReport?.id)}
               draft={draft}
@@ -1160,6 +1386,8 @@ export function ProductionWorkspace({
         memories={bootstrap.memories}
         organizationUnits={organizationUnits}
         dataCapabilities={dataCapabilities}
+        dailyBrief={dailyBrief}
+        dailyBriefStatus={dailyBriefStatus}
         language={languagePreference}
         memoryEnabled={memoryEnabled}
         setMemoryEnabled={(value) => void changeMemoryEnabled(value)}
@@ -1280,7 +1508,8 @@ function ProductionHome({
   authorizedModels,
   selectedModelId,
   setSelectedModelId,
-  latestReport,
+  dailyBrief,
+  dailyBriefStatus,
   dataCapabilities,
   onOpenReport,
   draft,
@@ -1299,7 +1528,8 @@ function ProductionHome({
   authorizedModels: AuthorizedModel[];
   selectedModelId: string;
   setSelectedModelId: (value: string) => void;
-  latestReport: Report | null;
+  dailyBrief: DailyBrief | null;
+  dailyBriefStatus: DailyBriefLoadState["status"];
   dataCapabilities: DataCapabilities | null;
   onOpenReport: () => void;
   draft: string;
@@ -1310,28 +1540,40 @@ function ProductionHome({
   activeProjectName: string | null;
 }) {
   const c = copy[language];
+  const greeting = useHumanGreeting(me, language, salutation);
   const hasScope = organizationUnits.length > 0;
   const suggestions = language === "en"
     ? ["Summarize this month's operating changes", "Show items that need my confirmation", "Draft a three-minute executive update"]
     : language === "zh-TW"
       ? ["整理本月經營變化", "查看需要我確認的事項", "起草三分鐘經營會匯報"]
       : ["整理本月经营变化", "查看需要我确认的事项", "起草三分钟经营会汇报"];
+  const dailyBriefAsOf = dailyBriefDataAsOf(dailyBrief);
+  const briefTitle = dailyBrief
+    ? dailyBriefHeadline(dailyBrief, language)
+    : dailyBriefStatus === "loading"
+      ? language === "en" ? "Reviewing today's priorities" : language === "zh-TW" ? "正在核對今日事項" : "正在核对今日事项"
+      : language === "en" ? "Morning brief is temporarily unavailable" : language === "zh-TW" ? "晨間簡報暫不可用" : "晨间简报暂不可用";
+  const briefMeta = dailyBrief
+    ? dailyBriefAsOf
+      ? `${language === "en" ? "Morning brief · Data through" : language === "zh-TW" ? "晨間簡報 · 數據截至" : "晨间简报 · 数据截至"} ${formatTimestamp(dailyBriefAsOf, language)}`
+      : language === "en" ? "Morning brief · Data status pending" : language === "zh-TW" ? "晨間簡報 · 數據狀態待確認" : "晨间简报 · 数据状态待确认"
+    : dailyBriefStatus === "loading"
+      ? language === "en" ? "Morning brief · Checking the current scope" : language === "zh-TW" ? "晨間簡報 · 正在核對目前範圍" : "晨间简报 · 正在核对当前范围"
+      : language === "en" ? "Morning brief · Check data status and try again" : language === "zh-TW" ? "晨間簡報 · 請檢查數據狀態後重試" : "晨间简报 · 请检查数据状态后重试";
 
   return (
     <div className="workspace-home">
       <div className="home-empty-stage">
         <div className="home-empty-inner">
           <div className="home-focus-group">
-            {latestReport ? (
-              <button className="morning-brief-trigger production-brief-trigger" type="button" onClick={onOpenReport}>
+            <button className="morning-brief-trigger production-brief-trigger" type="button" onClick={() => dailyBrief && onOpenReport()} disabled={!dailyBrief}>
                 <span className="morning-brief-dot" aria-hidden="true" />
-                <span><strong>{latestReport.title}</strong><small>{latestReport.data_as_of ? `数据截至 ${formatTimestamp(latestReport.data_as_of, language)}` : "最新简报已生成"}</small></span>
-                <span>查看晨间摘要 <b aria-hidden="true">›</b></span>
+                <span><strong>{briefTitle}</strong><small>{briefMeta}</small></span>
+                <span>{language === "en" ? "View morning brief" : language === "zh-TW" ? "查看晨間摘要" : "查看晨间摘要"} <b aria-hidden="true">›</b></span>
               </button>
-            ) : null}
 
             <section className="workspace-greeting" aria-labelledby="production-greeting-title">
-              <div className="greeting-title-line"><span className="service-mark" aria-hidden="true" /><h1 id="production-greeting-title">{greetingForCurrentHour(me.user.timezone, language)}，{salutation}</h1></div>
+              <div className="greeting-title-line"><span className="service-mark" aria-hidden="true" /><h1 id="production-greeting-title">{greeting}</h1></div>
               {!hasScope && <small className="active-project-context">经营数据尚未配置，仍可进行泛化问答。</small>}
               {activeProjectName && <small className="active-project-context">当前会话将归入项目：{activeProjectName}</small>}
             </section>
@@ -1355,7 +1597,7 @@ function ProductionHome({
 
             <section className="prompt-suggestions production-prompt-suggestions" aria-label={language === "en" ? "Suggested questions" : "建议问题"}><div>{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => setDraft(suggestion)}><span>{suggestion}</span><i aria-hidden="true">›</i></button>)}</div></section>
           </div>
-          <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? `数据来源：${professionalSourceLabel(dataCapabilities.source_label)}。` : "当前尚未激活经营数据。"}{c.disclaimer}</p>
+          <p className="home-service-note">{dataCapabilities?.source_kind.startsWith("simulated_") ? "当前使用演示模拟数据。" : dataCapabilities ? "经营数据已接入。" : "当前尚未激活经营数据。"}{c.disclaimer}</p>
         </div>
       </div>
     </div>
@@ -1935,6 +2177,8 @@ function WorkspaceDetailPanel({
   memories,
   organizationUnits,
   dataCapabilities,
+  dailyBrief,
+  dailyBriefStatus,
   language,
   memoryEnabled,
   setMemoryEnabled,
@@ -1956,6 +2200,8 @@ function WorkspaceDetailPanel({
   memories: Memory[];
   organizationUnits: OrganizationUnit[];
   dataCapabilities: DataCapabilities | null;
+  dailyBrief: DailyBrief | null;
+  dailyBriefStatus: DailyBriefLoadState["status"];
   language: UiLanguage;
   memoryEnabled: boolean;
   setMemoryEnabled: (value: boolean) => void;
@@ -1981,7 +2227,11 @@ function WorkspaceDetailPanel({
       <aside className={`workspace-detail-panel ${reportPanel ? "report-detail-panel" : ""}`} role="dialog" aria-modal="true" aria-labelledby="production-panel-title">
         <header><div><h2 id="production-panel-title">{titles[panel]}</h2><small>工作台下钻</small></div><div className="panel-header-actions"><button type="button" className="panel-close-button" onClick={onClose} aria-label="关闭面板">×</button></div></header>
         <div className="workspace-detail-scroll">
-          {reportPanel && <ProductionReportPanel kind={panel} report={report} loading={reportLoading} reports={reports} language={language} onSelectReport={onSelectReport} />}
+          {panel === "daily"
+            ? dailyBrief
+              ? <ProductionDailyBriefPanel brief={dailyBrief} language={language} />
+              : <div className="production-report-empty"><EmptyState title={dailyBriefStatus === "loading" ? "正在核对今日事项" : "晨间简报暂不可用"} description={dailyBriefStatus === "loading" ? "系统正在读取当前事业部范围的最新经营快照。" : "请先检查数据状态；系统不会使用其他事业部或历史样本替代当前范围。"} /></div>
+            : reportPanel && <ProductionReportPanel kind={panel} report={report} loading={reportLoading} reports={reports} language={language} onSelectReport={onSelectReport} />}
           {panel === "history" && <ProductionHistoryPanel conversations={conversations} language={language} onOpen={onOpenConversation} onNew={onNewConversation} onRename={onRenameConversation} onArchive={onArchiveConversation} />}
           {panel === "memory" && <ProductionMemoryPanel memories={memories} organizationUnits={organizationUnits} enabled={memoryEnabled} setEnabled={setMemoryEnabled} onCreate={onCreateMemory} onUpdate={onUpdateMemory} onDelete={onDeleteMemory} />}
           {panel === "scope" && <ProductionScopePanel organizationUnits={organizationUnits} dataCapabilities={dataCapabilities} />}
@@ -2135,6 +2385,60 @@ function recordItems(record: Record<string, unknown>, keys: string[]) {
     if (Array.isArray(value)) return value.map(asRecord).filter((item): item is Record<string, unknown> => Boolean(item));
   }
   return [];
+}
+
+function ProductionDailyBriefPanel({ brief, language }: { brief: DailyBrief; language: UiLanguage }) {
+  const asOf = dailyBriefDataAsOf(brief);
+  const canConcludeNoItems = brief.readiness === "ready" || brief.readiness === "stale";
+  const domainLabel = (domain: string) => domainLabels[domain] ?? domain;
+  const readinessLabel = (readiness: string) => {
+    if (language === "en") return readiness === "ready" ? "Ready" : readiness === "stale" ? "Older data" : readiness === "partial" ? "Partial" : "Unavailable";
+    if (language === "zh-TW") return readiness === "ready" ? "已就緒" : readiness === "stale" ? "數據較早" : readiness === "partial" ? "部分可用" : "暫不可用";
+    return readiness === "ready" ? "已就绪" : readiness === "stale" ? "数据较早" : readiness === "partial" ? "部分可用" : "暂不可用";
+  };
+  const metaLabel = language === "en" ? "Morning executive brief" : language === "zh-TW" ? "晨間經營摘要" : "晨间经营摘要";
+  const explanation = language === "en"
+    ? "Only material items that require an executive confirmation are shown here."
+    : language === "zh-TW"
+      ? "僅呈現需要高層確認的實質事項，不以普通變化補足數量。"
+      : "仅呈现需要高层确认的实质事项，不以普通变化补足数量。";
+
+  return (
+    <article className="executive-report production-executive-report daily live-daily-brief">
+      <header className="executive-report-lead">
+        <div className="executive-report-meta">
+          <div><span>{metaLabel}</span><time>{brief.brief_date ? formatDate(brief.brief_date, language) : "—"}</time></div>
+          <p>{asOf ? `${language === "en" ? "Data through" : language === "zh-TW" ? "數據截至" : "数据截至"} ${formatTimestamp(asOf, language)}` : readinessLabel(brief.readiness)}</p>
+        </div>
+        <h1>{dailyBriefHeadline(brief, language)}</h1>
+        <p>{explanation}</p>
+      </header>
+
+      {brief.items.length > 0 ? (
+        <section className="live-daily-brief-items" aria-label={language === "en" ? "Items needing attention" : "需要确认的事项"}>
+          {brief.items.map((item) => (
+            <article key={item.rule_id}>
+              <span className="morning-brief-dot" aria-hidden="true" />
+              <div><small>{domainLabel(item.domain)}</small><strong>{item.title}</strong><p>{item.detail}</p></div>
+              <b>{item.affected_count}</b>
+            </article>
+          ))}
+        </section>
+      ) : canConcludeNoItems ? (
+        <section className="live-daily-brief-clear"><span aria-hidden="true">✓</span><p>{language === "en" ? "No material confirmation item was identified for the current scope." : language === "zh-TW" ? "目前範圍內未識別到需要確認的重大事項。" : "当前范围内未识别到需要确认的重大事项。"}</p></section>
+      ) : (
+        <section className="live-daily-brief-clear uncertain"><span aria-hidden="true">!</span><p>{language === "en" ? "The current data is incomplete, so the system cannot confirm that there are no action items." : language === "zh-TW" ? "目前數據不完整，暫不能確認沒有需要處理的事項。" : "当前数据不完整，暂不能确认没有需要处理的事项。"}</p></section>
+      )}
+
+      <details className="executive-report-provenance">
+        <summary>{language === "en" ? "Data scope and readiness" : language === "zh-TW" ? "數據範圍與就緒度" : "数据范围与就绪度"}</summary>
+        <dl>
+          <div><dt>{language === "en" ? "Scope" : "范围"}</dt><dd>{brief.uses_enterprise_snapshot ? (language === "en" ? "All authorized business units" : language === "zh-TW" ? "全部授權事業部" : "全部授权事业部") : language === "en" ? `${brief.organization_unit_ids.length} business units` : language === "zh-TW" ? `${brief.organization_unit_ids.length} 個事業部` : `${brief.organization_unit_ids.length} 个事业部`}</dd></div>
+          {brief.domains.map((domain) => <div key={domain.domain}><dt>{domainLabel(domain.domain)}</dt><dd>{readinessLabel(domain.readiness)} · {domain.record_count.toLocaleString(language)}{language === "en" ? " records" : language === "zh-TW" ? " 條" : " 条"}{domain.data_as_of ? ` · ${formatTimestamp(domain.data_as_of, language)}` : ""}</dd></div>)}
+        </dl>
+      </details>
+    </article>
+  );
 }
 
 function ProductionReportPanel({

@@ -254,6 +254,37 @@ export type DataCapabilities = {
   generated_at: string;
 };
 
+export type DailyBriefItem = {
+  rule_id: "delivery_delayed" | "collection_overdue";
+  domain: "delivery" | "collection";
+  severity: "attention";
+  title: string;
+  detail: string;
+  affected_count: number;
+  amount: number | null;
+  unit: "元" | null;
+};
+
+export type DailyBriefDomainReadiness = {
+  domain: string;
+  readiness: string;
+  data_as_of: string | null;
+  record_count: number;
+};
+
+export type DailyBrief = {
+  brief_date: string | null;
+  data_as_of: string | null;
+  source_batch_id: string | null;
+  readiness: "ready" | "stale" | "partial" | "unavailable";
+  attention_count: number;
+  items: DailyBriefItem[];
+  domains: DailyBriefDomainReadiness[];
+  organization_unit_ids: string[];
+  uses_enterprise_snapshot: boolean;
+  generated_at: string;
+};
+
 export type AnspireModelOption = {
   id: string;
   name: string;
@@ -601,8 +632,9 @@ export type ProductionBootstrap = {
   reports: Report[];
   jobs: Job[];
   dataCapabilities: DataCapabilities | null;
+  dailyBrief: DailyBrief | null;
   personalProfile: ExecutivePersonalProfile | null;
-  optionalErrors: Partial<Record<"memories" | "reports" | "jobs" | "dataCapabilities" | "personalProfile" | "authorizedModels", string>>;
+  optionalErrors: Partial<Record<"memories" | "reports" | "jobs" | "dataCapabilities" | "dailyBrief" | "personalProfile" | "authorizedModels", string>>;
 };
 
 export type ApiErrorPayload = {

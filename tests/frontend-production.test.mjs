@@ -66,6 +66,7 @@ test("production services cover the active user domains without file upload", as
     "/memories",
     "/reports",
     "/jobs",
+    "/daily-brief",
   ]) {
     assert.match(services, new RegExp(path.replaceAll("/", "\\/")));
   }
@@ -86,15 +87,17 @@ test("management surface exposes only the controlled Anspire model channel", asy
   assert.match(application, /ProductionAdmin/);
   assert.match(admin, /Anspire 单一模型通道/);
   assert.match(admin, /open-gateway\.anspire\.ai/);
-  assert.match(admin, /modelFamilies/);
-  assert.match(admin, /optgroup/);
-  assert.match(admin, /全量模型目录/);
-  assert.match(admin, /item\.selectable/);
-  assert.match(admin, /固定|锁定/);
+  assert.match(admin, /测试与授权/);
+  assert.match(admin, /visibleModels/);
+  assert.match(admin, /testModel/);
+  assert.match(admin, /toggleAuthorization/);
+  assert.match(admin, /逐模型测试通过后，由管理员加入授权/);
   assert.match(admin, /保存配置/);
   assert.match(admin, /测试连接/);
-  assert.match(admin, /启用 Anspire/);
+  assert.match(admin, /保存网关配置/);
   assert.match(services, /\/admin\/model-provider/);
+  assert.match(services, /\/admin\/models/);
+  assert.match(types, /AdminModelAuthorization/);
   assert.match(types, /provider: "anspire"/);
   assert.doesNotMatch(admin, /OpenAI|Anthropic|自定义接口|endpoint_url.*onChange/);
   assert.doesNotMatch(services, /OPENAI_BASE_URL|HERMES_PROVIDER|model_api_key/);
@@ -125,11 +128,15 @@ test("management includes controlled data operations and a collapsible guide", a
   const services = await read("../app/production/services.ts");
   const types = await read("../app/production/types.ts");
 
-  assert.match(admin, /数据运营/);
+  assert.match(admin, /经营数据接入与同步/);
   assert.match(admin, /DataOperationsPanel/);
-  assert.match(admin, /飞书三表绑定/);
+  assert.match(admin, /数据接入/);
+  assert.match(admin, /同步运行/);
+  assert.match(admin, /调度计划/);
+  assert.match(admin, /数据质量/);
+  assert.match(admin, /指标口径/);
   assert.match(admin, /校验但不生效/);
-  assert.match(admin, /同步并原子切换/);
+  assert.match(admin, /同步并切换批次/);
   assert.match(admin, /跨表关联检查/);
   assert.match(admin, /金额恒等式/);
   assert.match(admin, /经验权重口径/);
@@ -148,6 +155,7 @@ test("management includes controlled data operations and a collapsible guide", a
   assert.match(types, /source_record_counts_json/);
   assert.match(types, /cross_table_validation_json/);
   assert.match(types, /OpportunityExperienceWeightPolicy/);
+  assert.doesNotMatch(admin, /飞书三表绑定|三表批次可用|自动任务/);
 });
 
 test("phase three workspace uses scoped multi-organization chat without legacy empty-state copy", async () => {
@@ -162,6 +170,14 @@ test("phase three workspace uses scoped multi-organization chat without legacy e
   assert.match(workspace, /organization-apply/);
   assert.match(workspace, /scope-change-divider/);
   assert.match(workspace, /workspace-topbar-date/);
+  assert.match(workspace, /useHumanGreeting/);
+  assert.match(workspace, /visibilitychange/);
+  assert.match(workspace, /欢迎回来/);
+  assert.match(workspace, /工作辛苦了/);
+  assert.match(workspace, /dailyBriefHeadline/);
+  assert.match(workspace, /今日有.*项需要确认/);
+  assert.match(types, /attention_count: number/);
+  assert.match(services, /services\.data\.dailyBrief\(\)/);
   assert.doesNotMatch(workspace, /今天需要我先看什么？|今天需要我先看什麼？|从一个问题开始|從一個問題開始/);
 });
 

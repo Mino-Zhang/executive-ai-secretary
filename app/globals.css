@@ -12043,8 +12043,8 @@ html[data-theme="dark"] .production-admin-shell {
   .admin-model-directory-controls > span { display: none; }
 }
 
-/* Targeted workbench balance: keep the welcome cluster optically centered and
-   keep the selected model adjacent to the submit action at every label width. */
+/* Targeted workbench balance: follow the established Demo rhythm from the top
+   bar instead of mathematically centering a visually heavy welcome cluster. */
 .production-workbench-v2 .home-empty-inner {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
@@ -12052,8 +12052,8 @@ html[data-theme="dark"] .production-admin-shell {
 
 .production-workbench-v2 .home-focus-group {
   width: 100%;
-  align-self: center;
-  transform: translateY(-32px);
+  align-self: start;
+  transform: none;
 }
 
 .production-workbench-v2 .home-service-note {
@@ -12106,5 +12106,247 @@ html[data-theme="dark"] .production-admin-shell {
     justify-content: flex-end;
     justify-self: stretch;
     margin-left: 0;
+  }
+}
+
+/* Production home composition — retain the established workbench behavior while
+   restoring the calmer Demo rhythm: brief, pause, greeting, composer, prompts. */
+.production-workbench-v2 .home-empty-inner {
+  width: min(100%, 880px);
+}
+
+.production-workbench-v2 .home-focus-group { transform: none; }
+
+.production-workbench-v2 .production-brief-trigger {
+  width: min(100%, 720px);
+  min-height: 58px;
+  margin-bottom: clamp(56px, 7vh, 76px);
+  padding: 10px 16px;
+  border-radius: 16px;
+  box-shadow: 0 1px 2px rgba(54, 46, 38, .035), 0 10px 26px rgba(54, 46, 38, .025);
+}
+
+.production-workbench-v2 .production-brief-trigger strong {
+  font-size: 14px;
+}
+
+.production-workbench-v2 .production-brief-trigger small {
+  font-size: 11px;
+}
+
+.production-workbench-v2 .production-brief-trigger > span:last-child {
+  font-size: 12px;
+}
+
+.production-workbench-v2 .production-brief-trigger:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.production-workbench-v2 .workspace-greeting {
+  margin-bottom: 28px;
+}
+
+.production-workbench-v2 .workspace-greeting h1 {
+  font-size: clamp(36px, 3.5vw, 42px);
+  line-height: 1.14;
+}
+
+.production-workbench-v2 .home-primary-composer {
+  border-radius: 20px;
+  box-shadow: var(--theme-shadow-elevated), inset 0 1px var(--theme-highlight);
+}
+
+.production-workbench-v2 .home-primary-composer:focus-within {
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--theme-accent) 10%, transparent),
+    var(--theme-shadow-elevated),
+    inset 0 1px var(--theme-highlight);
+}
+
+.production-workbench-v2 .home-primary-composer textarea {
+  min-height: 96px;
+  padding: 20px 21px 9px;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.production-workbench-v2 .production-prompt-suggestions {
+  margin-top: 18px;
+}
+
+.production-workbench-v2 .production-prompt-suggestions > div {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.production-workbench-v2 .production-prompt-suggestions button {
+  width: 100%;
+  min-height: 42px;
+  justify-content: space-between;
+  padding: 0 14px;
+}
+
+.production-workbench-v2 .production-prompt-suggestions button span {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-daily-brief-items {
+  display: grid;
+  margin-bottom: 34px;
+  border-top: 1px solid var(--theme-line);
+}
+
+.live-daily-brief-items > article {
+  display: grid;
+  min-height: 92px;
+  grid-template-columns: 10px minmax(0, 1fr) 38px;
+  align-items: center;
+  gap: 16px;
+  padding: 17px 2px;
+  border-bottom: 1px solid var(--theme-line);
+}
+
+.live-daily-brief-items > article > div {
+  display: grid;
+  gap: 5px;
+}
+
+.live-daily-brief-items small {
+  color: var(--theme-accent-strong);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.live-daily-brief-items strong {
+  color: var(--theme-ink);
+  font-size: 15px;
+  font-weight: 620;
+  line-height: 1.4;
+}
+
+.live-daily-brief-items p {
+  margin: 0;
+  color: var(--theme-muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.live-daily-brief-items > article > b {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid var(--theme-line);
+  border-radius: 50%;
+  color: var(--theme-ink-soft);
+  font-size: 13px;
+  font-weight: 620;
+}
+
+.live-daily-brief-clear {
+  display: flex;
+  min-height: 88px;
+  align-items: center;
+  gap: 13px;
+  margin-bottom: 34px;
+  padding: 18px 20px;
+  border: 1px solid var(--theme-line);
+  border-radius: 13px;
+  color: var(--theme-muted);
+  background: var(--theme-soft);
+}
+
+.live-daily-brief-clear > span {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--theme-positive);
+  background: color-mix(in srgb, var(--theme-positive) 11%, transparent);
+}
+
+.live-daily-brief-clear.uncertain > span {
+  color: var(--theme-attention);
+  background: var(--theme-attention-soft);
+}
+
+.live-daily-brief-clear p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+@media (max-width: 680px) {
+  .production-workbench-v2 .home-empty-inner {
+    width: 100%;
+  }
+
+  .production-workbench-v2 .home-focus-group {
+    transform: none;
+  }
+
+  .production-workbench-v2 .production-brief-trigger {
+    min-height: 52px;
+    grid-template-columns: 8px minmax(0, 1fr) auto;
+    margin-bottom: 32px;
+    padding: 8px 11px;
+    border-radius: 14px;
+  }
+
+  .production-workbench-v2 .production-brief-trigger strong {
+    font-size: 13px;
+  }
+
+  .production-workbench-v2 .production-brief-trigger small {
+    font-size: 10px;
+  }
+
+  .production-workbench-v2 .production-brief-trigger > span:last-child {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0;
+  }
+
+  .production-workbench-v2 .production-brief-trigger > span:last-child b {
+    margin-left: 0;
+    font-size: 16px;
+  }
+
+  .production-workbench-v2 .workspace-greeting {
+    margin-bottom: 22px;
+  }
+
+  .production-workbench-v2 .workspace-greeting h1 {
+    font-size: 29px;
+  }
+
+  .production-workbench-v2 .home-primary-composer {
+    border-radius: 15px;
+  }
+
+  .production-workbench-v2 .home-primary-composer textarea {
+    min-height: 72px;
+    padding: 15px 14px 7px;
+    font-size: 14px;
+  }
+
+  .production-workbench-v2 .production-prompt-suggestions {
+    margin-top: 16px;
+  }
+
+  .production-workbench-v2 .production-prompt-suggestions > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .production-workbench-v2 .production-prompt-suggestions button {
+    min-height: 44px;
   }
 }

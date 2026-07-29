@@ -654,6 +654,37 @@ class DataCapabilitiesOut(BaseModel):
     generated_at: datetime
 
 
+class DailyBriefItemOut(BaseModel):
+    rule_id: Literal["delivery_delayed", "collection_overdue"]
+    domain: Literal["delivery", "collection"]
+    severity: Literal["attention"] = "attention"
+    title: str
+    detail: str
+    affected_count: int = Field(ge=0)
+    amount: float | None = Field(default=None, ge=0)
+    unit: Literal["元"] | None = None
+
+
+class DailyBriefDomainReadinessOut(BaseModel):
+    domain: Literal["opportunity", "delivery", "collection", "target"]
+    readiness: str
+    data_as_of: datetime | None
+    record_count: int = Field(ge=0)
+
+
+class DailyBriefOut(BaseModel):
+    brief_date: date | None
+    data_as_of: datetime | None
+    source_batch_id: str | None
+    readiness: Literal["ready", "stale", "partial", "unavailable"]
+    attention_count: int = Field(ge=0)
+    items: list[DailyBriefItemOut]
+    domains: list[DailyBriefDomainReadinessOut]
+    organization_unit_ids: list[uuid.UUID]
+    uses_enterprise_snapshot: bool
+    generated_at: datetime
+
+
 class DataSourceOut(ORMModel):
     id: uuid.UUID
     key: str

@@ -9,6 +9,7 @@ import type {
   ConversationMessage,
   CursorPage,
   DataCapabilities,
+  DailyBrief,
   DataOperationsV3Overview,
   DataSource,
   DataSourceTest,
@@ -263,6 +264,14 @@ export function createProductionServices(client: ApiClient = apiClient) {
     async capabilities() {
       return client.request<DataCapabilities>("/data-capabilities");
     },
+    async dailyBrief(organizationUnitIds: string[] = []) {
+      const query = new URLSearchParams();
+      for (const organizationUnitId of organizationUnitIds) {
+        query.append("organization_unit_ids", organizationUnitId);
+      }
+      const serialized = query.toString();
+      return client.request<DailyBrief>(`/daily-brief${serialized ? `?${serialized}` : ""}`);
+    },
   };
 
   const models = {
@@ -442,6 +451,7 @@ export async function loadProductionBootstrap(
       reports: [],
       jobs: [],
       dataCapabilities: null,
+      dailyBrief: null,
       personalProfile: null,
       optionalErrors: {},
     };
@@ -460,6 +470,7 @@ export async function loadProductionBootstrap(
       reports: [],
       jobs: [],
       dataCapabilities: null,
+      dailyBrief: null,
       personalProfile: null,
       optionalErrors: {},
     };
@@ -476,12 +487,13 @@ export async function loadProductionBootstrap(
     services.reports.list(),
     services.jobs.list(),
     services.data.capabilities(),
+    services.data.dailyBrief(),
     services.auth.personalProfile(),
     services.models.list(),
   ] as const);
   const optionalErrors: ProductionBootstrap["optionalErrors"] = {};
   const authorizedOrganizationIds = new Set(me.scopes.map((scope) => scope.id));
-  const optionalKeys = ["memories", "reports", "jobs", "dataCapabilities", "personalProfile", "authorizedModels"] as const;
+  const optionalKeys = ["memories", "reports", "jobs", "dataCapabilities", "dailyBrief", "personalProfile", "authorizedModels"] as const;
   optional.forEach((result, index) => {
     if (result.status === "rejected") {
       optionalErrors[optionalKeys[index]] = humanizeApiError(result.reason);
@@ -495,12 +507,13 @@ export async function loadProductionBootstrap(
     ),
     conversations: conversationsResult.items,
     projects: projectsResult.items,
-    authorizedModels: optional[5].status === "fulfilled" ? optional[5].value : [],
+    authorizedModels: optional[6].status === "fulfilled" ? optional[6].value : [],
     memories: optional[0].status === "fulfilled" ? optional[0].value.items : [],
     reports: optional[1].status === "fulfilled" ? optional[1].value.items : [],
     jobs: optional[2].status === "fulfilled" ? optional[2].value.items : [],
     dataCapabilities: optional[3].status === "fulfilled" ? optional[3].value : null,
-    personalProfile: optional[4].status === "fulfilled" ? optional[4].value : null,
+    dailyBrief: optional[4].status === "fulfilled" ? optional[4].value : null,
+    personalProfile: optional[5].status === "fulfilled" ? optional[5].value : null,
     optionalErrors,
   };
 }
